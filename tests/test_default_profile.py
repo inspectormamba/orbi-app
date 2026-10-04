@@ -42,15 +42,17 @@ def new_device(monitor, mac, name):
     monitor.scan()
 
 
-def test_new_address_rejoins_profile_by_name(monitor):
-    monitor.scan()  # baseline
+def test_new_address_matching_by_name_is_held_with_profile_preselected(monitor):
+    monitor.scan()  # baseline (hold_new_devices is off: a name match is held regardless, since names are spoofable)
     pid = monitor.store.x("INSERT INTO profiles(name, created) VALUES('James', ?)", (time.time(),))
     monitor.store.x("UPDATE devices SET profile_id=? WHERE mac='AA:00:00:00:00:01'", (pid,))  # kid-phone
     new_device(monitor, "3E:00:00:00:00:99", "kid-phone")
-    row = monitor.store.one("SELECT profile_id FROM devices WHERE mac='3E:00:00:00:00:99'")
-    assert row["profile_id"] == pid
+    row = monitor.store.one("SELECT profile_id, manual_block, held FROM devices WHERE mac='3E:00:00:00:00:99'")
+    assert (row["profile_id"], row["manual_block"], row["held"]) == (pid, 1, 1)
     ev = monitor.store.q("SELECT title, detail FROM events WHERE kind='new_device'")[-1]
-    assert "came back with a new address (private address)" in ev["title"] and "Added to James" in ev["detail"]
+    assert "came back with a new address (private address)" in ev["title"] and "Blocked until you approve it" in ev["detail"]
+    monitor.enforce()
+    assert "3E:00:00:00:00:99" in monitor.router.blocked
 
 
 def test_hold_new_devices_until_approved(monitor):

@@ -62,7 +62,7 @@ def main():
     monitor.start()
 
     server = uvicorn.Server(uvicorn.Config(create_app(monitor), host="0.0.0.0", port=port, log_level="warning",
-                                           access_log=False, log_config=None))
+                                           access_log=False, log_config=None, proxy_headers=False))  # never trust X-Forwarded-For
     log.info("Orbi Control starting on port %s", port)
     if args.no_tray:
         server.run()

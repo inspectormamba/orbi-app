@@ -28,7 +28,7 @@ DEFAULTS = {
     "default_profile_id": None,  # profile followed by devices that aren't in one (incl. brand-new devices)
     "hold_new_devices": False,  # block never-seen devices until a parent approves them
     "protected_macs": [],  # never blocked (this PC is added automatically)
-    "file_access": False,  # whole-PC file browser in the web app; turning it on needs the PIN
+    "revoked_sessions": {},  # nonce -> expiry of session tokens that were signed out
 }
 
 _lock = threading.Lock()

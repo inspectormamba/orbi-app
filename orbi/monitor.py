@@ -170,6 +170,43 @@ class Monitor:
             st["outage_id"] = None
         st["internet"] = st["outage_id"] is None  # a single missed probe doesn't count as offline
 
+        # Satellites: only meaningful while this PC can reach the router itself.
+        if router_ms is not None:
+            self.check_satellites()
+
+    def check_satellites(self):
+        """Probes each known satellite directly, so a dropped one is noticed within a couple of
+        health checks instead of waiting for the slower device scan."""
+        known = self.store.get("satellites", {})
+        if not known:
+            return
+        for s in known.values():
+            up = bool(s.get("ip")) and (tcp_ok(s["ip"], 443, 2.5) is not None or tcp_ok(s["ip"], 80, 2.5) is not None)
+            if up:
+                self._missing_sats.pop(s["mac"], None)
+                if not s.get("online", True):
+                    s["online"] = True
+                    self._sat_back(s)
+            else:
+                self._sat_missed(s)
+        self.store.put("satellites", known)
+        self.state["satellites"] = list(known.values())
+
+    def _sat_missed(self, s):
+        """Counts a miss (router scan or direct probe); two in a row marks the satellite offline."""
+        if not s.get("online", True):
+            return
+        self._missing_sats[s["mac"]] = self._missing_sats.get(s["mac"], 0) + 1
+        if self._missing_sats[s["mac"]] >= 2:
+            s["online"] = False
+            s["devices"] = 0
+            self.store.event("satellite", f"{s['name']} went offline", severity="error", mac=s["mac"])
+            self.notify("Orbi satellite offline", f"{s['name']} lost its connection to the router.")
+
+    def _sat_back(self, s):
+        self.store.event("satellite", f"{s['name']} is back online", mac=s["mac"])
+        self.notify("Satellite back online", s["name"])
+
     def _outage_cause(self) -> str:
         if not self.router:
             return ""
@@ -215,20 +252,14 @@ class Monitor:
         seen = {s["mac"] for s in sats}
         for s in sats:
             s["devices"] = counts.get(s["mac"], 0)
-            s["online"] = True
-            if s["mac"] in known and not known[s["mac"]].get("online", True):
-                self.store.event("satellite", f"{s['name']} is back online", mac=s["mac"])
-                self.notify("Satellite back online", s["name"])
-            known[s["mac"]] = {**s}
+            was_offline = s["mac"] in known and not known[s["mac"]].get("online", True)
+            known[s["mac"]] = {**s, "online": True}
+            if was_offline:
+                self._sat_back(known[s["mac"]])
             self._missing_sats.pop(s["mac"], None)
         for mac, s in known.items():
-            if mac not in seen and s.get("online", True):
-                self._missing_sats[mac] = self._missing_sats.get(mac, 0) + 1
-                if self._missing_sats[mac] >= 2:  # two scans in a row
-                    s["online"] = False
-                    s["devices"] = 0
-                    self.store.event("satellite", f"{s['name']} went offline", severity="error", mac=mac)
-                    self.notify("Orbi satellite offline", s["name"])
+            if mac not in seen:
+                self._sat_missed(s)
         self.store.put("satellites", known)
         router_mac = self._router_mac(sats)
         self.state["satellites"] = list(known.values())
@@ -263,7 +294,9 @@ class Monitor:
             self.store.put("first_scan_done", True)
 
     def _handle_new_device(self, d, alert):
-        """A never-seen MAC: rejoin its owner's profile by name, else optionally hold it for approval."""
+        """A never-seen MAC. If its name matches devices in a profile, it's probably that person's device
+        with a new private address, but a name is easy to fake (rename a phone to match a parent's laptop),
+        so it's held for approval with that profile pre-selected rather than joined automatically."""
         mac, label = d["mac"], d["name"] or d["model"] or d["mac"]
         settings = config.load()
         named = self.store.q("SELECT router_name, profile_id FROM devices WHERE mac != ? AND router_name != ''", (mac,))
@@ -271,13 +304,13 @@ class Monitor:
         private = " (private address)" if parental.is_randomized_mac(mac) else ""
         # Muted MACs are still recorded as events (audit trail is kept) but raise no notification.
         muted = norm_mac(mac) in {norm_mac(m) for m in settings.get("mute_new_device_macs", [])}
-        if pid is not None:
+        if pid is not None and mac not in self.protected:
             pname = self.store.one("SELECT name FROM profiles WHERE id=?", (pid,))["name"]
-            self.store.x("UPDATE devices SET profile_id=? WHERE mac=?", (pid, mac))
+            self.store.x("UPDATE devices SET profile_id=?, manual_block=1, held=1 WHERE mac=?", (pid, mac))
             self.store.event("new_device", f"{label} came back with a new address{private}",
-                             detail=f"Added to {pname} automatically · {d['ip']} · {mac}", severity="warn", mac=mac)
-            if alert and not muted:
-                self.notify("Known device, new address", f"{label} was added back to {pname}")
+                             detail=f"Blocked until you approve it (it'll go in {pname}) · {d['ip']} · {mac}", severity="warn", mac=mac)
+            if not muted:
+                self.notify("Known device, new address?", f"{label} looks like {pname}'s device. Approve it in Devices.")
         elif settings.get("hold_new_devices") and mac not in self.protected:
             self.store.x("UPDATE devices SET manual_block=1, held=1 WHERE mac=?", (mac,))
             self.store.event("new_device", f"New device held: {label}{private}",

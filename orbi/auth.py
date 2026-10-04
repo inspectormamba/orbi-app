@@ -55,38 +55,80 @@ def make_session() -> str:
     return f"{payload}.{sig}"
 
 
-def valid_session(token: str | None) -> bool:
+def _parse(token: str | None):
+    """(expires, nonce) of a correctly signed, unexpired token; None otherwise."""
     if not token or token.count(".") != 2:
-        return False
+        return None
     expires, nonce, sig = token.split(".")
     good = hmac.new(_secret(), f"{expires}.{nonce}".encode(), hashlib.sha256).hexdigest()
-    return hmac.compare_digest(sig, good) and expires.isdigit() and int(expires) > time.time()
+    if hmac.compare_digest(sig, good) and expires.isdigit() and int(expires) > time.time():
+        return int(expires), nonce
+    return None
+
+
+def valid_session(token: str | None) -> bool:
+    parsed = _parse(token)
+    return bool(parsed) and parsed[1] not in config.load().get("revoked_sessions", {})
+
+
+def revoke_session(token: str | None):
+    """Signing out invalidates the token itself, so a copied cookie stops working too."""
+    parsed = _parse(token)
+    if not parsed:
+        return
+    now = time.time()
+    revoked = {n: exp for n, exp in config.load().get("revoked_sessions", {}).items() if exp > now}
+    revoked[parsed[1]] = parsed[0]
+    config.save({"revoked_sessions": revoked})
 
 
 def rotate_secret():
     """Signs everyone out (used when the PIN changes)."""
-    config.save({"session_secret": secrets.token_hex(32)})
+    config.save({"session_secret": secrets.token_hex(32), "revoked_sessions": {}})
 
 
 class Throttle:
-    """5 wrong PINs → 1 min lockout, doubling each further miss (max 1 hour), per client IP."""
+    """Wrong-PIN lockouts: 5 misses from one client, or 20 across the whole house, lock PIN entry
+    for 1 minute, doubling with each further miss (max 1 hour).
+
+    Each attempt is counted *before* the PIN is checked, under one lock, so a burst of simultaneous
+    guesses can't slip past the limit while the (deliberately slow) hash check runs. The house-wide
+    count stops someone from spreading guesses over many addresses."""
+
+    PER_CLIENT = 5
+    HOUSE = 20
+    _HOUSE_KEY = "*"
 
     def __init__(self):
         self._lock = threading.Lock()
         self._state: dict[str, tuple[int, float]] = {}
 
+    @staticmethod
+    def _lockout(fails: int, limit: int) -> float:
+        return 0 if fails < limit else min(3600, 60 * 2 ** (fails - limit))
+
     def wait_seconds(self, ip: str) -> int:
         with self._lock:
-            fails, until = self._state.get(ip, (0, 0))
-            return max(0, int(until - time.time()))
+            now = time.time()
+            return max(0, int(max(self._state.get(k, (0, 0))[1] for k in (ip, self._HOUSE_KEY)) - now))
 
-    def failure(self, ip: str):
+    def attempt(self, ip: str) -> int:
+        """Seconds to wait if PIN entry is locked; otherwise 0, and the attempt is counted as a miss
+        until success() is called."""
         with self._lock:
-            fails, _ = self._state.get(ip, (0, 0))
-            fails += 1
-            lock = 0 if fails < 5 else min(3600, 60 * 2 ** (fails - 5))
-            self._state[ip] = (fails, time.time() + lock)
+            now = time.time()
+            wait = max(self._state.get(k, (0, 0))[1] for k in (ip, self._HOUSE_KEY)) - now
+            if wait > 0:
+                return int(wait) + 1
+            for key, limit in ((ip, self.PER_CLIENT), (self._HOUSE_KEY, self.HOUSE)):
+                fails = self._state.get(key, (0, 0))[0] + 1
+                self._state[key] = (fails, now + self._lockout(fails, limit))
+            return 0
 
     def success(self, ip: str):
         with self._lock:
             self._state.pop(ip, None)
+            fails, _ = self._state.get(self._HOUSE_KEY, (0, 0))
+            if fails > 0:  # undo this attempt's provisional miss
+                fails -= 1
+                self._state[self._HOUSE_KEY] = (fails, time.time() + self._lockout(fails, self.HOUSE) if fails >= self.HOUSE else 0)

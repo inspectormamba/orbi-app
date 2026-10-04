@@ -339,7 +339,9 @@ function deviceSheet(d) {
     return api(`/api/devices/${d.mac}/block`, { body: { blocked: false } });
   }, "Approved").then(() => { closeSheet(); renderDevices(); }) }, "Approve") : null;
   openSheet(h("h3", {}, d.name),
-    d.held ? h("div", { class: "note" }, "New device, blocked until you approve it. Pick a profile below (or leave it on the default), then Approve.")
+    d.held ? h("div", { class: "note" }, d.profile
+      ? `Blocked until you approve it. Its name matches a device in ${d.profile.name}, so it's probably theirs with a new address. Names are easy to fake, so check it really is before approving.`
+      : "New device, blocked until you approve it. Pick a profile below (or leave it on the default), then Approve.")
       : d.blocked && d.block_reason ? h("div", { class: "note" }, d.block_reason) : null,
     !d.profile && d.default_profile ? h("div", { class: "muted small" }, `Not in a profile, so it follows ${d.default_profile.name}'s rules (the default).`) : null,
     d.randomized ? h("div", { class: "muted small" }, "Uses a private (randomized) Wi-Fi address. If it changes, the device shows up as new.") : null,
@@ -591,10 +593,20 @@ async function renderMore() {
 
   const cur = h("input", { type: "password", inputmode: "numeric", autocomplete: "current-password" });
   const nw = h("input", { type: "password", inputmode: "numeric", autocomplete: "new-password" });
+  const extraPins = h("div", {});
   const pinCard = h("section", { class: "card form" }, h("h2", {}, "App PIN"),
     h("div", { class: "inline" }, h("label", { class: "field" }, "Current", cur), h("label", { class: "field" }, "New (6+)", nw)),
-    h("button", { class: "btn", onclick: (e) => act(e.currentTarget, () => api("/api/settings/pin", { body: { current: cur.value, new: nw.value } }), "PIN changed; other devices are signed out").then(() => { cur.value = nw.value = ""; }) }, "Change PIN"),
-    h("button", { class: "btn", onclick: (e) => act(e.currentTarget, () => api("/api/logout", { body: {} })).then(showLogin) }, "Sign out of this device"));
+    h("button", { class: "btn", onclick: (e) => act(e.currentTarget, () => api("/api/settings/pin", { body: { current: cur.value, new: nw.value } }), "PIN changed; other PINs removed and other devices signed out").then(() => { cur.value = nw.value = ""; renderExtraPins(); }) }, "Change PIN"),
+    h("button", { class: "btn", onclick: (e) => act(e.currentTarget, () => api("/api/logout", { body: {} })).then(showLogin) }, "Sign out of this device"),
+    h("div", { class: "muted small", style: "margin-top:10px" }, "Other PINs that also unlock the app (removed when you change the PIN):"),
+    extraPins);
+  function renderExtraPins() {
+    api("/api/settings/pins").then((r) => fill(extraPins, r.extra.length ? r.extra.map((p) => h("div", { class: "row" },
+      h("div", { class: "main" }, h("div", { class: "name" }, p.label)),
+      h("button", { class: "btn small danger", onclick: (e) => act(e.currentTarget, () => api(`/api/settings/pins/${encodeURIComponent(p.label)}`, { method: "DELETE" }), "PIN removed").then(renderExtraPins) }, "Remove")))
+      : h("div", { class: "muted small" }, "None"))).catch((e) => fill(extraPins, h("div", { class: "error-text" }, e.message)));
+  }
+  renderExtraPins();
 
   const advToggle = h("input", { type: "checkbox", checked: advancedOn(), onchange: (e) => {
     try { localStorage.setItem(ADV_KEY, e.target.checked ? "1" : "0"); } catch {}
@@ -642,7 +654,12 @@ function filteringCard() {
       h("div", { class: "btns" },
         chip(c.youtube === "moderate" || c.youtube === "strict", `YouTube Restricted${c.youtube && c.youtube !== "unrestricted" ? ` (${c.youtube})` : ""}`),
         chip(!!c.safesearch, "SafeSearch"), chip(!!c.adult_blocked, "Adult sites blocked")),
-      h("div", { class: "muted small", style: "margin-top:8px" }, "Applies to every device in the house. Devices can't switch to other DNS servers: your router blocks that."));
+      h("div", { class: "muted small", style: "margin-top:8px" }, "Applies to every device in the house. To stop devices from switching to their own DNS or a VPN, add the router rules below."),
+      h("button", { class: "btn small", style: "margin-top:8px", onclick: (e) => act(e.currentTarget, async () => {
+        await api("/api/filtering/protect", { body: {} });
+        const r = await waitJob("protect", "Checking router rules");
+        return { note: r && r.added && r.added.length ? `Added: ${r.added.join(", ")}` : "All protection rules were already in place" };
+      }) }, "Add rules that block DNS & VPN workarounds"));
   }).catch((e) => fill(card, h("h2", {}, "Content filtering"), h("div", { class: "error-text" }, e.message)));
   return card;
 }

@@ -132,3 +132,54 @@ def test_web_app_served(client):
     assert "Orbi Control" in client.get("/").text
     assert client.get("/static/app.js").status_code == 200
     assert client.get("/manifest.webmanifest").json()["short_name"] == "Orbi"
+
+
+def test_pin_change_removes_extra_pins(client):
+    setup_pin(client, "246810")
+    client.post("/api/settings/pins", json={"current": "246810", "new": "092619", "label": "Spare"})
+    assert client.post("/api/settings/pin", json={"current": "246810", "new": "a long passphrase"}).status_code == 200
+    assert client.get("/api/settings/pins").json()["extra"] == []
+    client.post("/api/logout")
+    client.cookies.clear()
+    assert client.post("/api/login", json={"pin": "092619"}).status_code == 401
+    assert client.post("/api/login", json={"pin": "a long passphrase"}).status_code == 200
+
+
+def test_logout_revokes_a_copied_session(client):
+    setup_pin(client)
+    token = client.cookies.get("orbi_session")
+    client.post("/api/logout")
+    client.cookies.clear()
+    client.cookies.set("orbi_session", token)
+    assert client.get("/api/devices").status_code == 401
+
+
+def test_lockout_counts_simultaneous_guesses(client):
+    from concurrent.futures import ThreadPoolExecutor
+    setup_pin(client)
+    client.post("/api/logout")
+    client.cookies.clear()
+    with ThreadPoolExecutor(20) as pool:
+        codes = list(pool.map(lambda _: client.post("/api/login", json={"pin": "000000"}).status_code, range(40)))
+    assert codes.count(401) == 5 and codes.count(429) == 35
+
+
+def test_lockout_is_house_wide():
+    from orbi.auth import Throttle
+    t = Throttle()
+    for i in range(Throttle.HOUSE):  # 4 guesses each from many addresses stays under the per-client limit
+        assert t.attempt(f"192.168.1.{i // 4 + 10}") == 0
+    assert t.attempt("192.168.1.200") > 0  # a fresh address is locked out too
+
+
+def test_router_host_must_be_a_private_ip(client):
+    setup_pin(client)
+    for bad in ("evil.example.com", "8.8.8.8", "127.0.0.1", "0.0.0.0"):
+        assert client.patch("/api/settings", json={"router_host": bad}).status_code == 400, bad
+    assert client.patch("/api/settings", json={"router_host": "192.168.1.1"}).status_code == 200
+
+
+def test_file_api_is_gone(client):
+    setup_pin(client)
+    assert client.get("/api/files/list").status_code in (404, 405)
+    assert client.put("/api/files/settings", json={"enabled": True, "pin": "246810"}).status_code in (404, 405)

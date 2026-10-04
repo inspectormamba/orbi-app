@@ -189,6 +189,25 @@ class RouterUI:
         self._click("apply", wait=6)  # the list page's Apply is what activates new rules
         return True
 
+    PROTECTION_RULES = [  # (name, protocol, port)
+        ("Block-External-DNS", "TCP/UDP", 53),  # devices must use the router's (filtered) DNS
+        ("Block-DoT-853", "TCP/UDP", 853),  # DNS-over-TLS
+        ("Block-VPN-OpenVPN", "TCP/UDP", 1194),
+        ("Block-VPN-WireGuard", "UDP", 51820),
+    ]
+
+    def ensure_protection_rules(self) -> list[str]:
+        """Adds any missing PROTECTION_RULES for all devices. A rule counts as present if one with the
+        same name exists, or any rule already blocks that port for every device. Returns names added."""
+        existing = self.read_block_services()["rules"]
+        added = []
+        for name, protocol, port in self.PROTECTION_RULES:
+            if any(r["name"] == name or (r["port"] == str(port) and r["ips"].lower() == "all") for r in existing):
+                continue
+            if self.add_service_rule(name, protocol, port):
+                added.append(name)
+        return added
+
     def read_block_services(self) -> dict:
         f = self.form("BKS_service.htm")
         return {"mode": f.get("skeyword"), "rules": parse_rule_rows(self.rows())}

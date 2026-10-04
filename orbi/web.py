@@ -1,8 +1,7 @@
 """HTTP API + the web app (served to this PC's browser and phones on the home network)."""
 import io
-import os
+import ipaddress
 import re
-import tempfile
 import socket
 import time
 from datetime import datetime
@@ -13,7 +12,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import auth, config, files, parental
+from . import auth, config, parental
 from .monitor import Monitor, fmt_duration
 from .router import RouterClient, RouterError, norm_mac
 
@@ -109,17 +108,6 @@ class SiteBlockBody(BaseModel):
     end: str = "00:00"
 
 
-class FileAccessBody(BaseModel):
-    enabled: bool
-    pin: str = ""
-
-
-class FileOpBody(BaseModel):
-    path: str
-    name: str = ""
-    recursive: bool = False
-
-
 class PinChange(BaseModel):
     current: str
     new: str
@@ -162,6 +150,16 @@ def create_app(monitor: Monitor) -> FastAPI:
     def client_ip(request: Request) -> str:
         return request.client.host if request.client else "?"
 
+    def require_pin(pin: str, request: Request, settings: dict, wrong: str = "Wrong PIN"):
+        """Every PIN check goes through the lockout, counted before the (slow) hash comparison."""
+        ip = client_ip(request)
+        wait = throttle.attempt(ip)
+        if wait:
+            raise HTTPException(429, f"Too many wrong PINs. Try again in {fmt_duration(wait)}.")
+        if not auth.check_any_pin(pin, settings):
+            raise HTTPException(401, wrong)
+        throttle.success(ip)
+
     # ---------- session ----------
     @app.get("/api/session")
     def session(request: Request):
@@ -183,20 +181,16 @@ def create_app(monitor: Monitor) -> FastAPI:
 
     @app.post("/api/login")
     def login(body: PinBody, request: Request, response: Response):
-        ip = client_ip(request)
-        wait = throttle.wait_seconds(ip)
-        if wait:
-            raise HTTPException(429, f"Too many wrong PINs. Try again in {fmt_duration(wait)}.")
         s = config.load()
-        if not s["pin_hash"] or not auth.check_any_pin(body.pin, s):
-            throttle.failure(ip)
+        if not s["pin_hash"]:
             raise HTTPException(401, "Wrong PIN")
-        throttle.success(ip)
+        require_pin(body.pin, request, s)
         set_cookie(response)
         return {"ok": True}
 
     @app.post("/api/logout")
-    def logout(response: Response):
+    def logout(request: Request, response: Response):
+        auth.revoke_session(request.cookies.get(auth.COOKIE))
         response.delete_cookie(auth.COOKIE)
         return {"ok": True}
 
@@ -556,6 +550,15 @@ def create_app(monitor: Monitor) -> FastAPI:
             patch["scan_interval"] = max(60, min(patch["scan_interval"], 3600))
         if patch.get("speedtest_daily_at") and not HHMM.match(patch["speedtest_daily_at"]):
             raise HTTPException(400, "Speed test time must be HH:MM (or empty to turn it off)")
+        if "router_host" in patch:
+            # The router admin password is sent to this address, so only accept a private LAN IP.
+            try:
+                host = ipaddress.ip_address(patch["router_host"].strip())
+            except ValueError:
+                raise HTTPException(400, "Router address must be an IP address like 192.168.1.1")
+            if not host.is_private or host.is_loopback or host.is_link_local or host.is_unspecified:
+                raise HTTPException(400, "Router address must be a private address on your home network")
+            patch["router_host"] = str(host)
         if "mute_new_device_macs" in patch:
             patch["mute_new_device_macs"] = sorted({norm_mac(m) for m in patch["mute_new_device_macs"] if m.strip()})
         config.save(patch)
@@ -579,13 +582,13 @@ def create_app(monitor: Monitor) -> FastAPI:
 
     @app.post("/api/settings/pin")
     def change_pin(body: PinChange, request: Request, response: Response):
-        if not auth.check_any_pin(body.current, config.load()):
-            throttle.failure(client_ip(request))
-            raise HTTPException(401, "Current PIN is wrong")
+        require_pin(body.current, request, config.load(), "Current PIN is wrong")
         if len(body.new) < auth.MIN_PIN:
             raise HTTPException(400, f"Use at least {auth.MIN_PIN} digits or characters")
-        config.save({"pin_hash": auth.hash_pin(body.new)})
+        removed = len(config.load().get("extra_pins", []))
+        config.save({"pin_hash": auth.hash_pin(body.new), "extra_pins": []})  # a new PIN replaces every old one
         auth.rotate_secret()  # sign out every other device
+        store.event("action", "App PIN changed", detail=f"from {client_ip(request)}" + (f"; {removed} extra PIN(s) removed" if removed else ""))
         set_cookie(response)
         return {"ok": True}
 
@@ -596,9 +599,7 @@ def create_app(monitor: Monitor) -> FastAPI:
     @app.post("/api/settings/pins")
     def add_pin(body: ExtraPinBody, request: Request):
         s = config.load()
-        if not auth.check_any_pin(body.current, s):
-            throttle.failure(client_ip(request))
-            raise HTTPException(401, "Current PIN is wrong")
+        require_pin(body.current, request, s, "Current PIN is wrong")
         if len(body.new) < auth.MIN_PIN:
             raise HTTPException(400, f"Use at least {auth.MIN_PIN} digits or characters")
         extra = list(s.get("extra_pins", []))
@@ -696,6 +697,22 @@ def create_app(monitor: Monitor) -> FastAPI:
             raise HTTPException(409, "A filter change is already running")
         return {"ok": True}
 
+    @app.post("/api/filtering/protect")
+    def add_protection_rules():
+        """Router rules that stop devices from getting around the filter (their own DNS, DNS-over-TLS, VPNs)."""
+        router()
+        s = config.load()
+
+        def apply():
+            from .routerui import RouterUI
+            with RouterUI(s["router_host"], config.router_password(s), s["router_user"]) as ui:
+                added = ui.ensure_protection_rules()
+            store.event("action", "Router protection rules checked", detail=f"added: {', '.join(added)}" if added else "all already in place")
+            return {"added": added}
+        if not monitor.run_job("protect", apply):
+            raise HTTPException(409, "Already running")
+        return {"ok": True}
+
     # ---------- whole-house app & site blocking (router Block Sites) ----------
     @app.get("/api/siteblock")
     def siteblock():
@@ -729,97 +746,6 @@ def create_app(monitor: Monitor) -> FastAPI:
             return {"ok": True}
         if not monitor.run_job("siteblock", apply):
             raise HTTPException(409, "A blocking change is already running")
-        return {"ok": True}
-
-    # ---------- files (whole PC) ----------
-    @app.exception_handler(files.FileError)
-    def file_error(request: Request, e: files.FileError):
-        return JSONResponse({"detail": str(e)}, status_code=e.status, headers={"Cache-Control": "no-store"})
-
-    def files_on():
-        if not config.load()["file_access"]:
-            raise HTTPException(403, "File access is off (More → Files)")
-
-    @app.get("/api/files/settings")
-    def file_settings():
-        return {"enabled": bool(config.load()["file_access"])}
-
-    @app.put("/api/files/settings")
-    def set_file_settings(body: FileAccessBody, request: Request):
-        if body.enabled:
-            ip = client_ip(request)
-            wait = throttle.wait_seconds(ip)
-            if wait:
-                raise HTTPException(429, f"Too many wrong PINs. Try again in {fmt_duration(wait)}.")
-            if not auth.check_any_pin(body.pin, config.load()):
-                throttle.failure(ip)
-                raise HTTPException(401, "Wrong PIN")
-        config.save({"file_access": body.enabled})
-        store.event("files", f"File access turned {'on' if body.enabled else 'off'}", detail=f"from {client_ip(request)}",
-                    severity="warn" if body.enabled else "info")
-        return {"enabled": body.enabled}
-
-    @app.get("/api/files/list")
-    def file_list(path: str = ""):
-        files_on()
-        if not path:
-            return {"path": "", "parent": None, "entries": files.drives()}
-        return files.listdir(path)
-
-    @app.get("/api/files/download")
-    def file_download(path: str, request: Request):
-        files_on()
-        path = files.resolve(path)
-        files.file_size(path)
-        store.event("files", "File downloaded", detail=f"{path} → {client_ip(request)}")
-        return FileResponse(path, filename=os.path.basename(path), headers={"Cache-Control": "no-store"})
-
-    @app.put("/api/files/upload")
-    async def file_upload(request: Request, dir: str, name: str, overwrite: bool = False):
-        import anyio
-        files_on()
-        folder = files.resolve(dir)
-        target = os.path.join(folder, files.check_name(name))
-        if not await anyio.to_thread.run_sync(files.run, os.path.isdir, folder):
-            raise HTTPException(404, "Folder not found")
-        if not overwrite and await anyio.to_thread.run_sync(files.run, os.path.lexists, target):
-            raise HTTPException(409, f"{name} already exists")
-        fd, tmp = await anyio.to_thread.run_sync(lambda: tempfile.mkstemp(prefix=".upload-", dir=folder))
-        size = 0
-        try:
-            with os.fdopen(fd, "wb") as f:
-                async for chunk in request.stream():
-                    size += len(chunk)
-                    await anyio.to_thread.run_sync(f.write, chunk)
-            await anyio.to_thread.run_sync(os.replace, tmp, target)
-        except BaseException:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
-            raise
-        store.event("files", "File uploaded", detail=f"{target} ({size:,} bytes) from {client_ip(request)}")
-        return {"ok": True, "path": target, "size": size}
-
-    @app.post("/api/files/mkdir")
-    def file_mkdir(body: FileOpBody, request: Request):
-        files_on()
-        target = files.mkdir(body.path, body.name)
-        store.event("files", "Folder created", detail=f"{target} from {client_ip(request)}")
-        return {"ok": True, "path": target}
-
-    @app.post("/api/files/rename")
-    def file_rename(body: FileOpBody, request: Request):
-        files_on()
-        target = files.rename(body.path, body.name)
-        store.event("files", "Renamed", detail=f"{body.path} → {target} from {client_ip(request)}")
-        return {"ok": True, "path": target}
-
-    @app.post("/api/files/delete")
-    def file_delete(body: FileOpBody, request: Request):
-        files_on()
-        files.delete(body.path, body.recursive)
-        store.event("files", "Deleted", detail=f"{files.resolve(body.path)} from {client_ip(request)}", severity="warn")
         return {"ok": True}
 
     # ---------- web app ----------

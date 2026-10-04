@@ -17,7 +17,7 @@ YT_RESTRICTED = {"216.239.38.119": "moderate", "216.239.38.120": "strict"}
 
 PROVIDERS = {
     "adguard_family": {"name": "AdGuard Family", "dns": ["94.140.14.15", "94.140.15.16"], "youtube": True,
-                       "summary": "Blocks adult sites, forces SafeSearch, YouTube Restricted Mode. Reddit allowed."},
+                       "summary": "Blocks adult sites, forces SafeSearch, YouTube Restricted Mode. Reddit allowed. Also blocks ads and trackers, which breaks some streaming apps (ESPN won't play)."},
     "cleanbrowsing_family": {"name": "CleanBrowsing Family", "dns": ["185.228.168.168", "185.228.169.168"], "youtube": True,
                              "summary": "Blocks adult sites, VPN/proxy sites and Reddit; forces SafeSearch and YouTube Restricted Mode."},
     "cleanbrowsing_adult": {"name": "CleanBrowsing Adult", "dns": ["185.228.168.10", "185.228.169.11"], "youtube": False,

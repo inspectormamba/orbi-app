@@ -42,8 +42,10 @@ class RouterClient:
 
     def _connect(self):
         ng = Netgear(password=self.password, host=self.host, user=self.user, port=443, ssl=True)
-        if not ng.login_try_port():
-            raise RouterError("Could not log in to the router (check the admin password)")
+        # HTTPS on 443 only: pynetgear's login_try_port() falls back to plain HTTP (ports 5000/80),
+        # which would send the admin password across the LAN unencrypted.
+        if not ng.login():
+            raise RouterError("Could not log in to the router over HTTPS (check the admin password)")
         return ng
 
     def call(self, method: str, *args, attempts: int = 2, bool_result: bool = False):

@@ -40,6 +40,30 @@ def test_satellite_offline_needs_two_misses(monitor):
     assert "back online" in monitor.store.q("SELECT title FROM events WHERE kind='satellite' ORDER BY id DESC")[0]["title"]
 
 
+def test_satellite_offline_detected_by_direct_probe(monitor):
+    monitor.scan()
+    reachable = {"192.168.1.38": True}
+    orig = monitor_mod.tcp_ok
+    monitor_mod.tcp_ok = lambda host, port, timeout=3.0: 1.0 if reachable.get(host, True) else None
+    try:
+        reachable["192.168.1.38"] = False
+        monitor.check_satellites()
+        assert not monitor.store.q("SELECT * FROM events WHERE kind='satellite'")
+        monitor.check_satellites()
+        ev = monitor.store.q("SELECT * FROM events WHERE kind='satellite'")
+        assert len(ev) == 1 and "offline" in ev[0]["title"]
+        assert monitor.notes[-1][0] == "Orbi satellite offline"
+        assert monitor.state["satellites"][0]["online"] is False
+        monitor.check_satellites()  # no repeat alert while it stays down
+        assert len(monitor.store.q("SELECT * FROM events WHERE kind='satellite'")) == 1
+        reachable["192.168.1.38"] = True
+        monitor.check_satellites()
+        assert monitor.notes[-1][0] == "Satellite back online"
+        assert monitor.store.get("satellites", {})[SAT_MAC]["online"] is True
+    finally:
+        monitor_mod.tcp_ok = orig
+
+
 def test_enforce_pause_blocks_and_resume_unblocks(monitor):
     r = monitor.router
     monitor.scan()
@@ -143,13 +167,14 @@ def test_pin_and_sessions(tmp_config):
 
 def test_throttle_escalates():
     t = auth.Throttle()
-    for _ in range(4):
-        t.failure("1.2.3.4")
-    assert t.wait_seconds("1.2.3.4") == 0
-    t.failure("1.2.3.4")
+    for _ in range(5):
+        assert t.attempt("1.2.3.4") == 0  # each attempt counts as a miss until success()
     assert 55 <= t.wait_seconds("1.2.3.4") <= 60
-    t.failure("1.2.3.4")
-    assert t.wait_seconds("1.2.3.4") > 100
+    assert t.attempt("1.2.3.4") > 0  # locked: refused without being checked
+    fails, _ = t._state["1.2.3.4"]
+    t._state["1.2.3.4"] = (fails, 0)  # let the lockout expire
+    assert t.attempt("1.2.3.4") == 0
+    assert t.wait_seconds("1.2.3.4") > 100  # doubled
     assert t.wait_seconds("5.6.7.8") == 0
     t.success("1.2.3.4")
     assert t.wait_seconds("1.2.3.4") == 0
