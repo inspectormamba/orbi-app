@@ -41,6 +41,9 @@ def current_version() -> str:
         return "0.0.0"
 
 
+RUNNING = current_version()  # what this process started as (the VERSION file changes mid-update)
+
+
 def parse(v: str):
     """'v1.2.3' or '1.2.3' -> (1, 2, 3); anything else -> None."""
     parts = (v or "").strip().lstrip("v").split(".")
@@ -256,7 +259,8 @@ def _launch_helper(data_dir: Path, bak: Path, port: int, req_changed: bool):
     script = data_dir / "update-helper.ps1"
     script.write_text(HELPER.replace("%TASK%", TASK), "utf-8")
     version = json.loads((data_dir / "update-pending.json").read_text("utf-8"))["to"]
-    flags = 0x00000008 | 0x00000200 | getattr(subprocess, "CREATE_NO_WINDOW", 0)  # DETACHED_PROCESS | NEW_PROCESS_GROUP
+    # No console window, own process group so it outlives this app. Not DETACHED_PROCESS: PowerShell won't run without a console.
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", str(script),
                       "-AppPid", str(os.getpid()), "-Root", str(ROOT), "-Backup", str(bak), "-Port", str(port),
                       "-DataDir", str(data_dir), "-Version", version, "-ReqChanged", "1" if req_changed else "0"],

@@ -168,7 +168,7 @@ def create_app(monitor: Monitor) -> FastAPI:
     def session(request: Request):
         s = config.load()
         return {"authenticated": auth.valid_session(request.cookies.get(auth.COOKIE)), "pin_set": bool(s["pin_hash"]),
-                "version": updater.current_version(),
+                "version": updater.RUNNING,
                 "router_configured": bool(s["router_password_enc"])}
 
     @app.post("/api/setup")
@@ -756,7 +756,7 @@ def create_app(monitor: Monitor) -> FastAPI:
     def update_status():
         st = dict(monitor.state.get("update") or {"current": updater.current_version(), "git_checkout": updater.is_git_checkout()})
         st.pop("zip", None)
-        return st | {"current": updater.current_version(), "auto_check": config.load()["check_updates"], "job": monitor.jobs.get("update")}
+        return st | {"current": updater.RUNNING, "auto_check": config.load()["check_updates"], "job": monitor.jobs.get("update")}
 
     @app.get("/api/update")
     def get_update():
