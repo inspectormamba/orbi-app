@@ -56,6 +56,18 @@ A local replacement for the Netgear Orbi app. It runs on a Windows PC, talks to 
 .\uninstall.ps1            # stop and remove auto-start; also undoes allow-phone-access (firewall rule + network category)
 ```
 
+## Updating
+
+Download the zip from GitHub (Code → Download ZIP) rather than cloning, and the app can update itself:
+
+- Twice a day it checks this repository's version tags (`vX.Y.Z`) for a newer release. You get a Windows notification, and **More → Updates** shows what changed. Checking is the only outside connection the app makes, and you can turn it off there.
+- **Update now** downloads that release from this repository over HTTPS and backs up the current code. It swaps in the new code (your settings, history and `.venv` are kept), reinstalls dependencies only if `requirements.txt` changed, and restarts the app.
+- If the new version doesn't start within 2 minutes, the previous version is restored and restarted automatically, and Recent alerts says so.
+- Nothing installs without someone clicking Update. A copy cloned with git is never touched: update it with `git pull` and restart the app.
+- Copies installed before version 1.1.0 have no updater, so update those once by hand: download the zip, copy its files over the old folder, and restart the app.
+
+**Publishing an update:** set `VERSION` to the new number (e.g. `1.2.0`), commit, then `git tag -a v1.2.0 -m "What changed"` and `git push origin main --tags`. The tag's commit message is shown as the release notes, so write the commit message for users.
+
 ## Development
 
 ```
@@ -66,6 +78,7 @@ orbi/web.py        FastAPI API + serves web/
 orbi/tray.py       Windows tray icon and notifications
 orbi/routerui.py   router admin pages via headless Firefox (reads/writes), router log via plain HTTPS
 orbi/filtering.py  family-DNS providers, live verification, safe apply with rollback
+orbi/updater.py    update check against GitHub tags, download, swap with backup, restart helper with rollback
 web/               the app (vanilla JS, no build step)
 ```
 

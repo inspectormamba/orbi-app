@@ -28,6 +28,7 @@ DEFAULTS = {
     "default_profile_id": None,  # profile followed by devices that aren't in one (incl. brand-new devices)
     "hold_new_devices": False,  # block never-seen devices until a parent approves them
     "protected_macs": [],  # never blocked (this PC is added automatically)
+    "check_updates": True,  # look for new versions on GitHub twice a day (installing always needs a click)
     "revoked_sessions": {},  # nonce -> expiry of session tokens that were signed out
 }
 

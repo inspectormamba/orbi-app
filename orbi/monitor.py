@@ -92,7 +92,7 @@ class Monitor:
         self.reload_router()
         loops = {"health": self.health_loop, "scan": self.scan_loop, "enforce": self.enforce_loop,
                  "traffic": self.traffic_loop, "speedtest": self.speedtest_schedule_loop, "maintenance": self.maintenance_loop,
-                 "routerlog": self.routerlog_loop}
+                 "routerlog": self.routerlog_loop, "updates": self.update_loop}
         self._loops = loops
         for name in loops:
             self._spawn(name)
@@ -562,6 +562,23 @@ class Monitor:
             data["wifi"] = self.router.wifi()
         self.advanced = {"data": data, "ts": time.time()}
         return data
+
+    # ---- app updates ----
+    def update_loop(self):
+        self.stop_event.wait(60)  # let startup settle first
+        self._every(lambda: 12 * 3600, self.check_updates)
+
+    def check_updates(self, force: bool = False) -> dict:
+        from . import updater
+        if not force and not config.load()["check_updates"]:
+            return self.state.get("update") or {}
+        st = updater.check()
+        self.state["update"] = st
+        if st["available"] and not st["git_checkout"] and self.store.get("update_notified") != st["latest"]:
+            self.store.put("update_notified", st["latest"])
+            self.store.event("update", f"Orbi Control {st['latest']} is available", detail="More → Updates")
+            self.notify("Update available", f"Orbi Control {st['latest']} is ready to install (More → Updates).")
+        return st
 
     def maintenance_loop(self):
         self._every(lambda: 6 * 3600, self.store.prune)

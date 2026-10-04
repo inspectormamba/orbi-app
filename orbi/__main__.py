@@ -10,7 +10,7 @@ from logging.handlers import RotatingFileHandler
 
 import uvicorn
 
-from . import config
+from . import config, updater
 from .monitor import Monitor
 from .store import Store
 from .web import create_app
@@ -58,6 +58,8 @@ def main():
     log = logging.getLogger("orbi")
     store = Store(config.DATA_DIR / "orbi.db")
     tray = None
+    log.info("Orbi Control %s", updater.current_version())
+    update_note = updater.record_result(store, config.DATA_DIR)
     monitor = Monitor(store, notify=lambda t, m: tray and tray.notify(t, m))
     monitor.start()
 
@@ -78,6 +80,8 @@ def main():
         server.should_exit = True
 
     tray = Tray(monitor, url, quit_all)
+    if update_note:
+        threading.Timer(5, lambda: tray.notify(*update_note)).start()
     if not settings["pin_hash"] and not args.background:
         threading.Timer(2, lambda: webbrowser.open(url)).start()  # first run: open setup
     tray.run()

@@ -614,7 +614,51 @@ async function renderMore() {
   } });
   const advCard = h("section", { class: "card" }, h("h2", {}, "Advanced mode"),
     h("label", { class: "switch" }, "Show the Advanced tab (DHCP, logs, VPN, firewall rules…)", advToggle));
-  setView(alertCard, phone, guest, advCard, monitoring, routerCard, pinCard, h("div", { class: "muted small center" }, "Orbi Control runs on your PC and talks to the Orbi directly — no cloud."));
+  setView(alertCard, phone, guest, advCard, monitoring, routerCard, pinCard, updatesCard(settings),
+    h("div", { class: "muted small center" }, "Orbi Control runs on your PC and talks to the Orbi directly — no cloud. The only outside connection is the optional update check to GitHub."));
+}
+
+// ---------- app updates ----------
+function updatesCard(settings) {
+  const card = h("section", { class: "card form" }, h("h2", {}, "Updates"), h("div", { class: "muted small" }, h("span", { class: "spinner" })));
+  const auto = h("input", { type: "checkbox", checked: settings.check_updates, onchange: (e) =>
+    act(null, () => api("/api/settings", { method: "PATCH", body: { check_updates: e.target.checked } }), e.target.checked ? "Will check for updates" : "Update checks off").catch(() => (e.target.checked = !e.target.checked)) });
+  const show = (u) => {
+    const body = [h("h2", {}, "Updates"), h("div", {}, `Version ${u.current}`)];
+    if (u.git_checkout) body.push(h("div", { class: "muted small" }, "This copy is a git checkout, so it updates with git pull instead."));
+    else if (u.error) body.push(h("div", { class: "error-text" }, u.error));
+    else if (u.available) body.push(
+      h("div", { style: "font-weight:600;margin-top:6px" }, `Version ${u.latest} is available`),
+      u.notes ? h("pre", { class: "muted small", style: "white-space:pre-wrap;margin:6px 0" }, u.notes) : null,
+      h("button", { class: "btn primary", onclick: (e) => installUpdate(e.currentTarget, u.latest) }, `Update to ${u.latest}`),
+      h("div", { class: "muted small" }, "Downloads it from GitHub, restarts Orbi Control (about a minute), and puts the current version back automatically if the new one doesn't start."));
+    else if (u.latest) body.push(h("div", { class: "muted small" }, `You're up to date${u.checked ? ` (checked ${ago(u.checked)})` : ""}.`));
+    body.push(h("button", { class: "btn", onclick: (e) => act(e.currentTarget, () => api("/api/update/check", { body: {} })).then(show) }, "Check now"),
+      h("label", { class: "switch" }, "Check for updates automatically", auto));
+    fill(card, ...body);
+  };
+  api("/api/update").then(show).catch((e) => fill(card, h("h2", {}, "Updates"), h("div", { class: "error-text" }, e.message)));
+  return card;
+}
+
+async function installUpdate(btn, version) {
+  btn.disabled = true;
+  try {
+    await api("/api/update/apply", { body: {} });
+    await waitJob("update", "Downloading and installing");
+  } catch (ex) { toast(ex.message); btn.disabled = false; return; }
+  const t = $("#toast");
+  const started = Date.now();
+  for (;;) {  // the app restarts on the new code; wait for it to answer with the new version
+    t.replaceChildren(h("span", { class: "spinner" }), ` Restarting Orbi Control — ${Math.round((Date.now() - started) / 1000)}s`);
+    t.hidden = false;
+    await new Promise((r) => setTimeout(r, 3000));
+    try {
+      const s = await (await fetch("/api/session", { credentials: "same-origin" })).json();
+      if (s.version === version) { location.reload(); return; }
+      if (Date.now() - started > 150000) { toast(`Still on ${s.version}: the update didn't start, so the previous version was kept. See Recent alerts.`); return; }
+    } catch { /* restarting */ }
+  }
 }
 
 function rebootSheet() {

@@ -1,8 +1,10 @@
 """HTTP API + the web app (served to this PC's browser and phones on the home network)."""
 import io
 import ipaddress
+import os
 import re
 import socket
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -12,7 +14,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import auth, config, parental
+from . import auth, config, parental, updater
 from .monitor import Monitor, fmt_duration
 from .router import RouterClient, RouterError, norm_mac
 
@@ -81,6 +83,7 @@ class SettingsPatch(BaseModel):
     alert_admin_login_failures: bool | None = None
     mute_new_device_macs: list[str] | None = None
     router_host: str | None = None
+    check_updates: bool | None = None
 
 
 class PasswordBody(BaseModel):
@@ -165,6 +168,7 @@ def create_app(monitor: Monitor) -> FastAPI:
     def session(request: Request):
         s = config.load()
         return {"authenticated": auth.valid_session(request.cookies.get(auth.COOKIE)), "pin_set": bool(s["pin_hash"]),
+                "version": updater.current_version(),
                 "router_configured": bool(s["router_password_enc"])}
 
     @app.post("/api/setup")
@@ -538,7 +542,7 @@ def create_app(monitor: Monitor) -> FastAPI:
     def get_settings():
         s = config.load()
         return {k: s[k] for k in ("router_host", "health_interval", "scan_interval", "speedtest_daily_at", "alert_new_devices",
-                                   "alert_admin_login_failures", "mute_new_device_macs", "port")} | {
+                                   "alert_admin_login_failures", "mute_new_device_macs", "port", "check_updates")} | {
             "router_configured": bool(s["router_password_enc"])}
 
     @app.patch("/api/settings")
@@ -746,6 +750,41 @@ def create_app(monitor: Monitor) -> FastAPI:
             return {"ok": True}
         if not monitor.run_job("siteblock", apply):
             raise HTTPException(409, "A blocking change is already running")
+        return {"ok": True}
+
+    # ---------- app updates ----------
+    def update_status():
+        st = dict(monitor.state.get("update") or {"current": updater.current_version(), "git_checkout": updater.is_git_checkout()})
+        st.pop("zip", None)
+        return st | {"current": updater.current_version(), "auto_check": config.load()["check_updates"], "job": monitor.jobs.get("update")}
+
+    @app.get("/api/update")
+    def get_update():
+        return update_status()
+
+    @app.post("/api/update/check")
+    def check_update():
+        monitor.check_updates(force=True)
+        return update_status()
+
+    @app.post("/api/update/apply")
+    def apply_update(request: Request):
+        s = config.load()
+
+        def work():
+            info = monitor.check_updates(force=True)
+            if info.get("error"):
+                raise RuntimeError(info["error"])
+            if not info.get("available"):
+                raise RuntimeError("You're already on the latest version")
+            res = updater.apply(info, config.DATA_DIR, s["port"])
+            store.event("update", f"Installing Orbi Control {res['to']}", detail=f"from {res['from']}, requested from {client_ip(request)}")
+            threading.Timer(3, os._exit, (0,)).start()  # the helper restarts the app on the new code
+            return res
+        if updater.is_git_checkout():
+            raise HTTPException(409, "This copy is a git checkout. Update it with git pull instead.")
+        if not monitor.run_job("update", work):
+            raise HTTPException(409, "An update is already running")
         return {"ok": True}
 
     # ---------- web app ----------
