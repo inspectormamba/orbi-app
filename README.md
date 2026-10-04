@@ -66,7 +66,7 @@ Download the zip from GitHub (Code → Download ZIP) rather than cloning, and th
 - Nothing installs without someone clicking Update. A copy cloned with git is never touched: update it with `git pull` and restart the app.
 - Copies installed before version 1.1.0 have no updater, so update those once by hand: download the zip, copy its files over the old folder, and restart the app.
 
-**Publishing an update:** set `VERSION` to the new number (e.g. `1.2.0`), commit, then `git tag -a v1.2.0 -m "What changed"` and `git push origin main --tags`. The tag's commit message is shown as the release notes, so write the commit message for users.
+**Publishing an update:** set `VERSION` to the new number (e.g. `1.2.0`), commit, then `git tag -a v1.2.0 -m "What changed"` and `git push origin main --tags`. The tag message (the `-m` text) is shown in the app as the release notes, so write it for users.
 
 ## Development
 

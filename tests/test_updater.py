@@ -44,9 +44,15 @@ def install(tmp_path, monkeypatch):
 def test_parse_and_latest_picks_highest_tag(monkeypatch):
     assert updater.parse("v1.10.0") == (1, 10, 0) and updater.parse("nightly") is None
     tags = [{"name": "v1.2.0", "commit": {"sha": "a"}}, {"name": "v1.10.0", "commit": {"sha": "b"}}, {"name": "test", "commit": {"sha": "c"}}]
-    monkeypatch.setattr(updater, "_get_json", lambda url: tags if "/tags" in url else {"commit": {"message": "Notes for " + url[-1]}})
+    def fake(url):
+        if url.endswith("/tags?per_page=100"):
+            return tags
+        if "/git/ref/tags/" in url:
+            return {"object": {"type": "commit", "sha": "b"}}  # lightweight tag: falls back to the commit message
+        return {"commit": {"message": "Notes for b\n\nCo-Authored-By: Someone <x@y>"}}
+    monkeypatch.setattr(updater, "_get_json", fake)
     info = updater.latest()
-    assert info["version"] == "1.10.0" and info["notes"] == "Notes for b"
+    assert info["version"] == "1.10.0" and info["notes"] == "Notes for b"  # trailer stripped
     assert info["zip"] == "https://github.com/inspectormamba/orbi-app/archive/refs/tags/v1.10.0.zip"
 
 
@@ -56,6 +62,27 @@ def test_check_reports_available(install, monkeypatch):
     assert st["available"] and st["current"] == "1.1.0" and not st["git_checkout"]
     monkeypatch.setattr(updater, "latest", lambda: {"version": "1.1.0", "tag": "v1.1.0", "notes": "", "zip": "z"})
     assert not updater.check()["available"]
+
+
+def test_annotated_tag_message_is_the_release_notes(monkeypatch):
+    def fake(url):
+        if "/git/ref/tags/" in url:
+            return {"object": {"type": "tag", "sha": "t1"}}
+        if "/git/tags/t1" in url:
+            return {"message": "Orbi Control 1.2.0\n\n- New thing\n"}
+        raise AssertionError(url)
+    monkeypatch.setattr(updater, "_get_json", fake)
+    assert updater.release_notes({"name": "v1.2.0", "commit": {"sha": "c"}}) == "Orbi Control 1.2.0\n\n- New thing"
+
+
+def test_apply_accepts_check_output_and_ignores_its_url(install, monkeypatch):
+    root, data = install
+    urls = []
+    monkeypatch.setattr(updater, "_get", lambda url, limit=0: urls.append(url) or make_zip("1.2.0"))
+    updater.apply({"current": "1.1.0", "latest": "1.2.0", "available": True, "zip": "https://evil.example/x.zip"}, data, 8470,
+                  launch_helper=lambda *a: None)
+    assert urls == ["https://github.com/inspectormamba/orbi-app/archive/refs/tags/v1.2.0.zip"]
+    assert updater.current_version() == "1.2.0"
 
 
 def test_extract_rejects_unsafe_or_mismatched(tmp_path):

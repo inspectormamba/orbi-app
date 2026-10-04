@@ -10,6 +10,7 @@ import io
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -26,6 +27,7 @@ MANAGED_DIRS = ("orbi", "web", "scripts", "tests")  # replaced wholesale on upda
 SKIP = {".venv", ".git", ".pytest_cache", "__pycache__", ".gitignore"}
 MAX_ZIP = 50_000_000
 TASK = "Orbi Control"
+TRAILER = re.compile(r"^[A-Za-z-]+: \S")  # Co-Authored-By: ..., Signed-off-by: ...
 
 
 class UpdateError(Exception):
@@ -70,14 +72,24 @@ def latest() -> dict | None:
     if not tags:
         return None
     best = max(tags, key=lambda t: parse(t["name"]))
-    notes = ""
+    return {**_info(best["name"]), "notes": release_notes(best)}
+
+
+def release_notes(tag: dict) -> str:
+    """The annotated tag's message (written for users); else the commit message minus git trailers."""
     try:
-        notes = _get_json(f"https://api.github.com/repos/{REPO}/commits/{best['commit']['sha']}")["commit"]["message"]
+        ref = _get_json(f"https://api.github.com/repos/{REPO}/git/ref/tags/{tag['name']}")["object"]
+        if ref.get("type") == "tag":
+            return _get_json(f"https://api.github.com/repos/{REPO}/git/tags/{ref['sha']}")["message"].strip()[:4000]
+        msg = _get_json(f"https://api.github.com/repos/{REPO}/commits/{tag['commit']['sha']}")["commit"]["message"]
+        return "\n".join(l for l in msg.splitlines() if not TRAILER.match(l)).strip()[:4000]
     except Exception:  # notes are nice to have
-        pass
-    v = parse(best["name"])
-    return {"version": ".".join(map(str, v)), "tag": best["name"], "notes": notes.strip()[:4000],
-            "zip": f"https://github.com/{REPO}/archive/refs/tags/{best['name']}.zip"}
+        return ""
+
+
+def _info(tag_name: str) -> dict:
+    v = parse(tag_name)
+    return {"version": ".".join(map(str, v)), "tag": tag_name, "zip": f"https://github.com/{REPO}/archive/refs/tags/{tag_name}.zip"}
 
 
 def check() -> dict:
@@ -153,9 +165,13 @@ def apply(info: dict, data_dir: Path, port: int, launch_helper=None) -> dict:
     restart helper is running; the caller should then exit the app."""
     if is_git_checkout():
         raise UpdateError("This copy is a git checkout. Update it with git pull instead.")
+    version = info.get("version") or info["latest"]  # accepts latest() or check() output
+    if not parse(version):
+        raise UpdateError(f"Bad version {version!r}")
+    info = {**info, "version": version, "zip": _info(f"v{version}")["zip"]}  # the URL is always rebuilt from REPO
     work = data_dir / "update"
-    log.info("updating %s -> %s", current_version(), info["version"])
-    new_root = extract(_get(info["zip"], MAX_ZIP), work / "new", info["version"])
+    log.info("updating %s -> %s", current_version(), version)
+    new_root = extract(_get(info["zip"], MAX_ZIP), work / "new", version)
     bak = work / "backup"
     backup(bak)
     req = lambda root: (root / "requirements.txt").read_text("utf-8").split()  # ignores CRLF vs LF and blank lines
