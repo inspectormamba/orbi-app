@@ -1,4 +1,3 @@
--r requirements.txt
+# Test tools. Install requirements.txt first (it is hash-pinned, so it cannot be combined with this file).
 pytest
 httpx
-selenium

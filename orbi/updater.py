@@ -5,7 +5,14 @@ the fixed repository below over HTTPS, backs up the current code, swaps the new 
 .venv and all data), reinstalls dependencies only if requirements.txt changed, and restarts. A
 helper started from the *old* code watches the restart and puts the backup back if the new
 version doesn't come up. Git checkouts are never touched: update those with `git pull`.
+
+Releases are signed. scripts/release.py hashes every file in the tagged commit, signs that list
+with the project's Ed25519 release key (kept on the maintainer's PC, never on GitHub) and puts the
+signature in the tag message. Before installing, the downloaded files are hashed the same way and
+checked against PUBLIC_KEY, so someone who takes over the GitHub account still can't ship code.
 """
+import base64
+import hashlib
 import io
 import json
 import logging
@@ -19,6 +26,8 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
+from . import ed25519
+
 log = logging.getLogger("orbi.updater")
 
 REPO = "inspectormamba/orbi-app"  # fixed on purpose: updates can only ever come from here
@@ -28,6 +37,8 @@ SKIP = {".venv", ".git", ".pytest_cache", "__pycache__", ".gitignore"}
 MAX_ZIP = 50_000_000
 TASK = "Orbi Control"
 TRAILER = re.compile(r"^[A-Za-z-]+: \S")  # Co-Authored-By: ..., Signed-off-by: ...
+PUBLIC_KEY = bytes.fromhex("8ab2b50b1aa65f5a5e4500d0aa47b09a4ad73caaa4851a87885f2fbb81664af8")
+SIGNATURE = re.compile(r"^Orbi-Signature: ([A-Za-z0-9+/]{86}==)\s*$", re.M)
 
 
 class UpdateError(Exception):
@@ -78,12 +89,20 @@ def latest() -> dict | None:
     return {**_info(best["name"]), "notes": release_notes(best)}
 
 
+def tag_message(tag_name: str) -> str | None:
+    """The annotated tag's full message, or None for a lightweight tag."""
+    ref = _get_json(f"https://api.github.com/repos/{REPO}/git/ref/tags/{tag_name}")["object"]
+    if ref.get("type") != "tag":
+        return None
+    return _get_json(f"https://api.github.com/repos/{REPO}/git/tags/{ref['sha']}")["message"]
+
+
 def release_notes(tag: dict) -> str:
     """The annotated tag's message (written for users); else the commit message minus git trailers."""
     try:
-        ref = _get_json(f"https://api.github.com/repos/{REPO}/git/ref/tags/{tag['name']}")["object"]
-        if ref.get("type") == "tag":
-            return _get_json(f"https://api.github.com/repos/{REPO}/git/tags/{ref['sha']}")["message"].strip()[:4000]
+        msg = tag_message(tag["name"])
+        if msg is not None:
+            return SIGNATURE.sub("", msg).strip()[:4000]
         msg = _get_json(f"https://api.github.com/repos/{REPO}/commits/{tag['commit']['sha']}")["commit"]["message"]
         return "\n".join(l for l in msg.splitlines() if not TRAILER.match(l)).strip()[:4000]
     except Exception:  # notes are nice to have
@@ -133,6 +152,28 @@ def extract(data: bytes, dest: Path, expect_version: str) -> Path:
     return top
 
 
+def manifest(files: dict[str, bytes]) -> bytes:
+    """What a release signature covers: every file's SHA-256 and path, sorted by path."""
+    return "".join(f"{hashlib.sha256(files[k]).hexdigest()}  {k}\n" for k in sorted(files)).encode()
+
+
+def signed_message(version: str, files: dict[str, bytes]) -> bytes:
+    return f"orbi-control release {version}\n".encode() + manifest(files)
+
+
+def folder_files(folder: Path) -> dict[str, bytes]:
+    return {f.relative_to(folder).as_posix(): f.read_bytes() for f in sorted(folder.rglob("*")) if f.is_file()}
+
+
+def verify_release(folder: Path, version: str, message: str | None):
+    """Raises unless `message` (the tag message) carries a valid signature of exactly these files."""
+    m = SIGNATURE.search(message or "")
+    if not m:
+        raise UpdateError(f"Version {version} isn't signed with the project's release key, so it won't be installed")
+    if not ed25519.verify(PUBLIC_KEY, signed_message(version, folder_files(folder)), base64.b64decode(m.group(1))):
+        raise UpdateError(f"Version {version} doesn't match its signature (it may have been tampered with), so it won't be installed")
+
+
 def _top_files(folder: Path):
     return [p for p in folder.iterdir() if p.is_file() and p.name not in SKIP]
 
@@ -175,6 +216,7 @@ def apply(info: dict, data_dir: Path, port: int, launch_helper=None) -> dict:
     work = data_dir / "update"
     log.info("updating %s -> %s", current_version(), version)
     new_root = extract(_get(info["zip"], MAX_ZIP), work / "new", version)
+    verify_release(new_root, version, tag_message(f"v{version}"))
     bak = work / "backup"
     backup(bak)
     req = lambda root: (root / "requirements.txt").read_text("utf-8").split()  # ignores CRLF vs LF and blank lines

@@ -171,8 +171,7 @@ def test_throttle_escalates():
         assert t.attempt("1.2.3.4") == 0  # each attempt counts as a miss until success()
     assert 55 <= t.wait_seconds("1.2.3.4") <= 60
     assert t.attempt("1.2.3.4") > 0  # locked: refused without being checked
-    fails, _ = t._state["1.2.3.4"]
-    t._state["1.2.3.4"] = (fails, 0)  # let the lockout expire
+    t._state["1.2.3.4"]["until"] = 0  # let the lockout expire
     assert t.attempt("1.2.3.4") == 0
     assert t.wait_seconds("1.2.3.4") > 100  # doubled
     assert t.wait_seconds("5.6.7.8") == 0
@@ -206,3 +205,35 @@ def test_idle_sessions_sign_out(tmp_config, monkeypatch):
     assert not auth.valid_session(token, touch=True)
     now[0] -= 30 * 60  # and it stays signed out
     assert not auth.valid_session(token)
+
+
+def test_throttle_misses_expire(monkeypatch):
+    now = [1_000_000.0]
+    monkeypatch.setattr(auth.time, "time", lambda: now[0])
+    t = auth.Throttle()
+    for day in range(40):  # a typo a day from various devices never locks anyone out
+        ip = f"192.168.1.{day % 5 + 10}"
+        assert t.attempt(ip) == 0
+        t.failure(ip)
+        now[0] += 86400
+    assert t.wait_seconds("192.168.1.99") == 0
+
+
+def test_house_lockout_spares_this_pc_and_success_does_not_relock():
+    t = auth.Throttle()
+    for i in range(auth.Throttle.HOUSE + 6):
+        ip = f"192.168.1.{i // 4 + 10}"
+        if t.attempt(ip) == 0:
+            t.failure(ip)
+    assert t.wait_seconds("192.168.1.200") > 0  # other devices are locked out house-wide
+    assert t.wait_seconds("127.0.0.1") == 0  # the PC itself isn't
+    before = t._state["*"]["until"]
+    assert t.attempt("127.0.0.1") == 0
+    t.success("127.0.0.1")
+    assert t._state["*"]["until"] == before  # signing in correctly doesn't extend anyone's lockout
+
+
+def test_removing_an_extra_pin_signs_out_its_sessions(tmp_config):
+    main, spare = auth.make_session(""), auth.make_session("Spare")
+    auth.revoke_pin_sessions("Spare")
+    assert auth.valid_session(main) and not auth.valid_session(spare)

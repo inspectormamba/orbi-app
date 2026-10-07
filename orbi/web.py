@@ -4,6 +4,7 @@ import ipaddress
 import logging
 import os
 import re
+import secrets
 import socket
 import threading
 import time
@@ -24,6 +25,7 @@ log = logging.getLogger("orbi.web")
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 OPEN_PATHS = {"/api/session", "/api/login", "/api/setup"}
+INSTANCE = secrets.token_hex(8)  # changes on every start, so the page can tell the app restarted
 DNS_FILTERS = {  # what each family DNS service enforces was verified by querying them directly
     "185.228.168.168": "CleanBrowsing Family filter", "185.228.169.168": "CleanBrowsing Family filter",
     "185.228.168.10": "CleanBrowsing Adult filter", "185.228.169.11": "CleanBrowsing Adult filter",
@@ -158,8 +160,8 @@ def create_app(monitor: Monitor) -> FastAPI:
             raise HTTPException(409, "Router password not set yet (Settings)")
         return monitor.router
 
-    def set_cookie(resp: Response):
-        resp.set_cookie(auth.COOKIE, auth.make_session(), max_age=auth.SESSION_DAYS * 86400, httponly=True, samesite="strict")
+    def set_cookie(resp: Response, pin_label: str = ""):
+        resp.set_cookie(auth.COOKIE, auth.make_session(pin_label), max_age=auth.SESSION_DAYS * 86400, httponly=True, samesite="strict")
 
     def client_ip(request: Request) -> str:
         return request.client.host if request.client else "?"
@@ -171,23 +173,30 @@ def create_app(monitor: Monitor) -> FastAPI:
         name = monitor.device_by_ip(ip)
         return name if name.endswith(ip) else f"{name} ({ip})"
 
-    def require_pin(pin: str, request: Request, settings: dict, wrong: str = "Wrong PIN"):
-        """Every PIN check goes through the lockout, counted before the (slow) hash comparison."""
+    def require_pin(pin: str, request: Request, settings: dict, wrong: str = "Wrong PIN") -> str:
+        """Every PIN check goes through the lockout, counted before the (slow) hash comparison.
+        Returns the label of the PIN used ("" for the main PIN)."""
         ip = client_ip(request)
         wait = throttle.attempt(ip)
         if wait:
             raise HTTPException(429, f"Too many wrong PINs. Try again in {fmt_duration(wait)}.")
-        if not auth.check_any_pin(pin, settings):
+        label = auth.pin_label(pin, settings)
+        if label is None:
+            throttle.failure(ip)
             raise HTTPException(401, wrong)
         throttle.success(ip)
+        return label
 
     # ---------- session ----------
     @app.get("/api/session")
     def session(request: Request):
         s = config.load()
-        return {"authenticated": auth.valid_session(request.cookies.get(auth.COOKIE)), "pin_set": bool(s["pin_hash"]),
-                "version": updater.RUNNING,
-                "router_configured": bool(s["router_password_enc"])}
+        signed_in = auth.valid_session(request.cookies.get(auth.COOKIE))
+        out = {"authenticated": signed_in, "pin_set": bool(s["pin_hash"]), "instance": INSTANCE,
+               "router_configured": bool(s["router_password_enc"])}
+        if signed_in or client_ip(request) in auth.LOCAL_IPS:  # the update helper on this PC checks the version
+            out["version"] = updater.RUNNING
+        return out
 
     @app.post("/api/setup")
     def setup(body: SetupBody, response: Response):
@@ -206,9 +215,9 @@ def create_app(monitor: Monitor) -> FastAPI:
         s = config.load()
         if not s["pin_hash"]:
             raise HTTPException(401, "Wrong PIN")
-        require_pin(body.pin, request, s)
-        set_cookie(response)
-        store.event("action", "Signed in to Orbi Control")
+        label = require_pin(body.pin, request, s)
+        set_cookie(response, label)
+        store.event("action", "Signed in to Orbi Control", detail=f"with the extra PIN \"{label}\"" if label else "")
         return {"ok": True}
 
     @app.post("/api/logout")
@@ -582,6 +591,10 @@ def create_app(monitor: Monitor) -> FastAPI:
             if not host.is_private or host.is_loopback or host.is_link_local or host.is_unspecified:
                 raise HTTPException(400, "Router address must be a private address on your home network")
             patch["router_host"] = str(host)
+        if patch.get("router_host") and patch["router_host"] != config.load()["router_host"]:
+            # Never send the saved password to a new address: it has to be typed in again for that router.
+            patch["router_password_enc"] = ""
+            store.event("action", "Router address changed", detail=f"to {patch['router_host']}; router password cleared", severity="warn")
         if "mute_new_device_macs" in patch:
             patch["mute_new_device_macs"] = sorted({norm_mac(m) for m in patch["mute_new_device_macs"] if m.strip()})
         config.save(patch)
@@ -640,6 +653,7 @@ def create_app(monitor: Monitor) -> FastAPI:
         if len(extra) == len(s.get("extra_pins", [])):
             raise HTTPException(404, "No such PIN")
         config.save({"extra_pins": extra})
+        auth.revoke_pin_sessions(label)  # devices that signed in with it are signed out too
         store.event("action", f"Extra app PIN removed ({label})")
         return {"ok": True}
 
@@ -789,6 +803,8 @@ def create_app(monitor: Monitor) -> FastAPI:
     @app.post("/api/update/apply")
     def apply_update(request: Request):
         s = config.load()
+        if not s["check_updates"]:
+            raise HTTPException(409, "Updates are turned off (More → Updates)")
 
         def work():
             info = monitor.check_updates(force=True)

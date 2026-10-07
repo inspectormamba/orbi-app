@@ -9,7 +9,7 @@ if (-not (Test-Path (Join-Path $venv "Scripts\pythonw.exe"))) {
     Write-Host "Creating Python environment..."
     py -3 -m venv $venv
 }
-& (Join-Path $venv "Scripts\python.exe") -m pip install --quiet --upgrade pip
+# requirements.txt pins every package with its hash, so pip installs exactly those files or nothing.
 & (Join-Path $venv "Scripts\python.exe") -m pip install --quiet -r (Join-Path $root "requirements.txt")
 
 $action = New-ScheduledTaskAction -Execute (Join-Path $venv "Scripts\pythonw.exe") -Argument "-m orbi --background" -WorkingDirectory $root

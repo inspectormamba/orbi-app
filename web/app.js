@@ -631,14 +631,14 @@ async function renderMore() {
   const advCard = h("section", { class: "card" }, h("h2", {}, "Advanced mode"),
     h("label", { class: "switch" }, "Show the Advanced tab (DHCP, logs, VPN, firewall rules…)", advToggle));
   setView(alertCard, phone, guest, advCard, monitoring, routerCard, pinCard, updatesCard(settings),
-    h("div", { class: "muted small center" }, "Orbi Control runs on your PC and talks to the Orbi directly — no cloud. The only outside connection is the optional update check to GitHub."));
+    h("div", { class: "muted small center" }, "Orbi Control runs on your PC and talks to the Orbi directly — no cloud. Outside connections: the optional update check to GitHub, and internet checks to 1.1.1.1, 8.8.8.8 and 9.9.9.9."));
 }
 
 // ---------- app updates ----------
 function updatesCard(settings) {
   const card = h("section", { class: "card form" }, h("h2", {}, "Updates"), h("div", { class: "muted small" }, h("span", { class: "spinner" })));
   const auto = h("input", { type: "checkbox", checked: settings.check_updates, onchange: (e) =>
-    act(null, () => api("/api/settings", { method: "PATCH", body: { check_updates: e.target.checked } }), e.target.checked ? "Will check for updates" : "Update checks off").catch(() => (e.target.checked = !e.target.checked)) });
+    act(null, () => api("/api/settings", { method: "PATCH", body: { check_updates: e.target.checked } }), e.target.checked ? "Will check for updates" : "Updates off").catch(() => (e.target.checked = !e.target.checked)) });
   const show = (u) => {
     const body = [h("h2", {}, "Updates"), h("div", {}, `Version ${u.current}`)];
     if (u.git_checkout) body.push(h("div", { class: "muted small" }, "This copy is a git checkout, so it updates with git pull instead."));
@@ -647,10 +647,10 @@ function updatesCard(settings) {
       h("div", { style: "font-weight:600;margin-top:6px" }, `Version ${u.latest} is available`),
       u.notes ? h("pre", { class: "muted small", style: "white-space:pre-wrap;margin:6px 0" }, u.notes) : null,
       h("button", { class: "btn primary", onclick: (e) => installUpdate(e.currentTarget, u.latest) }, `Update to ${u.latest}`),
-      h("div", { class: "muted small" }, "Downloads it from GitHub, restarts Orbi Control (about a minute), and puts the current version back automatically if the new one doesn't start."));
+      h("div", { class: "muted small" }, "Downloads it from GitHub, checks it's signed with the project's release key, restarts Orbi Control (about a minute, and you'll need to sign in again), and puts the current version back automatically if the new one doesn't start."));
     else if (u.latest) body.push(h("div", { class: "muted small" }, `You're up to date${u.checked ? ` (checked ${ago(u.checked)})` : ""}.`));
     body.push(h("button", { class: "btn", onclick: (e) => act(e.currentTarget, () => api("/api/update/check", { body: {} })).then(show) }, "Check now"),
-      h("label", { class: "switch" }, "Check for updates automatically", auto));
+      h("label", { class: "switch" }, "Allow updates (checks GitHub twice a day; installing always needs a click)", auto));
     fill(card, ...body);
   };
   api("/api/update").then(show).catch((e) => fill(card, h("h2", {}, "Updates"), h("div", { class: "error-text" }, e.message)));
@@ -659,20 +659,22 @@ function updatesCard(settings) {
 
 async function installUpdate(btn, version) {
   btn.disabled = true;
+  let before;
   try {
+    before = (await api("/api/session")).instance;
     await api("/api/update/apply", { body: {} });
     await waitJob("update", "Downloading and installing");
   } catch (ex) { toast(ex.message); btn.disabled = false; return; }
   const t = $("#toast");
   const started = Date.now();
-  for (;;) {  // the app restarts on the new code; wait for it to answer with the new version
+  for (;;) {  // the app restarts (which signs everyone out); wait for the new copy to answer
     t.replaceChildren(h("span", { class: "spinner" }), ` Restarting Orbi Control — ${Math.round((Date.now() - started) / 1000)}s`);
     t.hidden = false;
     await new Promise((r) => setTimeout(r, 3000));
     try {
       const s = await (await fetch("/api/session", { credentials: "same-origin" })).json();
-      if (s.version === version) { location.reload(); return; }
-      if (Date.now() - started > 150000) { toast(`Still on ${s.version}: the update didn't start, so the previous version was kept. See Recent alerts.`); return; }
+      // If version 'version' didn't start, the previous one is restored; Recent alerts says which after signing in.
+      if (s.instance !== before && Date.now() - started > 15000) { location.reload(); return; }
     } catch { /* restarting */ }
   }
 }
@@ -715,13 +717,22 @@ function filteringCard() {
         chip(c.youtube === "moderate" || c.youtube === "strict", `YouTube Restricted${c.youtube && c.youtube !== "unrestricted" ? ` (${c.youtube})` : ""}`),
         chip(!!c.safesearch, "SafeSearch"), chip(!!c.adult_blocked, "Adult sites blocked")),
       h("div", { class: "muted small", style: "margin-top:8px" }, "Applies to every device in the house. To stop devices from switching to their own DNS or a VPN, add the router rules below."),
-      h("button", { class: "btn small", style: "margin-top:8px", onclick: (e) => act(e.currentTarget, async () => {
-        await api("/api/filtering/protect", { body: {} });
-        const r = await waitJob("protect", "Checking router rules");
-        return { note: r && r.added && r.added.length ? `Added: ${r.added.join(", ")}` : "All protection rules were already in place" };
-      }) }, "Add rules that block DNS & VPN workarounds"));
+      h("button", { class: "btn small", style: "margin-top:8px", onclick: protectSheet }, "Add rules that block DNS & VPN workarounds…"));
   }).catch((e) => fill(card, h("h2", {}, "Content filtering"), h("div", { class: "error-text" }, e.message)));
   return card;
+}
+
+function protectSheet() {
+  openSheet(h("h3", {}, "Block DNS & VPN workarounds?"),
+    h("p", { style: "margin:0" }, "Adds router rules that block outside DNS (ports 53 and 853) and OpenVPN and WireGuard VPNs (ports 1194 and 51820) for every device in the house, adults included."),
+    h("p", { class: "muted small" }, "A work laptop that connects to the office over OpenVPN or WireGuard on those ports will stop connecting. Check before adding them; you can remove them on the router's Block Services page."),
+    h("div", { class: "btns" }, h("button", { class: "btn", onclick: closeSheet }, "Cancel"),
+      h("button", { class: "btn primary", onclick: (e) => act(e.currentTarget, async () => {
+        await api("/api/filtering/protect", { body: {} });
+        const r = await waitJob("protect", "Checking router rules");
+        closeSheet();
+        return { note: r && r.added && r.added.length ? `Added: ${r.added.join(", ")}` : "All protection rules were already in place" };
+      }) }, "Add the rules")));
 }
 
 function filteringSheet(f) {

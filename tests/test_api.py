@@ -1,6 +1,7 @@
 import pytest
 from fastapi.testclient import TestClient
 
+from orbi import config
 from orbi.web import create_app
 
 
@@ -177,6 +178,15 @@ def test_router_host_must_be_a_private_ip(client):
     for bad in ("evil.example.com", "8.8.8.8", "127.0.0.1", "0.0.0.0"):
         assert client.patch("/api/settings", json={"router_host": bad}).status_code == 400, bad
     assert client.patch("/api/settings", json={"router_host": "192.168.1.1"}).status_code == 200
+
+
+def test_new_router_address_needs_the_password_again(client, monkeypatch):
+    setup_pin(client)
+    config.save({"router_password_enc": "x"})
+    client.patch("/api/settings", json={"router_host": "192.168.1.1"})  # unchanged: kept
+    assert config.load()["router_password_enc"] == "x"
+    client.patch("/api/settings", json={"router_host": "192.168.1.66"})
+    assert config.load()["router_password_enc"] == ""  # never sent to the new address
 
 
 def test_file_api_is_gone(client):

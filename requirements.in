@@ -1,0 +1,8 @@
+pynetgear==0.10.10
+fastapi==0.142.2
+uvicorn==0.54.0
+pystray==0.19.5
+pillow==12.3.0
+qrcode==8.2
+selenium==4.50.0
+dnspython==2.8.0

@@ -25,7 +25,9 @@ A local replacement for the Netgear Orbi app. It runs on a Windows PC, talks to 
 
 - On this PC: http://localhost:8470 (or the tray icon → Open). The tray icon turns green, amber, or red with status.
 - On your phone: run `allow-phone-access.ps1` once and approve the admin prompt. Then open the address shown under **More → Use it on your phone** (or scan its QR code) while on home Wi-Fi, and add it to your home screen.
-- The first time you open it, choose a PIN. Do this on the PC **before** running `allow-phone-access.ps1`, because whoever opens the app first sets it. Everyone on your Wi-Fi can reach the page, so the PIN keeps kids from unpausing themselves. Prefer a passphrase over 6 digits; any characters work. After 5 wrong guesses from one device, or 20 across the house, PIN entry locks, with lockouts that grow longer each time. Changing the PIN removes any extra PINs and signs out every other device.
+- The first time you open it, choose a PIN. Do this on the PC **before** running `allow-phone-access.ps1`, because whoever opens the app first sets it. Everyone on your Wi-Fi can reach the page, so the PIN keeps kids from unpausing themselves. Prefer a passphrase over 6 digits; any characters work. After 5 wrong guesses from one device, or 20 across the house, within an hour, PIN entry locks, with lockouts that grow longer each time. Wrong guesses are forgotten after an hour, and the house-wide lockout never applies to this PC, so wrong PINs sent from another device can't lock you out at the PC. Changing the PIN removes any extra PINs and signs out every other device; removing an extra PIN signs out the devices that used it.
+- A device signs itself out after 30 minutes without use, and restarting the app signs everyone out.
+- Every change made in the app is recorded with the device that made it (Recent alerts and History). If whole-house blocking loses sites, or the content filter is switched off, you get an alert.
 
 ## Reliability
 
@@ -42,8 +44,9 @@ A local replacement for the Netgear Orbi app. It runs on a Windows PC, talks to 
 - Phones that use a "Private Wi-Fi address" that keeps rotating look like new devices. Turn rotation off for your home network on kids' devices.
 - The Orbi doesn't report usage per device, only totals for the network. So there are no per-device time limits; use schedules, pause and extra time instead.
 - Content filtering and app blocking apply to the whole house. Per-person filtering needs device-level controls (Apple Screen Time / Google Family Link).
+- Outside connections: the update check to GitHub (can be turned off), and connection checks to 1.1.1.1, 8.8.8.8 and 9.9.9.9 (port 443) every 30 seconds to tell an internet outage from a router problem. Selenium's usage statistics are turned off.
 - The app is plain HTTP on your home network, so your PIN and session cookie travel unencrypted over Wi-Fi. Anyone already on your network who can capture traffic could read them. Skip `allow-phone-access.ps1` if you only use it on this PC.
-- The router's admin pages use a self-signed certificate, so the app can't verify it. It only ever logs in over HTTPS, and only to a private (LAN) address.
+- The router's admin pages use a self-signed certificate, so the app can't verify it. It only ever logs in over HTTPS, and only to a private (LAN) address. Changing the router address clears the saved password, so it is never sent to a new address until you type it in again.
 - Browsers that use their own encrypted DNS (DNS-over-HTTPS) can sidestep DNS-based filtering. The protection rules block encrypted DNS on port 853, but not DNS-over-HTTPS, which shares port 443 with normal web traffic.
 - The Orbi doesn't report who is connected to its VPN server.
 - Settings only available on the router's admin pages (DNS, Block Sites, schedules, block rules, VPN status) are read and changed by driving those pages in a headless Firefox. Firefox must stay installed.
@@ -58,15 +61,16 @@ A local replacement for the Netgear Orbi app. It runs on a Windows PC, talks to 
 
 ## Updating
 
-Download the zip from GitHub (Code → Download ZIP) rather than cloning, and the app can update itself:
+Download the zip from GitHub (Code → Download ZIP) and the app can update itself. Clone with git instead if you'd rather review every change yourself; a git copy never updates itself.
 
-- Twice a day it checks this repository's version tags (`vX.Y.Z`) for a newer release. You get a Windows notification, and **More → Updates** shows what changed. Checking is the only outside connection the app makes, and you can turn it off there.
-- **Update now** downloads that release from this repository over HTTPS and backs up the current code. It swaps in the new code (your settings, history and `.venv` are kept), reinstalls dependencies only if `requirements.txt` changed, and restarts the app.
+- Twice a day it checks this repository's version tags (`vX.Y.Z`) for a newer release. You get a Windows notification, and **More → Updates** shows what changed. Turning updates off there stops both the check and installing.
+- Every release is signed with the project's release key, which lives on the maintainer's PC and never on GitHub. Before installing, the app hashes every downloaded file and checks the signature against the key built into it, and refuses anything unsigned or changed. So taking over the GitHub account isn't enough to push code to your PC.
+- **Update now** downloads that release from this repository over HTTPS and backs up the current code. It swaps in the new code (your settings, history and `.venv` are kept), reinstalls dependencies only if `requirements.txt` changed, and restarts the app. Everyone is signed out by the restart.
 - If the new version doesn't start within 2 minutes, the previous version is restored and restarted automatically, and Recent alerts says so.
 - Nothing installs without someone clicking Update. A copy cloned with git is never touched: update it with `git pull` and restart the app.
-- Copies installed before version 1.1.2 have no working updater, so update those once by hand: download the zip, copy its files over the old folder, and restart the app.
+- Copies installed before version 1.1.2 have no working updater, so update those once by hand: download the zip, copy its files over the old folder, and restart the app. Versions before 1.1.3 don't check signatures; they start checking once they're on 1.1.3.
 
-**Publishing an update:** set `VERSION` to the new number (e.g. `1.2.0`), commit, then `git tag -a v1.2.0 -m "What changed"` and `git push origin main --tags`. The tag message (the `-m` text) is shown in the app as the release notes, so write it for users.
+**Publishing an update** (only from the PC with the release key): set `VERSION` to the new number (e.g. `1.2.0`) and commit. Then run `.venv\Scripts\python scripts\release.py 1.2.0 "What changed"`, which creates the signed tag, and `git push origin main --tags`. The notes are shown in the app as the release notes, so write them for users. A tag made with plain `git tag` won't install.
 
 ## Development
 
@@ -78,10 +82,13 @@ orbi/web.py        FastAPI API + serves web/
 orbi/tray.py       Windows tray icon and notifications
 orbi/routerui.py   router admin pages via headless Firefox (reads/writes), router log via plain HTTPS
 orbi/filtering.py  family-DNS providers, live verification, safe apply with rollback
-orbi/updater.py    update check against GitHub tags, download, swap with backup, restart helper with rollback
+orbi/updater.py    update check against GitHub tags, signature check, download, swap with backup, restart helper with rollback
+orbi/ed25519.py    release signatures (RFC 8032 reference code, no dependencies)
+scripts/release.py        tag and sign a release; --verify checks an existing tag
+scripts/lock_requirements.py  regenerate the hash-pinned requirements.txt from requirements.in
 web/               the app (vanilla JS, no build step)
 ```
 
-- `pip install -r requirements-dev.txt` then `pytest`. The tests use a fake router: schedules (including overnight and week-wrap), precedence of pause, extra time and schedules, enforcement and self-healing, outage detection, auth and lockout, and the full API.
+- `pip install -r requirements.txt`, then `pip install -r requirements-dev.txt`, then `pytest`. `requirements.txt` pins every package with its hashes; change versions in `requirements.in` and run `scripts/lock_requirements.py`. The tests use a fake router: schedules (including overnight and week-wrap), precedence of pause, extra time and schedules, enforcement and self-healing, outage detection, auth and lockout, and the full API.
 - `tests/live/live_e2e.py <url> <mac> <ip>` runs against a real router through a running instance. It briefly pauses one test device and confirms with ping that the device really goes offline.
 - `tests/live/screenshots.py <url> <pin> <outdir> [light]` takes phone-sized screenshots of every screen.

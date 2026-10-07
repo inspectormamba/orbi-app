@@ -1,3 +1,4 @@
+import base64
 import io
 from .test_api import client  # noqa: F401  (fixture)
 import json
@@ -5,7 +6,7 @@ import zipfile
 
 import pytest
 
-from orbi import updater
+from orbi import ed25519, updater
 from orbi.store import Store
 
 
@@ -38,7 +39,20 @@ def install(tmp_path, monkeypatch):
     monkeypatch.setattr(updater, "ROOT", root)
     data = tmp_path / "data"
     data.mkdir()
+    monkeypatch.setattr(updater, "PUBLIC_KEY", ed25519.public_key(TEST_KEY))
+    monkeypatch.setattr(updater, "tag_message", lambda tag: signed_tag(data, tag))
     return root, data
+
+
+TEST_KEY = bytes(range(32))
+
+
+def signed_tag(data, tag, key=TEST_KEY, edit=None):
+    """A tag message signed over what was just downloaded (optionally signing an edited copy instead)."""
+    top = next((data / "update" / "new").iterdir())
+    files = updater.folder_files(top) | (edit or {})
+    sig = ed25519.sign(key, updater.signed_message(tag.lstrip("v"), files))
+    return f"Orbi Control {tag}\n\nOrbi-Signature: {base64.b64encode(sig).decode()}\n"
 
 
 def test_parse_and_latest_picks_highest_tag(monkeypatch):
@@ -151,3 +165,36 @@ def test_update_api(client):
     client.post("/api/setup", json={"pin": "246810"})
     assert client.get("/api/session").json()["version"] == updater.RUNNING == updater.current_version()
     assert client.post("/api/update/apply", json={}).status_code == 409  # this repo is a git checkout
+
+
+@pytest.mark.parametrize("message, error", [
+    (lambda data, tag: "Orbi Control 1.2.0, no signature", "isn't signed"),
+    (lambda data, tag: None, "isn't signed"),  # lightweight tag
+    (lambda data, tag: signed_tag(data, tag, key=bytes(32)), "doesn't match"),  # someone else's key
+    (lambda data, tag: signed_tag(data, tag, edit={"orbi/__main__.py": b"# what was signed\n"}), "doesn't match"),  # files changed
+])
+def test_unsigned_or_tampered_releases_are_refused(install, monkeypatch, message, error):
+    root, data = install
+    monkeypatch.setattr(updater, "_get", lambda url, limit=0: make_zip("1.2.0"))
+    monkeypatch.setattr(updater, "tag_message", lambda tag: message(data, tag))
+    with pytest.raises(updater.UpdateError, match=error):
+        updater.apply({"version": "1.2.0", "zip": "z"}, data, 8470, launch_helper=lambda *a: None)
+    assert updater.current_version() == "1.1.0" and (root / "orbi" / "__main__.py").read_text() == "# old app\n"
+
+
+def test_signature_is_hidden_from_release_notes(monkeypatch):
+    monkeypatch.setattr(updater, "tag_message", lambda name: "Orbi Control 1.2.0\n\n- New thing\n\nOrbi-Signature: " + "A" * 86 + "==\n")
+    assert updater.release_notes({"name": "v1.2.0", "commit": {"sha": "c"}}) == "Orbi Control 1.2.0\n\n- New thing"
+
+
+def test_session_hides_version_unless_signed_in(client):
+    assert "version" not in client.get("/api/session").json()
+    client.post("/api/setup", json={"pin": "246810"})
+    assert client.get("/api/session").json()["version"] == updater.RUNNING
+
+
+def test_updates_off_blocks_installing(client):
+    client.post("/api/setup", json={"pin": "246810"})
+    client.patch("/api/settings", json={"check_updates": False})
+    r = client.post("/api/update/apply", json={})
+    assert r.status_code == 409 and "turned off" in r.json()["detail"]
