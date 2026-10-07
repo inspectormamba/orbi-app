@@ -13,7 +13,7 @@ import threading
 import time
 from datetime import datetime, timedelta
 
-from . import config, parental
+from . import config, parental, vpnlog
 from .router import RouterClient, RouterError, backhaul_kind, norm_mac
 from .store import Store
 
@@ -682,6 +682,8 @@ class Monitor:
                 self.store.event("vpn_attempt", f"{who} tried to use a VPN", detail=f"Blocked by the router ({kind.split(': ', 1)[1]}) · {e['source']}",
                                  severity="warn", mac=self.mac_by_ip(e["source"]), ts=e["ts"])
                 self.notify("VPN attempt blocked", f"{who} tried to connect to a VPN")
+            elif kind.startswith(vpnlog.KIND_PREFIX):
+                self._vpn_server_event(e)
             elif kind == "Admin login failure" and e["source"] not in mine:
                 if not config.load().get("alert_admin_login_failures", True):
                     continue  # failed-login logging disabled: no event, no notification
@@ -690,6 +692,31 @@ class Monitor:
                 self.store.event("admin_fail", "Failed login to the router's admin page", detail=f"From {self.device_by_ip(e['source'])} ({e['source']})",
                                  severity="error", mac=self.mac_by_ip(e["source"]), ts=e["ts"])
                 self.notify("Router login failed", f"Someone at {e['source']} tried to log in to the Orbi admin page")
+
+    def _vpn_server_event(self, e):
+        """Someone connected to, disconnected from, or failed to connect to the Orbi's own VPN server."""
+        ev = vpnlog.event_of(e["kind"], e["text"])
+        if not ev:
+            return
+        action, ip = ev
+        where = f"from inside your home ({self.device_by_ip(ip)}, {ip})" if vpnlog.is_inside(ip) else f"from {ip}"
+        if action == "connect":
+            # Phones reconnect every few minutes: only a gap since this address's last connection starts a new session.
+            seen = self.store.get("vpn_last_connect", {})
+            last, seen[ip] = seen.get(ip), e["ts"]
+            self.store.put("vpn_last_connect", {k: v for k, v in seen.items() if e["ts"] - v < 86400})
+            if last is None or e["ts"] - last > vpnlog.SESSION_GAP:
+                self.store.event("vpn_connect", "Connected to the home VPN", detail=where, ts=e["ts"])
+        elif action == "drop":
+            self.store.event("vpn_disconnect", "Disconnected from the home VPN", detail=where, ts=e["ts"])
+        elif not vpnlog.is_inside(ip):
+            # From outside: a device without a working VPN profile is trying to get in. One alert per burst.
+            seen = self.store.get("vpn_last_fail", {})
+            last, seen[ip] = seen.get(ip), e["ts"]
+            self.store.put("vpn_last_fail", {k: v for k, v in seen.items() if e["ts"] - v < 86400})
+            if last is None or e["ts"] - last > vpnlog.FAIL_GAP:
+                self.store.event("vpn_fail", "Failed attempt to connect to the home VPN", detail=where, severity="warn", ts=e["ts"])
+                self.notify("Failed VPN connection", f"Someone {where} tried to connect to your home VPN")
 
     def _recent_alert(self, kind, source, seconds):
         return self.store.one("SELECT 1 AS x FROM events WHERE kind=? AND detail LIKE ? AND ts > ?",

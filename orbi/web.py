@@ -979,6 +979,18 @@ def create_app(monitor: Monitor) -> FastAPI:
         return {"vpn": data.get("vpn"), "ddns": ddns, "ddns_check": check, "ts": (cached or {}).get("ts"),
                 "reading": bool(job.get("running")), "error": None if cached else job.get("error")}
 
+    @app.get("/api/vpn-log")
+    def vpn_log(days: int = 14):
+        """Connections to the Orbi's VPN server, from the router log the app has collected."""
+        from . import vpnlog
+        rows = store.q("SELECT ts, kind, text FROM router_log WHERE kind LIKE 'OpenVPN, connection%' AND ts > ?",
+                       (time.time() - min(max(days, 1), 90) * 86400,))
+        out = vpnlog.summarize(rows)
+        for f in out["failures"]:
+            if f["inside"]:
+                f["device"] = monitor.device_by_ip(f["ip"])
+        return out
+
     @app.put("/api/ddns")
     def set_ddns(body: DdnsBody):
         host, user = body.host.strip().lower(), body.user.strip()

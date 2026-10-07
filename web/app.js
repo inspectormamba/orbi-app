@@ -969,10 +969,45 @@ function remoteCard() {
         h("dt", {}, "Orbi VPN server"), h("dd", {}, v.enabled ? `On · ${String(v.protocol || "").toUpperCase()} port ${v.port}` : "Off"),
         h("dt", {}, "Dynamic DNS"), h("dd", {}, d.enabled ? `${d.provider} · ${ddnsState}` : "Off")),
       c && !c.current ? h("div", { class: "note" }, "Your Dynamic DNS name doesn't point at your current internet address, so connecting from outside may fail until the router updates it.") : null,
-      h("div", { class: "muted small" }, "To use Orbi Control away from home, connect your phone to the Orbi's VPN (set up in the Orbi app), then open the same address as at home. Dynamic DNS keeps a name like myhome.ddns.net pointing at your home's internet address, which the VPN uses to find home."));
+      h("div", { class: "muted small" }, "To use Orbi Control away from home, connect your phone to the Orbi's VPN (set up in the Orbi app), then open the same address as at home. Dynamic DNS keeps a name like myhome.ddns.net pointing at your home's internet address, which the VPN uses to find home."),
+      vpnLogList());
   };
   load().catch((e) => fill(card, h("h2", {}, "Away from home"), h("div", { class: "error-text" }, e.message)));
   return card;
+}
+
+// Connections to the Orbi's VPN server, from the router log (the Orbi doesn't log who, only from where).
+function vpnSessionRow(x) {
+  const when = x.start == null ? `Until ${fmtWhen(x.end)}` : x.end ? `${fmtWhen(x.start)} – ${fmtTime(x.end)}` : `Since ${fmtWhen(x.start)}`;
+  const extra = [x.reconnects ? `reconnected ${x.reconnects}×` : null, x.end ? null : "disconnect not logged"].filter(Boolean).join(" · ");
+  return h("div", { class: "row" }, ico("wifi"), h("div", { class: "main" },
+    h("div", { class: "name" }, x.inside ? `From inside your home (${x.ip})` : `From ${x.ip}`),
+    h("div", { class: "meta" }, [when, extra].filter(Boolean).join(" · "))));
+}
+
+function vpnFailRow(x) {
+  const span = x.first === x.last ? fmtWhen(x.first) : `${fmtWhen(x.first)} – ${fmtTime(x.last)}`;
+  return h("div", { class: "row" }, h("div", { class: "main" },
+    h("div", { class: "name" }, `${x.count} failed attempt${x.count === 1 ? "" : "s"} ${x.inside ? `from inside your home (${x.device || x.ip})` : `from ${x.ip}`}`),
+    h("div", { class: "meta" }, span + (x.inside ? " · usually a phone trying the VPN while it's on home Wi-Fi" : ""))),
+    x.inside ? null : h("span", { class: "pill warn" }, "Outside"));
+}
+
+function vpnLogList() {
+  const box = h("div", {}, h("div", { class: "group-label" }, "Recent VPN connections"), h("div", { class: "muted small" }, h("span", { class: "spinner" })));
+  api("/api/vpn-log?days=14").then((r) => {
+    const showAll = () => openSheet(h("h3", {}, "VPN connections (14 days)"),
+      ...(r.sessions.length ? r.sessions.map(vpnSessionRow) : [h("div", { class: "muted small" }, "None.")]),
+      h("div", { class: "group-label" }, "Failed attempts"), ...(r.failures.length ? r.failures.map(vpnFailRow) : [h("div", { class: "muted small" }, "None.")]),
+      h("p", { class: "muted small" }, "The Orbi logs where each connection came from, not who made it. Phones on mobile data reconnect every few minutes; those are grouped into one session."),
+      h("div", { class: "btns" }, h("button", { class: "btn", onclick: closeSheet }, "Close")));
+    const outsideFails = r.failures.filter((f) => !f.inside);
+    fill(box, h("div", { class: "group-label" }, "Recent VPN connections"),
+      ...(r.sessions.length ? r.sessions.slice(0, 4).map(vpnSessionRow) : [h("div", { class: "muted small" }, "No connections in the last 14 days.")]),
+      outsideFails.length ? vpnFailRow(outsideFails[0]) : null,
+      r.sessions.length > 4 || r.failures.length ? h("button", { class: "btn small", style: "margin-top:6px", onclick: showAll }, "Show all") : null);
+  }).catch((e) => fill(box, h("div", { class: "error-text" }, e.message)));
+  return box;
 }
 
 function ddnsSheet(d) {
