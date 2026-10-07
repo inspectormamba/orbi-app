@@ -711,7 +711,32 @@ class Monitor:
             data["wifi"] = self.router.wifi()
         self.advanced = {"data": data, "ts": time.time()}
         self._watch_block_sites(data.get("block_sites"))
+        self._watch_block_services(data.get("block_services"))
         return data
+
+    def _watch_block_services(self, now):
+        """Alert when the router's firewall rules get weaker: a rule removed, narrowed to fewer devices, or all
+        rules turned off."""
+        if not now:
+            return
+        before = self.store.get("block_services_last")
+        self.store.put("block_services_last", now)
+        if not before:
+            return
+        found = []
+        if before.get("mode") != "never" and now.get("mode") == "never":
+            found.append("Firewall rules turned off (Never)")
+        rules = {r["name"]: r for r in now.get("rules") or []}
+        for r in before.get("rules") or []:
+            new = rules.get(r["name"])
+            if not new:
+                found.append(f"Removed: {r['name']} (port {r['port']})")
+            elif r["ips"].lower() == "all" and new["ips"].lower() != "all":
+                found.append(f"{r['name']} now only applies to {new['ips']}")
+        if found:
+            what = "; ".join(found)
+            self.store.event("block_loosened", "Firewall rules were loosened", detail=what, severity="warn")
+            self.notify("Firewall rules loosened", what)
 
     def _watch_block_sites(self, now):
         """Alert when whole-house blocking gets weaker (sites removed or blocking turned off), however it happened."""

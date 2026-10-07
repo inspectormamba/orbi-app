@@ -151,6 +151,7 @@ class RouterUI:
             if len(cells) >= 5 and cells[1] in ("TCP", "UDP"):
                 upnp.append({"active": cells[0], "protocol": cells[1], "internal_port": cells[2], "external_port": cells[3], "ip": cells[4]})
         out["upnp"] = upnp
+        out["iot"] = self.read_iot()
         return out
 
     # ---- writes (each verified by reading the page back) ----
@@ -171,23 +172,82 @@ class RouterUI:
         keep = ("wan_proto", "WANAssign", "MACAssign", "wan_hwaddr2", "domain_name", "system_name", "ipv6_proto", "wan_aggr")
         return {k: f.get(k) for k in keep}
 
-    def add_service_rule(self, name: str, protocol: str, port_start: int, port_end: int | None = None):
-        """Adds a Block Services rule for all devices (no-op if a rule with this name exists)."""
-        existing = [r["name"] for r in self.read_block_services()["rules"]]
-        if name in existing:
-            return False
-        self.open("BKS_service_add.htm")
-        self._set("service_type", "User_Defined")
+    # ---- Block Services (the router's firewall rules) ----
+    def _fill_rule_form(self, name: str, protocol: str, port_start: int, port_end: int, applies: dict):
+        """Fills the add/edit rule form (both pages use the same field names)."""
+        self._set("service_type", "User_Defined")  # first: changing it rewrites the other fields
         self._set("protocol", protocol)
         self._set("portstart", port_start)
-        self._set("portend", port_end or port_start)
+        self._set("portend", port_end)
         self._set("userdefined", name)
-        self.d.execute_script("document.getElementById('filter_ip_all').click()")
+        self.d.execute_script("document.getElementById(arguments[0]).click()",
+                              {"all": "filter_ip_all", "single": "filter_ip_single", "range": "filter_ip_range"}[applies["type"]])
+        if applies["type"] == "single":
+            for i, octet in enumerate(applies["ip"].split("."), 1):
+                self._set(f"f_pcip{i}", octet)
+        elif applies["type"] == "range":
+            for i, (a, b) in enumerate(zip(applies["start"].split("."), applies["end"].split(".")), 1):
+                self._set(f"f_startip{i}", a)
+                self._set(f"f_endip{i}", b)
+
+    def _activate_rules(self):
+        """The list page's Apply is what puts added/edited/deleted rules into effect."""
+        self.open("BKS_service.htm", settle=2)
+        self._click("apply", wait=6)
+
+    def _select_rule(self, index: int, expected_name: str) -> list[dict]:
+        """Opens the rule list and selects row `index`, refusing if that row isn't the rule the user meant."""
+        rules = self.read_block_services()["rules"]
+        if index >= len(rules) or rules[index]["name"] != expected_name:
+            raise RouterUIError(f"The router's rule list changed (no rule {expected_name!r} at position {index + 1}); refresh and try again")
+        self.d.execute_script("document.querySelectorAll('input[name=ruleSelect]')[arguments[0]].click()", index)
+        return rules
+
+    def _check_rule(self, rules: list[dict], index: int, name: str, port_start: int, applies: dict):
+        r = rules[index] if index < len(rules) else None
+        if not r or r["name"] != name or rule_ips_text(applies) != r["ips"] or not r["port"].startswith(str(port_start)):
+            raise RouterUIError(f"The router didn't save rule {name!r} as asked (it shows {r})")
+
+    def add_rule(self, name: str, protocol: str, port_start: int, port_end: int, applies: dict) -> dict:
+        if any(r["name"] == name for r in self.read_block_services()["rules"]):
+            raise RouterUIError(f"A rule called {name!r} already exists")
+        self.open("BKS_service_add.htm", settle=2)
+        self._fill_rule_form(name, protocol, port_start, port_end, applies)
         self._click("add", wait=4)
-        if name not in [r["name"] for r in self.read_block_services()["rules"]]:
-            raise RouterUIError(f"Block rule {name} wasn't added")
-        self._click("apply", wait=6)  # the list page's Apply is what activates new rules
-        return True
+        self._activate_rules()
+        rules = self.read_block_services()["rules"]
+        index = next((i for i, r in enumerate(rules) if r["name"] == name), len(rules))
+        self._check_rule(rules, index, name, port_start, applies)
+        return rules[index]
+
+    def edit_rule(self, index: int, expected_name: str, name: str, protocol: str, port_start: int, port_end: int, applies: dict) -> dict:
+        self._select_rule(index, expected_name)
+        self._click("edit", wait=3)  # opens the edit form; nothing changes until it's accepted
+        if (self.form().get("userdefined") or "") != expected_name:
+            raise RouterUIError(f"The router opened the wrong rule for editing (expected {expected_name!r})")
+        self._fill_rule_form(name, protocol, port_start, port_end, applies)
+        self._click("apply", wait=4)  # "Accept"
+        self._activate_rules()
+        rules = self.read_block_services()["rules"]
+        self._check_rule(rules, index, name, port_start, applies)
+        return rules[index]
+
+    def delete_rule(self, index: int, expected_name: str):
+        before = self._select_rule(index, expected_name)
+        self._click("delete", wait=4)
+        self._activate_rules()
+        after = self.read_block_services()["rules"]
+        if after != before[:index] + before[index + 1:]:
+            raise RouterUIError(f"Rule {expected_name!r} wasn't deleted as expected")
+
+    def set_rules_mode(self, mode: str):
+        """never | perschedule | always: when the Block Services rules are in force."""
+        self.open("BKS_service.htm", settle=2)
+        self.d.execute_script("document.getElementById(arguments[0]).click()",
+                              {"never": "skeyword_never", "perschedule": "skeyword_sched", "always": "skeyword_always"}[mode])
+        self._click("apply", wait=6)
+        if self.read_block_services()["mode"] != mode:
+            raise RouterUIError("The router didn't change when its firewall rules apply")
 
     PROTECTION_RULES = [  # (name, protocol, port)
         ("Block-External-DNS", "TCP/UDP", 53),  # devices must use the router's (filtered) DNS
@@ -197,16 +257,74 @@ class RouterUI:
     ]
 
     def ensure_protection_rules(self) -> list[str]:
-        """Adds any missing PROTECTION_RULES for all devices. A rule counts as present if one with the
-        same name exists, or any rule already blocks that port for every device. Returns names added."""
-        existing = self.read_block_services()["rules"]
-        added = []
+        """Makes sure each PROTECTION_RULES port is blocked for every device: adds missing rules, and widens
+        one of ours that only covers some devices (an early version could save them for this PC only).
+        Rules the user made that cover the port partly (e.g. a range that leaves out one device) are left alone.
+        Returns what changed."""
+        changed = []
         for name, protocol, port in self.PROTECTION_RULES:
-            if any(r["name"] == name or (r["port"] == str(port) and r["ips"].lower() == "all") for r in existing):
+            rules = self.read_block_services()["rules"]
+            if any(r["port"] == str(port) and r["ips"].lower() == "all" for r in rules):
                 continue
-            if self.add_service_rule(name, protocol, port):
-                added.append(name)
-        return added
+            mine = next((i for i, r in enumerate(rules) if r["name"] == name), None)
+            if mine is not None:
+                self.edit_rule(mine, name, name, protocol, port, port, {"type": "all"})
+                changed.append(f"{name} (now covers every device)")
+            elif not any(r["port"] == str(port) for r in rules):
+                self.add_rule(name, protocol, port, port, {"type": "all"})
+                changed.append(name)
+        return changed
+
+    # ---- IoT Wi-Fi network (on the main Wireless Setup page) ----
+    IOT_BANDS = {"both": "enable_iot_2g5g", "2.4": "enable_iot_2g", "5": "enable_iot_5g"}
+    IOT_SECURITY = {"WPA2-PSK": ("security_wpa2_iot", "passphrase_Iot"), "WPA-AUTO-PSK": ("security_auto_iot", "passphrase_auto_Iot")}
+
+    def read_iot(self) -> dict:
+        f = self.form("WLG_wireless2.htm")
+        two, five = f.get("enable_iot_2g_value") == "1", f.get("enable_iot_5g_value") == "1"
+        return {"enabled": f.get("enable_iot") == "1", "ssid": f.get("ssid_iot") or "",
+                "band": "both" if two and five else "5" if five else "2.4", "security": f.get("security_type_iot") or ""}
+
+    _WIFI_SNAPSHOT_JS = """
+const out = {};
+for (const e of document.forms[0].elements) {
+  if (!e.name || /iot|buttonHit|buttonValue|password_changed/i.test(e.name) || e.type === 'button' || e.type === 'submit') continue;
+  if (e.type === 'radio' || e.type === 'checkbox') { if (e.checked) out[e.name] = e.value; } else out[e.name] = e.value;
+}
+return out;"""
+
+    def set_iot(self, enabled: bool, ssid: str, band: str, security: str, password: str | None = None) -> dict:
+        """Changes the IoT network. Saving restarts the router's and satellites' Wi-Fi; everything else on
+        the page (main network name, password, channels) must come back unchanged."""
+        self.open("WLG_wireless2.htm", settle=2.5)
+        before = self.d.execute_script(self._WIFI_SNAPSHOT_JS)
+        if self.d.execute_script("return document.getElementById('enable_iot').checked") != enabled:
+            self.d.execute_script("document.getElementById('enable_iot').click()")
+        if enabled:
+            radio, field = self.IOT_SECURITY[security]
+            self.d.execute_script("document.getElementById(arguments[0]).click()", self.IOT_BANDS[band])
+            self._set("ssid_iot", ssid)
+            self.d.execute_script("document.getElementById(arguments[0]).click()", radio)
+            if password:
+                self.d.execute_script("""
+                    const el = document.getElementById(arguments[0]);
+                    el.value = arguments[1];
+                    for (const t of ['input', 'keyup', 'change']) el.dispatchEvent(new Event(t, {bubbles: true}));
+                    document.forms[0].elements['password_changed_iot'].value = '1';""", field, password)
+        self._click("Apply", wait=25)  # the router restarts Wi-Fi on every radio
+        self.open("WLG_wireless2.htm", settle=3)
+        got = self.read_iot()
+        after = self.d.execute_script(self._WIFI_SNAPSHOT_JS)
+        changed = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
+        if changed:
+            raise RouterUIError(f"Other Wi-Fi settings changed while saving the IoT network: {', '.join(changed)}. Check them on the router")
+        want = {"enabled": enabled} if not enabled else {"enabled": True, "ssid": ssid, "band": band, "security": security}
+        if any(got[k] != v for k, v in want.items()):
+            raise RouterUIError(f"The router didn't save the IoT network as asked (it shows {got})")
+        if enabled and password and not self.d.execute_script("return document.getElementById(arguments[0]).value === arguments[1]",
+                                                              self.IOT_SECURITY[security][1], password):
+            raise RouterUIError("The router didn't save the new IoT password")
+        return got
 
     def read_block_services(self) -> dict:
         f = self.form("BKS_service.htm")
@@ -261,6 +379,11 @@ def parse_rule_rows(rows: list[list[str]]) -> list[dict]:
         if len(cells) >= 4 and cells[0].isdigit() and re.fullmatch(r"[\d\-\s]+", cells[2]):
             rules.append({"name": cells[1], "port": cells[2], "ips": cells[3]})
     return rules
+
+
+def rule_ips_text(applies: dict) -> str:
+    """How the router's rule list shows who a rule applies to."""
+    return {"all": lambda a: "all", "single": lambda a: a["ip"], "range": lambda a: f"{a['start']} - {a['end']}"}[applies["type"]](applies)
 
 
 def parse_schedule(f: dict) -> dict:

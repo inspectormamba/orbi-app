@@ -117,6 +117,32 @@ class SiteBlockBody(BaseModel):
     end: str = "00:00"
 
 
+class FirewallRuleBody(BaseModel):
+    name: str
+    protocol: str = "TCP/UDP"
+    port_start: int
+    port_end: int | None = None
+    applies: str = "all"  # all | single | range
+    ip: str = ""
+    ip_end: str = ""
+
+
+class FirewallRuleEdit(FirewallRuleBody):
+    expected_name: str  # the rule the user was looking at, so a changed list can't make us edit another one
+
+
+class ModeBody(BaseModel):
+    mode: str
+
+
+class IotBody(BaseModel):
+    enabled: bool
+    ssid: str = ""
+    band: str = "2.4"  # 2.4 | 5 | both
+    security: str = "WPA2-PSK"  # WPA2-PSK | WPA-AUTO-PSK
+    password: str | None = None  # None or "" keeps the current one
+
+
 class PinChange(BaseModel):
     current: str
     new: str
@@ -745,7 +771,7 @@ def create_app(monitor: Monitor) -> FastAPI:
             from .routerui import RouterUI
             with RouterUI(s["router_host"], config.router_password(s), s["router_user"]) as ui:
                 added = ui.ensure_protection_rules()
-            store.event("action", "Router protection rules checked", detail=f"added: {', '.join(added)}" if added else "all already in place")
+            store.event("action", "Router protection rules checked", detail=f"fixed: {', '.join(added)}" if added else "all already in place")
             return {"added": added}
         if not monitor.run_job("protect", apply):
             raise HTTPException(409, "Already running")
@@ -784,6 +810,112 @@ def create_app(monitor: Monitor) -> FastAPI:
             return {"ok": True}
         if not monitor.run_job("siteblock", apply):
             raise HTTPException(409, "A blocking change is already running")
+        return {"ok": True}
+
+    # ---------- firewall rules (router Block Services) ----------
+    def _rule_args(body: FirewallRuleBody) -> tuple:
+        name = body.name.strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _.\-]{0,29}", name):
+            raise HTTPException(400, "Name the rule with letters, numbers, spaces, dots, dashes or underscores (up to 30)")
+        if body.protocol not in ("TCP", "UDP", "TCP/UDP"):
+            raise HTTPException(400, "Protocol must be TCP, UDP or TCP/UDP")
+        end = body.port_end or body.port_start
+        if not 1 <= body.port_start <= end <= 65535:
+            raise HTTPException(400, "Ports must be 1–65535, with the start no higher than the end")
+        lan = ipaddress.ip_network(f"{config.load()['router_host']}/24", strict=False)
+
+        def lan_ip(text):
+            try:
+                ip = ipaddress.ip_address(text.strip())
+            except ValueError:
+                raise HTTPException(400, f"{text or 'That'} isn't an IP address")
+            if ip not in lan or ip in (lan.network_address, lan.broadcast_address):
+                raise HTTPException(400, f"{ip} isn't on your home network ({lan})")
+            return ip
+        if body.applies == "all":
+            applies = {"type": "all"}
+        elif body.applies == "single":
+            applies = {"type": "single", "ip": str(lan_ip(body.ip))}
+        elif body.applies == "range":
+            a, b = lan_ip(body.ip), lan_ip(body.ip_end)
+            if a > b:
+                raise HTTPException(400, "The range must start at the lower address")
+            applies = {"type": "range", "start": str(a), "end": str(b)}
+        else:
+            raise HTTPException(400, "Choose all devices, one address, or a range")
+        return name, body.protocol, body.port_start, end, applies
+
+    def _who_text(applies: dict) -> str:
+        return {"all": "every device", "single": applies.get("ip"), "range": f"{applies.get('start')} – {applies.get('end')}"}[applies["type"]]
+
+    def _firewall_job(fn, title: str, detail: str, severity: str = "info"):
+        router()
+
+        def work():
+            with monitor.ui_factory() as ui:
+                res = fn(ui)
+            store.event("action", title, detail=detail, severity=severity)
+            monitor.refresh_advanced()
+            return res
+        if not monitor.run_job("firewall", work):
+            raise HTTPException(409, "A firewall change is already running")
+        return {"ok": True}
+
+    @app.post("/api/firewall/rules")
+    def fw_add_rule(body: FirewallRuleBody):
+        name, proto, start, end, applies = _rule_args(body)
+        ports = f"{start}" if start == end else f"{start}–{end}"
+        return _firewall_job(lambda ui: ui.add_rule(name, proto, start, end, applies),
+                             f"Firewall rule added: {name}", f"{proto} {ports}, blocked for {_who_text(applies)}")
+
+    @app.put("/api/firewall/rules/{index}")
+    def fw_edit_rule(index: int, body: FirewallRuleEdit):
+        name, proto, start, end, applies = _rule_args(body)
+        ports = f"{start}" if start == end else f"{start}–{end}"
+        return _firewall_job(lambda ui: ui.edit_rule(index, body.expected_name, name, proto, start, end, applies),
+                             f"Firewall rule changed: {body.expected_name}",
+                             (f"renamed {name}; " if name != body.expected_name else "") + f"{proto} {ports}, blocked for {_who_text(applies)}")
+
+    @app.delete("/api/firewall/rules/{index}")
+    def fw_delete_rule(index: int, name: str):
+        return _firewall_job(lambda ui: ui.delete_rule(index, name), f"Firewall rule deleted: {name}", "", "warn")
+
+    @app.put("/api/firewall/mode")
+    def fw_rules_mode(body: ModeBody):
+        if body.mode not in ("never", "perschedule", "always"):
+            raise HTTPException(400, "Mode must be never, perschedule or always")
+        label = {"never": "off", "perschedule": "on the blocking schedule", "always": "always on"}[body.mode]
+        return _firewall_job(lambda ui: ui.set_rules_mode(body.mode), "Firewall rules turned " + label, "",
+                             "warn" if body.mode == "never" else "info")
+
+    # ---------- IoT Wi-Fi network ----------
+    @app.put("/api/iot")
+    def set_iot(body: IotBody):
+        from .routerui import RouterUI
+        ssid = body.ssid.strip()
+        if body.enabled:
+            if not 1 <= len(ssid) <= 32 or not ssid.isprintable():
+                raise HTTPException(400, "The network name must be 1–32 characters")
+            if body.band not in RouterUI.IOT_BANDS:
+                raise HTTPException(400, "Band must be 2.4, 5 or both")
+            if body.security not in RouterUI.IOT_SECURITY:
+                raise HTTPException(400, "Security must be WPA2-PSK or WPA-AUTO-PSK")
+            if body.password and not (re.fullmatch(r"[ -~]{8,63}", body.password) or re.fullmatch(r"[0-9A-Fa-f]{64}", body.password)):
+                raise HTTPException(400, "The password must be 8–63 characters (or 64 hex digits)")
+        router()
+
+        def work():
+            with monitor.ui_factory() as ui:
+                got = ui.set_iot(body.enabled, ssid, body.band, body.security, body.password or None)
+            band = {"2.4": "2.4 GHz", "5": "5 GHz", "both": "2.4 + 5 GHz"}[got["band"]]
+            store.event("action", "IoT Wi-Fi " + ("updated" if body.enabled else "turned off"),
+                        detail=(f"{got['ssid']} · {band} · {got['security']}" + (" · new password" if body.password else ""))
+                        if body.enabled else "IoT devices are disconnected until it's turned back on",
+                        severity="info" if body.enabled else "warn")
+            monitor.refresh_advanced()
+            return got
+        if not monitor.run_job("iot", work):
+            raise HTTPException(409, "An IoT Wi-Fi change is already running")
         return {"ok": True}
 
     # ---------- app updates ----------

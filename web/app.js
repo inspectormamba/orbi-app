@@ -734,7 +734,7 @@ function protectSheet() {
         await api("/api/filtering/protect", { body: {} });
         const r = await waitJob("protect", "Checking router rules");
         closeSheet();
-        return { note: r && r.added && r.added.length ? `Added: ${r.added.join(", ")}` : "All protection rules were already in place" };
+        return { note: r && r.added && r.added.length ? `Fixed: ${r.added.join(", ")}` : "All protection rules were already in place" };
       }) }, "Add the rules")));
 }
 
@@ -905,8 +905,27 @@ async function renderAdvanced() {
     vpnAttempts.length ? h("div", {}, ...vpnAttempts.map((e) => h("div", { class: "row" }, h("div", { class: "main" },
       h("div", { class: "name" }, e.title), h("div", { class: "meta" }, `${fmtWhen(e.ts)} · ${e.detail}`)))))
       : h("div", { class: "muted small" }, "None so far."));
-  const fw = h("section", { class: "card" }, h("h2", {}, `Firewall: Block Services · ${d.block_services.mode}`),
-    table(["Rule", "Port", "Applies to"], d.block_services.rules.map((x) => [x.name, x.port, x.ips])));
+  const modeLabel = { never: "Off (Never)", perschedule: "On the blocking schedule", always: "Always on" };
+  const who = (ips) => ips === "all" ? "Every device" : `${ips}${devName(ips) ? ` (${devName(ips)})` : ""}`;
+  const fw = h("section", { class: "card" },
+    h("h2", {}, "Firewall rules", h("button", { class: "btn small act", onclick: () => firewallRuleSheet() }, "Add")),
+    h("div", { class: "inline", style: "align-items:center;margin-bottom:6px" },
+      h("div", { class: "muted small" }, `Block Services: stops devices connecting out on these ports · ${modeLabel[d.block_services.mode] || d.block_services.mode}`),
+      h("div", { style: "flex:0" }, h("button", { class: "btn small", onclick: () => rulesModeSheet(d.block_services.mode) }, "When…"))),
+    ...(d.block_services.rules.length ? d.block_services.rules.map((x, i) => h("div", { class: "row" },
+      h("div", { class: "main" }, h("div", { class: "name" }, x.name), h("div", { class: "meta" }, `Port ${x.port} · ${who(x.ips)}`)),
+      h("button", { class: "btn small", onclick: () => firewallRuleSheet(x, i) }, "Edit"),
+      h("button", { class: "btn small danger", onclick: () => deleteFirewallRuleSheet(x, i) }, "Delete")))
+      : [h("div", { class: "muted small" }, "No rules.")]));
+  const iot = d.iot || {};
+  const iotNow = (cache.devices || []).filter((x) => x.online && /iot/i.test(x.connection || ""));
+  const bandLabel = { "2.4": "2.4 GHz", 5: "5 GHz", both: "2.4 GHz + 5 GHz" };
+  const iotCard = h("section", { class: "card" },
+    h("h2", {}, "IoT Wi-Fi", h("button", { class: "btn small act", onclick: () => iotSheet(iot) }, "Change")),
+    kv([["Network", iot.enabled ? "On" : "Off"], ["Name", iot.enabled ? iot.ssid : null], ["Band", iot.enabled ? bandLabel[iot.band] : null],
+      ["Security", iot.enabled ? (iot.security === "WPA2-PSK" ? "WPA2-PSK [AES]" : "WPA + WPA2 (older devices)") : null],
+      ["Connected now", `${iotNow.length} device${iotNow.length === 1 ? "" : "s"}`]]),
+    h("div", { class: "muted small" }, "A separate network for smart plugs, cameras and other gadgets, so they don't share your main Wi-Fi name and password."));
   const ports = h("section", { class: "card" }, h("h2", {}, "Port forwarding (UPnP)"),
     table(["Device", "Protocol", "Outside", "Inside"], d.upnp.map((x) => [devName(x.ip) ? `${devName(x.ip)} (${x.ip})` : x.ip, x.protocol, x.external_port, x.internal_port])));
 
@@ -930,7 +949,98 @@ async function renderAdvanced() {
   }
   const logCard = h("section", { class: "card" }, h("h2", {}, "Router log"), logSearch, logChips, logList);
   loadLog().catch(() => {});
-  setView(head, routerCard, wan, lan, wifi, sats, vpn, fw, ports, logCard);
+  setView(head, routerCard, wan, lan, wifi, iotCard, sats, vpn, fw, ports, logCard);
+}
+
+// ---------- firewall rules & IoT Wi-Fi (Advanced) ----------
+async function routerJob(name, label, done) {
+  try { await waitJob(name, label); }
+  catch (e) {
+    if (/Can't reach/.test(e.message)) return { note: "Lost contact while the router applied it. Refresh Advanced in a minute to confirm." };
+    throw e;
+  }
+  closeSheet(); renderAdvanced().catch(() => {});
+  return { note: done };
+}
+
+function firewallRuleSheet(rule, index) {
+  const [ps, pe] = rule ? rule.port.split("-").map((x) => x.trim()) : ["", ""];
+  const range = rule && rule.ips.includes(" - ") ? rule.ips.split(" - ") : null;
+  const now = !rule || rule.ips === "all" ? "all" : range ? "range" : "single";
+  const name = h("input", { value: rule ? rule.name : "", maxlength: 30, placeholder: "e.g. Block-Minecraft" });
+  const proto = h("select", {}, ...["TCP/UDP", "TCP", "UDP"].map((p) => h("option", { value: p }, p)));
+  const start = h("input", { type: "number", min: 1, max: 65535, value: ps || "" });
+  const end = h("input", { type: "number", min: 1, max: 65535, value: pe || "", placeholder: "same" });
+  const applies = h("select", {}, h("option", { value: "all", selected: now === "all" }, "Every device"),
+    h("option", { value: "single", selected: now === "single" }, "One device (IP address)"),
+    h("option", { value: "range", selected: now === "range" }, "A range of addresses"));
+  const ip = h("input", { value: now === "single" ? rule.ips : range ? range[0] : "", placeholder: "192.168.1.x", inputmode: "decimal" });
+  const ipEnd = h("input", { value: range ? range[1] : "", placeholder: "192.168.1.x", inputmode: "decimal" });
+  const ipLabel = h("span", {}, "IP address");
+  const ipRow = h("label", { class: "field" }, ipLabel, ip);
+  const endRow = h("label", { class: "field" }, "to", ipEnd);
+  const sync = () => { ipRow.hidden = applies.value === "all"; endRow.hidden = applies.value !== "range"; ipLabel.textContent = applies.value === "range" ? "From" : "IP address"; };
+  applies.addEventListener("change", sync); sync();
+  const save = h("button", { class: "btn primary", onclick: (e) => act(e.currentTarget, async () => {
+    const body = { name: name.value, protocol: proto.value, port_start: Number(start.value), port_end: Number(end.value || start.value),
+      applies: applies.value, ip: ip.value, ip_end: ipEnd.value };
+    if (rule) await api(`/api/firewall/rules/${index}`, { method: "PUT", body: { ...body, expected_name: rule.name } });
+    else await api("/api/firewall/rules", { body });
+    return routerJob("firewall", "Saving to the router", rule ? "Rule saved" : "Rule added");
+  }) }, rule ? "Save" : "Add rule");
+  openSheet(h("h3", {}, rule ? `Edit ${rule.name}` : "New firewall rule"),
+    h("p", { class: "muted small", style: "margin:0" }, "Blocks devices from connecting out on these ports. Saving takes about a minute, and the router's list is checked afterwards."),
+    h("label", { class: "field" }, "Name", name), h("label", { class: "field" }, "Protocol", proto),
+    h("div", { class: "inline" }, h("label", { class: "field" }, "Port", start), h("label", { class: "field" }, "to port (optional)", end)),
+    h("label", { class: "field" }, "Block it for", applies), ipRow, endRow,
+    rule ? h("p", { class: "muted small" }, "The router's list doesn't show a rule's protocol, so check it before saving. TCP/UDP blocks both.") : null,
+    h("div", { class: "btns" }, h("button", { class: "btn", onclick: closeSheet }, "Cancel"), save));
+}
+
+function deleteFirewallRuleSheet(rule, index) {
+  const guard = /^Block[- ](External[- ]DNS|DoT|VPN)/i.test(rule.name);
+  openSheet(h("h3", {}, `Delete ${rule.name}?`),
+    h("p", { style: "margin:0" }, `Devices will be able to connect out on port ${rule.port} again${rule.ips === "all" ? "" : ` (${rule.ips})`}.`),
+    guard ? h("p", { class: "muted small" }, "This is one of the rules that stops devices getting around content filtering or using a VPN. Deleting it records an alert.") : null,
+    h("div", { class: "btns" }, h("button", { class: "btn", onclick: closeSheet }, "Cancel"),
+      h("button", { class: "btn danger solid", onclick: (e) => act(e.currentTarget, async () => {
+        await api(`/api/firewall/rules/${index}?name=${encodeURIComponent(rule.name)}`, { method: "DELETE" });
+        return routerJob("firewall", "Deleting on the router", "Rule deleted");
+      }) }, "Delete")));
+}
+
+function rulesModeSheet(mode) {
+  const sel = h("select", {}, ...[["always", "Always"], ["perschedule", "On the blocking schedule"], ["never", "Never (all rules off)"]]
+    .map(([v, l]) => h("option", { value: v, selected: v === mode }, l)));
+  openSheet(h("h3", {}, "When do firewall rules apply?"), h("label", { class: "field" }, "Rules apply", sel),
+    h("p", { class: "muted small" }, "The schedule is the router's single blocking schedule, shared with whole-house site blocking. Never turns every rule off, including the ones that protect content filtering."),
+    h("div", { class: "btns" }, h("button", { class: "btn", onclick: closeSheet }, "Cancel"),
+      h("button", { class: "btn primary", onclick: (e) => act(e.currentTarget, async () => {
+        await api("/api/firewall/mode", { method: "PUT", body: { mode: sel.value } });
+        return routerJob("firewall", "Saving to the router", "Saved");
+      }) }, "Save")));
+}
+
+function iotSheet(iot) {
+  const on = h("input", { type: "checkbox", checked: !!iot.enabled });
+  const ssid = h("input", { value: iot.ssid || "", maxlength: 32 });
+  const band = h("select", {}, ...[["2.4", "2.4 GHz only (most smart devices)"], ["both", "2.4 GHz and 5 GHz"], ["5", "5 GHz only"]]
+    .map(([v, l]) => h("option", { value: v, selected: v === (iot.band || "2.4") }, l)));
+  const sec = h("select", {}, h("option", { value: "WPA2-PSK", selected: iot.security !== "WPA-AUTO-PSK" }, "WPA2-PSK [AES]"),
+    h("option", { value: "WPA-AUTO-PSK", selected: iot.security === "WPA-AUTO-PSK" }, "WPA + WPA2 (only for very old devices)"));
+  const pw = h("input", { type: "password", autocomplete: "new-password", placeholder: "Leave blank to keep the current password" });
+  const fields = h("div", {}, h("label", { class: "field" }, "Network name", ssid), h("label", { class: "field" }, "Band", band),
+    h("label", { class: "field" }, "Security", sec), h("label", { class: "field" }, "New password (optional)", pw));
+  const sync = () => { fields.hidden = !on.checked; };
+  on.addEventListener("change", sync); sync();
+  openSheet(h("h3", {}, "IoT Wi-Fi"), h("label", { class: "switch" }, "IoT network on", on), fields,
+    h("p", { class: "muted small" }, "Saving restarts Wi-Fi on the router and satellites for about a minute, and every wireless device reconnects. Changing the name or password, or turning the network off, disconnects IoT devices until each one is set up again."),
+    h("div", { class: "btns" }, h("button", { class: "btn", onclick: closeSheet }, "Cancel"),
+      h("button", { class: "btn primary", onclick: (e) => act(e.currentTarget, async () => {
+        await api("/api/iot", { method: "PUT", body: { enabled: on.checked, ssid: ssid.value, band: band.value, security: sec.value, password: pw.value || null } });
+        pw.value = "";
+        return routerJob("iot", "Saving (Wi-Fi restarts)", "IoT Wi-Fi saved");
+      }) }, "Save")));
 }
 
 // ---------- default profile ("everyone else") ----------

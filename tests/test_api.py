@@ -193,3 +193,16 @@ def test_file_api_is_gone(client):
     setup_pin(client)
     assert client.get("/api/files/list").status_code in (404, 405)
     assert client.put("/api/files/settings", json={"enabled": True, "pin": "246810"}).status_code in (404, 405)
+
+
+def test_web_app_has_no_duplicate_functions():
+    """A second top-level function with the same name silently replaces the first in the browser
+    (that once broke editing family schedules)."""
+    import collections
+    import re
+    from pathlib import Path
+    src = (Path(__file__).resolve().parent.parent / "web" / "app.js").read_text("utf-8")
+    names = re.findall(r"^(?:async )?function (\w+)\s*\(", src, re.M)
+    names += re.findall(r"^(?:const|let) (\w+)\s*=", src, re.M)
+    dupes = [n for n, c in collections.Counter(names).items() if c > 1]
+    assert not dupes, f"defined more than once in web/app.js: {dupes}"

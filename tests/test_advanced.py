@@ -79,13 +79,30 @@ class FakeUI:
                 "block_services": {"mode": "always", "rules": [{"name": "Block-VPN-OpenVPN", "port": "1194", "ips": "all"}]},
                 "block_sites": {"mode": "never", "keywords": [], "trusted_ip": None},
                 "schedule": {"days": "0123456", "all_day": True, "start": "00:00", "end": "00:00"},
-                "vpn": {"enabled": True, "protocol": "udp", "port": "12973", "port_tap": "12974"}, "upnp": []}
+                "vpn": {"enabled": True, "protocol": "udp", "port": "12973", "port_tap": "12974"}, "upnp": [],
+                "iot": {"enabled": True, "ssid": "Home-IoT", "band": "2.4", "security": "WPA2-PSK"}}
 
     def set_schedule(self, days, start, end):
         FakeUI.calls.append(("schedule", days, start, end))
 
     def set_block_sites(self, mode, keywords):
         FakeUI.calls.append(("sites", mode, tuple(keywords)))
+
+    def add_rule(self, name, protocol, start, end, applies):
+        FakeUI.calls.append(("add_rule", name, protocol, start, end, applies))
+
+    def edit_rule(self, index, expected, name, protocol, start, end, applies):
+        FakeUI.calls.append(("edit_rule", index, expected, name, protocol, start, end, applies))
+
+    def delete_rule(self, index, expected):
+        FakeUI.calls.append(("delete_rule", index, expected))
+
+    def set_rules_mode(self, mode):
+        FakeUI.calls.append(("rules_mode", mode))
+
+    def set_iot(self, enabled, ssid, band, security, password=None):
+        FakeUI.calls.append(("iot", enabled, ssid, band, security, password))
+        return {"enabled": enabled, "ssid": ssid, "band": band, "security": security}
 
 
 def wait_job(client, name):
@@ -171,3 +188,81 @@ def test_filter_turned_off_alerts(monitor):
     assert monitor.notes == []
     monitor._watch_filter(["74.40.74.40", "74.40.74.41"])
     assert monitor.notes == [("Content filter turned off", "The router no longer uses Cloudflare for Families")]
+
+
+
+def test_firewall_rule_api(client):
+    bad = [
+        {"name": "x!", "port_start": 25},  # name
+        {"name": "Mail", "port_start": 0},  # port
+        {"name": "Mail", "port_start": 30, "port_end": 20},  # backwards range
+        {"name": "Mail", "port_start": 25, "protocol": "ICMP"},
+        {"name": "Mail", "port_start": 25, "applies": "single", "ip": "8.8.8.8"},  # not on the LAN
+        {"name": "Mail", "port_start": 25, "applies": "range", "ip": "192.168.1.50", "ip_end": "192.168.1.20"},
+    ]
+    for body in bad:
+        assert client.post("/api/firewall/rules", json=body).status_code == 400, body
+    r = client.post("/api/firewall/rules", json={"name": "Block-Minecraft", "protocol": "TCP", "port_start": 25565, "applies": "range",
+                                                 "ip": "192.168.1.20", "ip_end": "192.168.1.40"})
+    assert r.status_code == 200 and wait_job(client, "firewall")["error"] is None
+    assert FakeUI.calls[0] == ("add_rule", "Block-Minecraft", "TCP", 25565, 25565, {"type": "range", "start": "192.168.1.20", "end": "192.168.1.40"})
+    r = client.put("/api/firewall/rules/4", json={"expected_name": "Block-VPN-WireGuard", "name": "Block-VPN-WireGuard", "protocol": "UDP",
+                                                  "port_start": 51820, "applies": "all"})
+    assert r.status_code == 200 and wait_job(client, "firewall")["error"] is None
+    assert ("edit_rule", 4, "Block-VPN-WireGuard", "Block-VPN-WireGuard", "UDP", 51820, 51820, {"type": "all"}) in FakeUI.calls
+    assert client.delete("/api/firewall/rules/2?name=Block-DoT-853").status_code == 200 and wait_job(client, "firewall")["error"] is None
+    assert ("delete_rule", 2, "Block-DoT-853") in FakeUI.calls
+    assert client.put("/api/firewall/mode", json={"mode": "sometimes"}).status_code == 400
+    assert client.put("/api/firewall/mode", json={"mode": "never"}).status_code == 200 and wait_job(client, "firewall")["error"] is None
+    titles = [e["title"] for e in client.get("/api/events?kind=action").json()]
+    assert {"Firewall rule added: Block-Minecraft", "Firewall rule changed: Block-VPN-WireGuard", "Firewall rule deleted: Block-DoT-853",
+            "Firewall rules turned off"} <= set(titles)
+
+
+def test_iot_api(client):
+    assert client.put("/api/iot", json={"enabled": True, "ssid": "", "band": "2.4"}).status_code == 400
+    assert client.put("/api/iot", json={"enabled": True, "ssid": "Gadgets", "band": "6"}).status_code == 400
+    assert client.put("/api/iot", json={"enabled": True, "ssid": "Gadgets", "password": "short"}).status_code == 400
+    r = client.put("/api/iot", json={"enabled": True, "ssid": "Gadgets", "band": "both", "security": "WPA2-PSK", "password": "correct horse"})
+    assert r.status_code == 200 and wait_job(client, "iot")["error"] is None
+    assert FakeUI.calls[0] == ("iot", True, "Gadgets", "both", "WPA2-PSK", "correct horse")
+    ev = client.get("/api/events?kind=action").json()[0]
+    assert ev["title"] == "IoT Wi-Fi updated" and "new password" in ev["detail"] and "correct horse" not in ev["detail"]
+    assert client.put("/api/iot", json={"enabled": False}).status_code == 200 and wait_job(client, "iot")["error"] is None
+    assert FakeUI.calls[-1][:2] == ("iot", False)
+    assert client.get("/api/advanced").json()["data"]["iot"]["ssid"] == "Home-IoT"  # whatever the router reports, re-read after
+
+
+def test_loosened_firewall_rules_alert(monitor):
+    rules = [{"name": "Block-DoT-853", "port": "853", "ips": "all"}, {"name": "Block-VPN-WireGuard", "port": "51820", "ips": "all"}]
+    monitor._watch_block_services({"mode": "always", "rules": rules})
+    monitor._watch_block_services({"mode": "always", "rules": rules + [{"name": "New", "port": "1", "ips": "all"}]})
+    assert monitor.notes == []
+    monitor._watch_block_services({"mode": "always", "rules": [rules[0], {"name": "Block-VPN-WireGuard", "port": "51820", "ips": "192.168.1.58"}]})
+    assert monitor.notes[-1] == ("Firewall rules loosened", "Block-VPN-WireGuard now only applies to 192.168.1.58; Removed: New (port 1)")
+    monitor._watch_block_services({"mode": "never", "rules": [rules[0]]})
+    assert "Firewall rules turned off (Never)" in monitor.notes[-1][1]
+
+
+def test_protection_rules_widen_ours_and_leave_partial_user_rules(monkeypatch):
+    from orbi.routerui import RouterUI
+    rules = [{"name": "Block External DNS", "port": "53", "ips": "192.168.1.2 - 192.168.1.15"},
+             {"name": "Block External DNS 2", "port": "53", "ips": "192.168.1.17 - 192.168.1.254"},
+             {"name": "Block-DoT-853", "port": "853", "ips": "all"},
+             {"name": "Block-VPN-OpenVPN", "port": "1194", "ips": "all"},
+             {"name": "Block-VPN-WireGuard", "port": "51820", "ips": "192.168.1.58"}]
+    ui = RouterUI.__new__(RouterUI)
+    calls = []
+    monkeypatch.setattr(ui, "read_block_services", lambda: {"mode": "always", "rules": [dict(r) for r in rules]}, raising=False)
+    monkeypatch.setattr(ui, "edit_rule", lambda *a: calls.append(("edit",) + a), raising=False)
+    monkeypatch.setattr(ui, "add_rule", lambda *a: calls.append(("add",) + a), raising=False)
+    changed = ui.ensure_protection_rules()
+    assert calls == [("edit", 4, "Block-VPN-WireGuard", "Block-VPN-WireGuard", "UDP", 51820, 51820, {"type": "all"})]
+    assert changed == ["Block-VPN-WireGuard (now covers every device)"]
+
+
+def test_rule_ips_text():
+    from orbi.routerui import rule_ips_text
+    assert rule_ips_text({"type": "all"}) == "all"
+    assert rule_ips_text({"type": "single", "ip": "192.168.1.58"}) == "192.168.1.58"
+    assert rule_ips_text({"type": "range", "start": "192.168.1.2", "end": "192.168.1.15"}) == "192.168.1.2 - 192.168.1.15"
