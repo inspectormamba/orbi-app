@@ -590,15 +590,6 @@ async function renderMore() {
       h("div", { style: "flex:1;min-width:200px" }, h("div", { style: "font-weight:600;word-break:break-all" }, access.urls[0] || "—"),
         h("p", { class: "muted small" }, "On your home Wi-Fi, scan the code or open this address. Then: iPhone → Share → Add to Home Screen; Android → ⋮ → Add to Home screen."))));
 
-  const guest = h("section", { class: "card" }, h("h2", {}, "Guest Wi-Fi"), h("div", { class: "muted small" }, h("span", { class: "spinner" })));
-  api("/api/guest").then((g) => {
-    const toggle = h("input", { type: "checkbox", checked: g.enabled, onchange: (e) => act(null, () => api("/api/guest", { body: { enabled: e.target.checked } }), `Guest Wi-Fi ${e.target.checked ? "on" : "off"}`).catch(() => (e.target.checked = !e.target.checked)) });
-    const pw = h("span", {}, "••••••••");
-    guest.replaceChildren(h("h2", {}, "Guest Wi-Fi"), h("label", { class: "switch" }, "Guest network", toggle),
-      h("dl", { class: "kv" }, h("dt", {}, "Name"), h("dd", {}, g.ssid || "—"), h("dt", {}, "Password"),
-        h("dd", {}, pw, " ", h("button", { class: "btn small", onclick: (e) => { pw.textContent = pw.textContent.startsWith("•") ? g.password || "(none)" : "••••••••"; e.currentTarget.textContent = pw.textContent.startsWith("•") ? "Show" : "Hide"; } }, "Show"))));
-  }).catch((e) => guest.replaceChildren(h("h2", {}, "Guest Wi-Fi"), h("div", { class: "error-text" }, e.message)));
-
   const speedAt = h("input", { type: "time", value: settings.speedtest_daily_at || "" });
   const health = h("select", {}, ...[[15, "15 s"], [30, "30 s"], [60, "1 min"], [120, "2 min"]].map(([v, l]) => h("option", { value: v, selected: settings.health_interval === v }, l)));
   const scan = h("select", {}, ...[[60, "1 min"], [120, "2 min"], [300, "5 min"], [600, "10 min"]].map(([v, l]) => h("option", { value: v, selected: settings.scan_interval === v }, l)));
@@ -646,8 +637,8 @@ async function renderMore() {
     syncAdvancedTab(); toast(e.target.checked ? "Advanced tab added" : "Advanced tab hidden");
   } });
   const advCard = h("section", { class: "card" }, h("h2", {}, "Advanced mode"),
-    h("label", { class: "switch" }, "Show the Advanced tab (DHCP, logs, VPN, firewall rules…)", advToggle));
-  setView(alertCard, phone, h("div", { class: "group-label" }, "Wi-Fi networks"), guest, iotCard(), advCard, monitoring, routerCard, pinCard, updatesCard(settings),
+    h("label", { class: "switch" }, "Show the Advanced tab (Wi-Fi networks, DHCP, logs, VPN, firewall rules…)", advToggle));
+  setView(alertCard, phone, advCard, monitoring, routerCard, pinCard, updatesCard(settings),
     h("div", { class: "muted small center" }, "Orbi Control runs on your PC and talks to the Orbi directly — no cloud. Outside connections: the optional update check to GitHub, and internet checks to 1.1.1.1, 8.8.8.8 and 9.9.9.9."));
 }
 
@@ -904,7 +895,7 @@ async function renderAdvanced() {
     h("div", { class: "group-label" }, `Address reservations · ${d.lan.reservations.length}`),
     table(["IP", "Name", "MAC"], d.lan.reservations.map((x) => [x.ip, x.name, x.mac])),
     h("div", { class: "muted small", style: "margin-top:8px" }, "Recent DHCP activity is in the Router log below (DHCP filter)."));
-  const wifi = h("section", { class: "card" }, h("h2", {}, "Wi-Fi"), table(["Band", "Name", "Channel", "Mode", "Security"],
+  const wifi = h("section", { class: "card" }, h("h2", {}, "Main Wi-Fi"), table(["Band", "Name", "Channel", "Mode", "Security"],
     (d.wifi || []).map((w) => [w.band, w.ssid + (w.enabled ? "" : " (off)"), w.channel, w.mode, w.security])));
   const sats = h("section", { class: "card" }, h("h2", {}, "Satellites"), table(["Name", "IP", "Backhaul", "Signal", "Firmware", "MAC"],
     (r.satellites || []).map((x) => [x.name + (x.online === false ? " (offline)" : ""), x.ip, x.backhaul, x.backhaul_kind === "wired" ? "—" : `${x.signal == null ? "—" : x.signal}%`, x.firmware, x.mac])));
@@ -954,10 +945,22 @@ async function renderAdvanced() {
   }
   const logCard = h("section", { class: "card" }, h("h2", {}, "Router log"), logSearch, logChips, logList);
   loadLog().catch(() => {});
-  setView(head, routerCard, wan, lan, wifi, sats, vpn, fw, ports, logCard);
+  setView(head, routerCard, wan, lan, h("div", { class: "group-label" }, "Wi-Fi networks"), wifi, guestCard(), iotCard(), sats, vpn, fw, ports, logCard);
 }
 
-// ---------- IoT Wi-Fi (More, next to Guest Wi-Fi) ----------
+// ---------- Guest & IoT Wi-Fi (Advanced, under Main Wi-Fi) ----------
+function guestCard() {
+  const guest = h("section", { class: "card" }, h("h2", {}, "Guest Wi-Fi"), h("div", { class: "muted small" }, h("span", { class: "spinner" })));
+  api("/api/guest").then((g) => {
+    const toggle = h("input", { type: "checkbox", checked: g.enabled, onchange: (e) => act(null, () => api("/api/guest", { body: { enabled: e.target.checked } }), `Guest Wi-Fi ${e.target.checked ? "on" : "off"}`).catch(() => (e.target.checked = !e.target.checked)) });
+    const pw = h("span", {}, "••••••••");
+    guest.replaceChildren(h("h2", {}, "Guest Wi-Fi"), h("label", { class: "switch" }, "Guest network", toggle),
+      h("dl", { class: "kv" }, h("dt", {}, "Name"), h("dd", {}, g.ssid || "—"), h("dt", {}, "Password"),
+        h("dd", {}, pw, " ", h("button", { class: "btn small", onclick: (e) => { pw.textContent = pw.textContent.startsWith("•") ? g.password || "(none)" : "••••••••"; e.currentTarget.textContent = pw.textContent.startsWith("•") ? "Show" : "Hide"; } }, "Show"))));
+  }).catch((e) => guest.replaceChildren(h("h2", {}, "Guest Wi-Fi"), h("div", { class: "error-text" }, e.message)));
+  return guest;
+}
+
 function iotCard() {
   const card = h("section", { class: "card" }, h("h2", {}, "IoT Wi-Fi"), h("div", { class: "muted small" }, h("span", { class: "spinner" }), " Reading from the router…"));
   const bandLabel = { "2.4": "2.4 GHz", 5: "5 GHz", both: "2.4 GHz + 5 GHz" };
@@ -1068,9 +1071,7 @@ function iotSheet(iot) {
       h("button", { class: "btn primary", onclick: (e) => act(e.currentTarget, async () => {
         await api("/api/iot", { method: "PUT", body: { enabled: on.checked, ssid: ssid.value, band: band.value, security: sec.value, password: pw.value || null } });
         pw.value = "";
-        const r = await routerJob("iot", "Saving (Wi-Fi restarts)", "IoT Wi-Fi saved");
-        if (currentTab === "more") renderMore().catch(() => {});
-        return r;
+        return routerJob("iot", "Saving (Wi-Fi restarts)", "IoT Wi-Fi saved");
       }) }, "Save")));
 }
 
