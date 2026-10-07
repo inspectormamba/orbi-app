@@ -210,6 +210,7 @@ function statusLevel(st) {
   if (st.internet === null) return { level: "unknown", short: "Checking…", big: "Checking your connection…", sub: "" };
   if (st.router === false) return { level: "down", short: "Router unreachable", big: "Can't reach the router", sub: "This PC can't reach the Orbi. Check its power, or this PC's network cable." };
   if (st.internet === false) return { level: "down", short: "Internet down", big: "Internet is down", sub: `Since ${st.outage ? fmtWhen(st.outage.ts) : "just now"}. ${st.outage?.detail || ""}` };
+  if (st.pc_offline) return { level: "warn", short: "Internet online", big: st.pc_offline.title, sub: `Since ${fmtWhen(st.pc_offline.ts)}. ${st.pc_offline.detail}` };
   const off = (st.satellites || []).filter((s) => s.online === false);
   if (off.length) return { level: "warn", short: "Satellite offline", big: "Online, but a satellite is down", sub: `${off.map((s) => s.name).join(", ")} isn't connected.` };
   if (st.scan_error) return { level: "warn", short: "Online", big: "Internet is online", sub: "The router isn't answering status requests right now; retrying." };

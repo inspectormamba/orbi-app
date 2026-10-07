@@ -275,3 +275,85 @@ def test_wireless_satellite_blip_is_ignored(monitor, fake_router):
     sat["backhaul"] = "wired"
     monitor.scan()
     assert monitor.notes == [] and not monitor.store.q("SELECT * FROM events WHERE kind='satellite'")
+
+
+
+def _pc_cut_off(monitor, monkeypatch, up):
+    monkeypatch.setattr(monitor_mod, "tcp_ok", lambda host, port, timeout=3.0: 5.0 if (up["pc"] or host.startswith("192.168")) else None)
+
+
+def test_vpn_drop_is_not_an_outage(monitor, monkeypatch):
+    up = {"pc": True}
+    _pc_cut_off(monitor, monkeypatch, up)
+    monkeypatch.setattr(monitor_mod, "house_online", lambda host: True)
+    monkeypatch.setattr(monitor_mod, "internet_route", lambda host: {"vpn": True, "local_ip": "10.8.0.2"})
+    monkeypatch.setattr(monitor_mod, "adapter_name", lambda ip: "WireGuard Tunnel")
+    monitor.check_health()
+    up["pc"] = False
+    monitor.check_health()
+    monitor.check_health()
+    assert monitor.state["internet"] is True and not monitor.state["outage_id"]
+    ev = monitor.store.one("SELECT * FROM events WHERE kind='pc_offline'")
+    assert ev["title"] == "Your VPN dropped; the internet is fine" and "WireGuard Tunnel (10.8.0.2)" in ev["detail"]
+    assert not monitor.store.q("SELECT * FROM events WHERE kind='outage'")
+    assert monitor.store.one("SELECT MIN(internet) AS m FROM checks")["m"] == 1  # uptime isn't charged for it
+    up["pc"] = True
+    monitor.check_health()
+    assert monitor.store.one("SELECT * FROM events WHERE kind='pc_offline'")["end_ts"] is not None
+    assert [n[0] for n in monitor.notes] == ["Your VPN dropped; the internet is fine", "This PC is back online"]
+
+
+def test_pc_only_drop_without_vpn(monitor, monkeypatch):
+    up = {"pc": False}
+    _pc_cut_off(monitor, monkeypatch, up)
+    monkeypatch.setattr(monitor_mod, "house_online", lambda host: True)
+    monitor.check_health()
+    monitor.check_health()
+    assert monitor.notes[0][0] == "This PC lost internet; the rest of the house is online"
+
+
+def test_outage_reports_router_restart_and_new_ip(monitor, monkeypatch, fake_router):
+    up = {"pc": True}
+    _pc_cut_off(monitor, monkeypatch, up)
+    monitor.scan()
+    monitor.check_health()
+    up["pc"] = False
+    monitor.check_health()
+    monitor.check_health()
+    assert monitor.state["outage_id"]
+    fake_router.wan = lambda: {"link_up": True, "ip": "5.6.7.8", "dns": []}
+    fake_router.uptime = lambda: "00:02:10"
+    up["pc"] = True
+    monitor.check_health()
+    ev = monitor.store.one("SELECT * FROM events WHERE kind='outage'")
+    assert "router restarted" in ev["detail"] and "1.2.3.4 → 5.6.7.8" in ev["detail"]
+
+
+def test_uptime_seconds():
+    assert monitor_mod.uptime_seconds("2 days 07:21:36") == 2 * 86400 + 7 * 3600 + 21 * 60 + 36
+    assert monitor_mod.uptime_seconds("1 day 00:00:05") == 86405
+    assert monitor_mod.uptime_seconds("00:02:10") == 130
+    assert monitor_mod.uptime_seconds("soon") is None
+
+
+def test_only_real_upstream_answers_count():
+    import dns.message
+    import dns.rcode
+    import dns.rrset
+    q = dns.message.make_query("orbi-check-abc.example.com", "A")
+    made_up = dns.message.make_response(q)
+    made_up.set_rcode(dns.rcode.NXDOMAIN)  # a router answering by itself has no SOA for the zone
+    assert not monitor_mod.upstream_answered(made_up)
+    real = dns.message.make_response(q)
+    real.set_rcode(dns.rcode.NXDOMAIN)
+    real.authority.append(dns.rrset.from_text("example.com.", 3600, "IN", "SOA",
+                                              "ns.icann.org. noc.dns.icann.org. 2025 7200 3600 1209600 3600"))
+    assert monitor_mod.upstream_answered(real)
+    nodata = dns.message.make_response(q)  # what example.com really returns today: no records, plus its SOA
+    nodata.authority.append(dns.rrset.from_text("example.com.", 1800, "IN", "SOA",
+                                                "elliott.ns.cloudflare.com. dns.cloudflare.com. 2416 10000 2400 604800 1800"))
+    assert monitor_mod.upstream_answered(nodata)
+    assert not monitor_mod.upstream_answered(dns.message.make_response(q))  # empty NOERROR, no SOA
+    failed = dns.message.make_response(q)
+    failed.set_rcode(dns.rcode.SERVFAIL)
+    assert not monitor_mod.upstream_answered(failed)

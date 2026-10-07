@@ -115,6 +115,10 @@ def fake_router():
 @pytest.fixture
 def monitor(tmp_config, fake_router, monkeypatch):
     monkeypatch.setattr("orbi.monitor.local_macs", lambda: {"08:BF:B8:39:2E:5D"})
+    # Never query the real router or network from tests; individual tests override these.
+    monkeypatch.setattr("orbi.monitor.house_online", lambda host: False)
+    monkeypatch.setattr("orbi.monitor.internet_route", lambda host: {"vpn": False, "local_ip": "192.168.1.58"})
+    monkeypatch.setattr("orbi.monitor.adapter_name", lambda ip: "")
     store = Store(tmp_config / "orbi.db")
     notes = []
     m = Monitor(store, notify=lambda t, msg: notes.append((t, msg)), router_factory=lambda: fake_router,

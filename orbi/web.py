@@ -246,6 +246,7 @@ def create_app(monitor: Monitor) -> FastAPI:
         st = monitor.state
         s = config.load()
         outage = store.one("SELECT ts, detail FROM events WHERE id=?", (st["outage_id"],)) if st["outage_id"] else None
+        pc_offline = store.one("SELECT ts, title, detail FROM events WHERE id=?", (st["pc_offline_id"],)) if st["pc_offline_id"] else None
         last_speed = store.one("SELECT * FROM speedtests ORDER BY ts DESC LIMIT 1")
         traffic = store.one("SELECT ts, data FROM traffic ORDER BY ts DESC LIMIT 1")
         dns = st["wan"].get("dns", []) if st["wan"] else []
@@ -259,7 +260,7 @@ def create_app(monitor: Monitor) -> FastAPI:
         return {
             "router_configured": bool(s["router_password_enc"]),
             "internet": st["internet"], "router": st["router"], "latency_ms": st["latency_ms"], "last_check": st["last_check"],
-            "outage": outage, "uptime": {"24h": uptime(24), "7d": uptime(24 * 7), "30d": uptime(24 * 30)},
+            "outage": outage, "pc_offline": pc_offline, "uptime": {"24h": uptime(24), "7d": uptime(24 * 7), "30d": uptime(24 * 30)},
             "info": st["info"], "wan": st["wan"], "system": st["system"], "satellites": st["satellites"],
             "router_devices": st.get("router_devices"), "last_scan": st["last_scan"], "scan_error": st["scan_error"],
             "speedtest": {**st["speedtest"], "last": last_speed}, "traffic": _traffic_json(traffic),

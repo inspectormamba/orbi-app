@@ -6,6 +6,8 @@ supervisor if it ever dies, so one bad router response can't stop monitoring.
 import contextvars
 import json
 import logging
+import re
+import secrets
 import socket
 import threading
 import time
@@ -27,6 +29,68 @@ def tcp_ok(host, port, timeout=3.0):
             return (time.perf_counter() - t) * 1000
     except OSError:
         return None
+
+
+def internet_route(router_host: str) -> dict:
+    """Which local address this PC uses to reach the internet, and whether that differs from the one
+    it uses to reach the router. A different one means internet traffic leaves through another
+    adapter, which in practice is a VPN."""
+    def source(dest):
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as so:
+            so.connect((dest, 53))  # a UDP connect only picks the route; nothing is sent
+            return so.getsockname()[0]
+    try:
+        lan, out = source(router_host), source("1.1.1.1")
+    except OSError:
+        return {"vpn": False, "local_ip": None}
+    return {"vpn": lan != out, "local_ip": out}
+
+
+def adapter_name(ip: str) -> str:
+    """Windows' name for the network adapter that has this address (e.g. "WireGuard Tunnel"), or ""."""
+    import subprocess
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-Command", f"(Get-NetIPAddress -IPAddress '{ip}' -ErrorAction Stop).InterfaceAlias"],
+                             capture_output=True, text=True, timeout=15, creationflags=0x08000000).stdout  # CREATE_NO_WINDOW
+    except Exception:
+        return ""
+    return out.strip().splitlines()[0] if out.strip() else ""
+
+
+def upstream_answered(response, zone: str = "example.com.") -> bool:
+    """True if a reply to a made-up name under `zone` really came from the internet: either an answer, or
+    "no such name"/"no records" carrying the zone's own SOA record, which a router can't make up by itself.
+    (example.com answers a made-up name with NOERROR, no records and its SOA.)"""
+    import dns.rcode
+    import dns.rdatatype
+    if response.rcode() == dns.rcode.NOERROR and response.answer:
+        return True
+    return response.rcode() in (dns.rcode.NOERROR, dns.rcode.NXDOMAIN) and any(
+        rr.rdtype == dns.rdatatype.SOA and rr.name.to_text().lower() == zone for rr in response.authority)
+
+
+def house_online(router_host: str) -> bool:
+    """Asks the router to look up a made-up name under example.com. Only the internet can answer that,
+    so an answer means the router itself is online, whatever a VPN on this PC is doing."""
+    import dns.message
+    import dns.query
+    for _ in range(2):
+        try:
+            q = dns.message.make_query(f"orbi-check-{secrets.token_hex(6)}.example.com", "A")
+            if upstream_answered(dns.query.udp(q, router_host, timeout=3)):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def uptime_seconds(text: str | None) -> int | None:
+    """'2 days 07:21:36' or '07:21:36' -> seconds."""
+    m = re.fullmatch(r"(?:(\d+)\s*days?\s*)?(\d+):(\d{2}):(\d{2})", (text or "").strip())
+    if not m:
+        return None
+    d, h, mi, s = (int(x or 0) for x in m.groups())
+    return d * 86400 + h * 3600 + mi * 60 + s
 
 
 def local_macs() -> set[str]:
@@ -55,13 +119,14 @@ class Monitor:
         self._enforce_lock = threading.Lock()
         self.threads: dict[str, threading.Thread] = {}
         self.state = {
-            "internet": None, "router": None, "latency_ms": None, "last_check": None, "outage_id": None,
+            "internet": None, "router": None, "latency_ms": None, "last_check": None, "outage_id": None, "pc_offline_id": None,
             "router_down_id": None, "last_scan": None, "scan_error": None, "satellites": [], "wan": {},
             "system": {}, "info": {}, "speedtest": {"running": False, "error": None}, "enforce_error": None,
             "access_control": None,
         }
         self._fails = 0
         self._router_fails = 0
+        self._pc_fails = 0
         self._missing_sats: dict[str, int] = {}
         self._backhaul_changes: dict[str, tuple[str, int]] = {}  # mac -> (new kind, scans seen in a row)
         self.protected = local_macs()
@@ -140,7 +205,10 @@ class Monitor:
         s = config.load()
         router_ms = tcp_ok(s["router_host"], 443, 2.5) or tcp_ok(s["router_host"], 80, 2.5)
         lat = [ms for ms in (tcp_ok(h, p) for h, p in INTERNET_TARGETS) if ms is not None]
-        internet = bool(lat)
+        pc_ok = bool(lat)
+        # When this PC can't get out, ask the router whether *it* can: if so, the house is online and
+        # only this PC (usually its VPN) dropped, which isn't an internet outage.
+        internet = pc_ok or (router_ms is not None and house_online(s["router_host"]))
         now = time.time()
         self.store.x("INSERT INTO checks(ts,internet,router,latency_ms) VALUES(?,?,?,?)",
                      (now, int(internet), int(router_ms is not None), min(lat) if lat else None))
@@ -161,16 +229,32 @@ class Monitor:
         self._fails = 0 if internet else self._fails + 1
         if self._fails >= 2 and not st["outage_id"]:
             cause = self._outage_cause()
+            st["outage_wan_ip"] = (st["wan"] or {}).get("ip")
             st["outage_id"] = self.store.event("outage", "Internet down", detail=cause, severity="error",
                                                ts=now - self._fails * s["health_interval"])
             self.notify("Internet is down", cause)
         elif internet and st["outage_id"]:
             ev = self.store.one("SELECT * FROM events WHERE id=?", (st["outage_id"],))
             dur = now - ev["ts"]
-            self._close(st["outage_id"], f"{ev['detail']} Back after {fmt_duration(dur)}.".strip())
-            self.notify("Internet is back", f"Outage lasted {fmt_duration(dur)}")
+            found = self._outage_aftermath(dur)
+            self._close(st["outage_id"], f"{ev['detail']} {found} Back after {fmt_duration(dur)}.".replace("  ", " ").strip())
+            self.notify("Internet is back", f"Outage lasted {fmt_duration(dur)}. {found}".strip())
             st["outage_id"] = None
         st["internet"] = st["outage_id"] is None  # a single missed probe doesn't count as offline
+
+        # Only this PC lost the internet (2 misses in a row): say why, without calling it an outage.
+        self._pc_fails = self._pc_fails + 1 if (internet and not pc_ok) else 0
+        if self._pc_fails >= 2 and not st["pc_offline_id"]:
+            title, detail, note = self._pc_offline_cause(s["router_host"])
+            st["pc_offline_id"] = self.store.event("pc_offline", title, detail=detail, severity="warn",
+                                                   ts=now - self._pc_fails * s["health_interval"])
+            self.notify(title, note)
+        elif pc_ok and st["pc_offline_id"]:
+            ev = self.store.one("SELECT * FROM events WHERE id=?", (st["pc_offline_id"],))
+            dur = now - ev["ts"]
+            self._close(st["pc_offline_id"], f"{ev['detail']} Back after {fmt_duration(dur)}.")
+            self.notify("This PC is back online", f"It was cut off for {fmt_duration(dur)}")
+            st["pc_offline_id"] = None
 
         # Satellites: only meaningful while this PC can reach the router itself.
         if router_ms is not None:
@@ -219,6 +303,38 @@ class Monitor:
                 "Router and modem link are up; the problem is likely with your internet provider."
         except RouterError:
             return "The router isn't responding either."
+
+    def _pc_offline_cause(self, router_host):
+        """(title, detail, notification) for when the router is online but this PC isn't."""
+        route = internet_route(router_host)
+        if route["vpn"]:
+            name = adapter_name(route["local_ip"]) or "a VPN"
+            return ("Your VPN dropped; the internet is fine",
+                    f"The router is still online, but this PC sends its internet traffic through {name} ({route['local_ip']}), "
+                    "and that stopped working. Reconnect the VPN, or check with whoever runs it.",
+                    "The house internet is fine; reconnect your VPN.")
+        return ("This PC lost internet; the rest of the house is online",
+                "The router is still online, so the problem is on this PC: its network adapter or cable, a firewall or "
+                "security app, a proxy, or a VPN's kill switch blocking traffic.",
+                "The rest of the house is online; the problem is on this PC.")
+
+    def _outage_aftermath(self, duration: float) -> str:
+        """What the router says about an outage once it's over: did it restart, did the public IP change?"""
+        if not self.router:
+            return ""
+        found = []
+        try:
+            secs = uptime_seconds(self.router.uptime())
+            if secs is not None and secs < duration + 300:
+                found.append("The router restarted during it (power cut, crash or firmware update).")
+            wan = self.router.wan()
+            self.state["wan"] = wan
+            before = self.state.get("outage_wan_ip")
+            if before and wan.get("ip") and wan["ip"] != before:
+                found.append(f"Your public IP changed ({before} → {wan['ip']}), so the modem or your provider reset the connection.")
+        except RouterError:
+            pass
+        return " ".join(found)
 
     def _close(self, event_id, detail):
         self.store.close_event(event_id, detail=detail)
