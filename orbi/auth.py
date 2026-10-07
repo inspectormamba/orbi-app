@@ -14,7 +14,12 @@ from . import config
 
 COOKIE = "orbi_session"
 SESSION_DAYS = 90
+IDLE_MINUTES = 30  # a session unused this long is signed out (web/app.js also signs out after this long without input)
 MIN_PIN = 6
+
+# nonce -> time of its last request. Kept in memory only, so restarting the app signs everyone out too.
+_last_seen: dict[str, float] = {}
+_seen_lock = threading.Lock()
 
 
 def hash_pin(pin: str, salt: bytes | None = None) -> str:
@@ -50,8 +55,11 @@ def _secret() -> bytes:
 
 
 def make_session() -> str:
-    payload = f"{int(time.time()) + SESSION_DAYS * 86400}.{secrets.token_hex(8)}"
+    nonce = secrets.token_hex(8)
+    payload = f"{int(time.time()) + SESSION_DAYS * 86400}.{nonce}"
     sig = hmac.new(_secret(), payload.encode(), hashlib.sha256).hexdigest()
+    with _seen_lock:
+        _last_seen[nonce] = time.time()
     return f"{payload}.{sig}"
 
 
@@ -66,9 +74,20 @@ def _parse(token: str | None):
     return None
 
 
-def valid_session(token: str | None) -> bool:
+def valid_session(token: str | None, touch: bool = False) -> bool:
+    """touch=True counts this request as use of the session, restarting its idle timer."""
     parsed = _parse(token)
-    return bool(parsed) and parsed[1] not in config.load().get("revoked_sessions", {})
+    if not parsed or parsed[1] in config.load().get("revoked_sessions", {}):
+        return False
+    now = time.time()
+    with _seen_lock:
+        last = _last_seen.get(parsed[1])
+        if last is None or now - last > IDLE_MINUTES * 60:
+            _last_seen.pop(parsed[1], None)
+            return False
+        if touch:
+            _last_seen[parsed[1]] = now
+    return True
 
 
 def revoke_session(token: str | None):
@@ -80,11 +99,15 @@ def revoke_session(token: str | None):
     revoked = {n: exp for n, exp in config.load().get("revoked_sessions", {}).items() if exp > now}
     revoked[parsed[1]] = parsed[0]
     config.save({"revoked_sessions": revoked})
+    with _seen_lock:
+        _last_seen.pop(parsed[1], None)
 
 
 def rotate_secret():
     """Signs everyone out (used when the PIN changes)."""
     config.save({"session_secret": secrets.token_hex(32), "revoked_sessions": {}})
+    with _seen_lock:
+        _last_seen.clear()
 
 
 class Throttle:

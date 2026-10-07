@@ -139,7 +139,7 @@ def create_app(monitor: Monitor) -> FastAPI:
     async def require_login(request: Request, call_next):
         path = request.url.path
         if path.startswith("/api/") and path not in OPEN_PATHS:
-            if not auth.valid_session(request.cookies.get(auth.COOKIE)):
+            if not auth.valid_session(request.cookies.get(auth.COOKIE), touch=True):
                 return JSONResponse({"detail": "Sign in required"}, status_code=401)
         token = ACTOR.set(who(request)) if path.startswith("/api/") and request.method != "GET" else None
         try:

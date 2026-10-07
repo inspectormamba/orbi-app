@@ -120,12 +120,28 @@ async function boot() {
   catch (e) { setView(h("div", { class: "empty" }, e.message)); return; }
   if (!s.pin_set) return showSetup(s);
   if (!s.authenticated) return showLogin();
+  signedIn = true; lastInput = Date.now();
   $("#tabs").hidden = false;
   syncAdvancedTab();
   route(location.hash.slice(1) || "home");
 }
 
+// Sign out after 30 minutes without touch, mouse or keyboard input, so an unattended screen can't be used.
+// The page refreshes itself while open, so the server alone can't tell an idle tab from a busy one.
+const IDLE_MS = 30 * 60 * 1000;
+let lastInput = Date.now(), signedIn = false;
+["pointerdown", "pointermove", "keydown", "wheel", "touchstart", "scroll"].forEach((ev) =>
+  window.addEventListener(ev, () => { lastInput = Date.now(); }, { passive: true, capture: true }));
+function checkIdle() {
+  if (!signedIn || Date.now() - lastInput < IDLE_MS) return;
+  signedIn = false;
+  fetch("/api/logout", { method: "POST", credentials: "same-origin" }).catch(() => {}).finally(() => { showLogin(); toast("Signed out after 30 minutes without use"); });
+}
+setInterval(checkIdle, 30 * 1000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) checkIdle(); });
+
 function showLogin() {
+  signedIn = false;
   stopRefresh(); closeSheet();
   $("#tabs").hidden = true; $("#top-status").replaceChildren();
   const pin = h("input", { class: "pin-input", type: "password", inputmode: "numeric", autocomplete: "current-password", "aria-label": "PIN", maxlength: 32 });

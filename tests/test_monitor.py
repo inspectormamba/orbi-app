@@ -192,3 +192,17 @@ def test_daily_speedtest_window(monitor, monkeypatch):
     assert started == ["scheduled"]
     monitor.speedtest_tick(datetime(2026, 10, 2, 5, 30))  # PC woke at 5:30: still within the catch-up window
     assert started == ["scheduled", "scheduled"]
+
+
+def test_idle_sessions_sign_out(tmp_config, monkeypatch):
+    now = [1_000_000.0]
+    monkeypatch.setattr(auth.time, "time", lambda: now[0])
+    token = auth.make_session()
+    now[0] += 29 * 60
+    assert auth.valid_session(token, touch=True)  # used: the 30 minutes start again
+    now[0] += 29 * 60
+    assert auth.valid_session(token)
+    now[0] += 2 * 60  # 31 minutes since it was last used
+    assert not auth.valid_session(token, touch=True)
+    now[0] -= 30 * 60  # and it stays signed out
+    assert not auth.valid_session(token)
