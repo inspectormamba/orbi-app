@@ -136,6 +136,14 @@ class ModeBody(BaseModel):
     mode: str
 
 
+class DdnsBody(BaseModel):
+    enabled: bool
+    provider: str = "No-IP"
+    host: str = ""
+    user: str = ""
+    password: str | None = None  # None or "" keeps the current one
+
+
 class IotBody(BaseModel):
     enabled: bool
     ssid: str = ""
@@ -153,6 +161,17 @@ class ExtraPinBody(BaseModel):
     current: str
     new: str
     label: str = ""
+
+
+def ddns_points_to(host: str, router_host: str) -> list[str]:
+    """What a Dynamic DNS name resolves to right now (asked through the router, like every device does)."""
+    import dns.message
+    import dns.query
+    try:
+        r = dns.query.udp(dns.message.make_query(host, "A"), router_host, timeout=3)
+        return [rr.address for rrset in r.answer for rr in rrset if rrset.rdtype == 1]
+    except Exception:
+        return []
 
 
 def iso(dt):
@@ -290,7 +309,7 @@ def create_app(monitor: Monitor) -> FastAPI:
             "router_configured": bool(s["router_password_enc"]),
             "internet": st["internet"], "router": st["router"], "latency_ms": st["latency_ms"], "last_check": st["last_check"],
             "outage": outage, "pc_offline": pc_offline, "uptime": {"24h": uptime(24), "7d": uptime(24 * 7), "30d": uptime(24 * 30)},
-            "info": st["info"], "wan": st["wan"], "system": st["system"], "satellites": st["satellites"],
+            "info": st["info"], "wan": st["wan"], "system": st["system"], "satellites": st["satellites"], "router_uptime": st.get("router_uptime"),
             "router_devices": st.get("router_devices"), "last_scan": st["last_scan"], "scan_error": st["scan_error"],
             "speedtest": {**st["speedtest"], "last": last_speed}, "traffic": _traffic_json(traffic),
             "access_control": st["access_control"], "enforce_error": st["enforce_error"],
@@ -938,6 +957,54 @@ def create_app(monitor: Monitor) -> FastAPI:
         label = {"never": "off", "perschedule": "on the blocking schedule", "always": "always on"}[body.mode]
         return _firewall_job(lambda ui: ui.set_rules_mode(body.mode), "Firewall rules turned " + label, "",
                              "warn" if body.mode == "never" else "info")
+
+    # ---------- remote access: Orbi VPN server + Dynamic DNS ----------
+    @app.get("/api/remote-access")
+    def remote_access():
+        """The Orbi's VPN server and Dynamic DNS, as last read from the router (read on first request, ~20 s)."""
+        cached = monitor.state.get("remote")
+        if not cached and router() and not (monitor.jobs.get("remote_read") or {}).get("running"):
+            def read():
+                with monitor.ui_factory() as ui:
+                    data = {"vpn": ui.read_vpn(), "ddns": ui.read_ddns()}
+                monitor.state["remote"] = {"data": data, "ts": time.time()}
+                return data
+            monitor.run_job("remote_read", read)
+        job = monitor.jobs.get("remote_read") or {}
+        data = (cached or {}).get("data") or {}
+        ddns, check = data.get("ddns"), None
+        if ddns and ddns.get("enabled") and ddns.get("host"):
+            ips, public = ddns_points_to(ddns["host"], config.load()["router_host"]), (monitor.state.get("wan") or {}).get("ip")
+            check = {"resolves_to": ips, "public_ip": public, "current": bool(public and public in ips)}
+        return {"vpn": data.get("vpn"), "ddns": ddns, "ddns_check": check, "ts": (cached or {}).get("ts"),
+                "reading": bool(job.get("running")), "error": None if cached else job.get("error")}
+
+    @app.put("/api/ddns")
+    def set_ddns(body: DdnsBody):
+        host, user = body.host.strip().lower(), body.user.strip()
+        if body.enabled:
+            if body.provider not in ("No-IP", "Dyn"):
+                raise HTTPException(400, "Choose No-IP or Dyn (set up NETGEAR's own service on the router's Dynamic DNS page)")
+            if not re.fullmatch(r"(?=.{4,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}", host):
+                raise HTTPException(400, "Enter the full host name, like myhome.ddns.net")
+            if not 1 <= len(user) <= 64 or not user.isprintable():
+                raise HTTPException(400, "Enter the account's user name or email")
+            if body.password and (len(body.password) > 64 or not body.password.isprintable()):
+                raise HTTPException(400, "The password must be up to 64 characters")
+        router()
+
+        def work():
+            with monitor.ui_factory() as ui:
+                got = ui.set_ddns(body.enabled, body.provider, host, user, body.password or None)
+                vpn = ui.read_vpn()
+            monitor.state["remote"] = {"data": {"vpn": vpn, "ddns": got}, "ts": time.time()}
+            store.event("action", "Dynamic DNS " + ("updated" if body.enabled else "turned off"),
+                        detail=f"{got['provider']} · {got['host']}" + (" · new password" if body.password else "") if body.enabled
+                        else "Your home address name stops following your internet address", severity="info" if body.enabled else "warn")
+            return got
+        if not monitor.run_job("ddns", work):
+            raise HTTPException(409, "A Dynamic DNS change is already running")
+        return {"ok": True}
 
     # ---------- IoT Wi-Fi network ----------
     @app.get("/api/iot")

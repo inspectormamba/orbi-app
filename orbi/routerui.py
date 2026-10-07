@@ -158,9 +158,8 @@ class RouterUI:
                               "trusted_ip": f.get("bs_trustedip") if f.get("bs_trustedip_enable") == "1" else None}
         f = self.form("FW_schedule.htm")
         out["schedule"] = parse_schedule(f)
-        f = self.form("OPENVPN.htm")
-        out["vpn"] = {"enabled": f.get("openvpnActive") == "openvpnEnable", "protocol": f.get("openvpn_protocol_tun"),
-                      "port": f.get("openvpn_service_port_tun"), "port_tap": f.get("openvpn_service_port")}
+        out["vpn"] = self.read_vpn()
+        out["ddns"] = self.read_ddns()
         upnp = []
         for cells in self.rows("UPNP_upnp.htm"):
             if len(cells) >= 5 and cells[1] in ("TCP", "UDP"):
@@ -289,6 +288,41 @@ class RouterUI:
                 self.add_rule(name, protocol, port, port, {"type": "all"})
                 changed.append(name)
         return changed
+
+    # ---- remote access: the Orbi's VPN server and Dynamic DNS ----
+    def read_vpn(self) -> dict:
+        f = self.form("OPENVPN.htm")
+        return {"enabled": f.get("openvpnActive") == "openvpnEnable", "protocol": f.get("openvpn_protocol_tun"),
+                "port": f.get("openvpn_service_port_tun"), "port_tap": f.get("openvpn_service_port")}
+
+    DDNS_PROVIDERS = ("NETGEAR", "No-IP", "Dyn")
+
+    def read_ddns(self) -> dict:
+        """The router's Dynamic DNS settings. The password is never read back out."""
+        f = self.form("DNS_ddns.htm")
+        provider = f.get("sysDNSProviderlist") or ""
+        netgear = provider == "NETGEAR"
+        return {"enabled": f.get("sysDNSActive") == "dnsEnable", "provider": provider,
+                "host": (f.get("sysDNSHost_Netgear") if netgear else f.get("sysDNSHost")) or "",
+                "user": "" if netgear else f.get("sysDNSUser") or "", "wildcard": f.get("sysDNSWildCard") == "wildEnable"}
+
+    def set_ddns(self, enabled: bool, provider: str, host: str, user: str, password: str | None = None) -> dict:
+        """No-IP / Dyn accounts (NETGEAR's own service has a separate sign-up flow on the router page)."""
+        self.open("DNS_ddns.htm", settle=3)
+        if self.d.execute_script("return document.getElementById('sys_dnsactive').checked") != enabled:
+            self.d.execute_script("document.getElementById('sys_dnsactive').click()")
+        if enabled:
+            self._set("sys_dnsprovider_list", provider)
+            self._set("sys_dnshost", host)
+            self._set("sys_dnsuser", user)
+            if password:
+                self._set("sys_dnspassword", password)
+        self._click("apply", wait=8)
+        got = self.read_ddns()
+        want = {"enabled": enabled} if not enabled else {"enabled": True, "provider": provider, "host": host, "user": user}
+        if any(got[k] != v for k, v in want.items()):
+            raise RouterUIError(f"The router didn't save the Dynamic DNS settings as asked (it shows {got})")
+        return got
 
     # ---- IoT Wi-Fi network (on the main Wireless Setup page) ----
     IOT_BANDS = {"both": "enable_iot_2g5g", "2.4": "enable_iot_2g", "5": "enable_iot_5g"}

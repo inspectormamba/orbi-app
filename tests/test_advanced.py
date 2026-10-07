@@ -100,6 +100,20 @@ class FakeUI:
     def set_rules_mode(self, mode):
         FakeUI.calls.append(("rules_mode", mode))
 
+    def read_vpn(self):
+        return {"enabled": True, "protocol": "udp", "port": "12973", "port_tap": "12974"}
+
+    def read_ddns(self):
+        return dict(FakeUI.ddns)
+
+    ddns = {"enabled": True, "provider": "No-IP", "host": "myhome.ddns.net", "user": "me@example.com", "wildcard": False}
+
+    def set_ddns(self, enabled, provider, host, user, password=None):
+        FakeUI.calls.append(("ddns", enabled, provider, host, user, password))
+        FakeUI.ddns = {**FakeUI.ddns, "enabled": enabled} if not enabled else \
+            {"enabled": True, "provider": provider, "host": host, "user": user, "wildcard": False}
+        return dict(FakeUI.ddns)
+
     def read_iot(self):
         return {"enabled": True, "ssid": "Home-IoT", "band": "2.4", "security": "WPA2-PSK"}
 
@@ -289,3 +303,38 @@ def test_iot_card_reads_the_router_on_its_own(client, monitor):
     assert first["iot"] is None or first["iot"]["ssid"] == "Home-IoT"
     wait_job(client, "iot_read")
     assert client.get("/api/iot").json()["iot"] == {"enabled": True, "ssid": "Home-IoT", "band": "2.4", "security": "WPA2-PSK"}
+
+
+
+def test_remote_access_reads_vpn_and_ddns(client, monkeypatch):
+    import orbi.web as web
+    monkeypatch.setattr(web, "ddns_points_to", lambda host, router_host: ["1.2.3.4"])
+    first = client.get("/api/remote-access").json()
+    assert first["vpn"] is None or first["vpn"]["port"] == "12973"
+    wait_job(client, "remote_read")
+    r = client.get("/api/remote-access").json()
+    assert r["vpn"]["enabled"] and r["ddns"]["host"] == "myhome.ddns.net"
+    assert "password" not in r["ddns"]
+    assert r["ddns_check"] == {"resolves_to": ["1.2.3.4"], "public_ip": "1.2.3.4", "current": True}  # FakeRouter's WAN address
+
+
+def test_ddns_api(client, monkeypatch):
+    import orbi.web as web
+    monkeypatch.setattr(web, "ddns_points_to", lambda host, router_host: [])
+    FakeUI.ddns = {"enabled": True, "provider": "No-IP", "host": "myhome.ddns.net", "user": "me@example.com", "wildcard": False}
+    for bad in ({"enabled": True, "provider": "NETGEAR", "host": "a.mynetgear.com", "user": "x"},
+                {"enabled": True, "provider": "No-IP", "host": "not a host", "user": "x"},
+                {"enabled": True, "provider": "No-IP", "host": "home.ddns.net", "user": ""}):
+        assert client.put("/api/ddns", json=bad).status_code == 400, bad
+    r = client.put("/api/ddns", json={"enabled": True, "provider": "Dyn", "host": "Home.Dyndns.org", "user": "me", "password": "s3cret"})
+    assert r.status_code == 200 and wait_job(client, "ddns")["error"] is None
+    assert FakeUI.calls[0] == ("ddns", True, "Dyn", "home.dyndns.org", "me", "s3cret")
+    ev = client.get("/api/events?kind=action").json()[0]
+    assert ev["title"] == "Dynamic DNS updated" and "s3cret" not in ev["detail"]
+    assert client.get("/api/remote-access").json()["ddns"]["host"] == "home.dyndns.org"
+    assert client.put("/api/ddns", json={"enabled": False}).status_code == 200 and wait_job(client, "ddns")["error"] is None
+    assert client.get("/api/events?kind=action").json()[0]["title"] == "Dynamic DNS turned off"
+
+
+def test_status_includes_router_uptime(client):
+    assert client.get("/api/status").json()["router_uptime"] == "2 days 07:21:36"

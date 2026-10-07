@@ -240,7 +240,8 @@ async function renderHome() {
   for (const s of st.satellites || []) {
     const wired = s.backhaul_kind === "wired";
     const bh = wired ? "Wired backhaul" : s.backhaul ? `${s.backhaul.replace("GHz", " GHz")} wireless backhaul${s.usually_wired ? " (normally wired: check its cable)" : ""}` : "";
-    mesh.append(h("div", { class: `row${s.online === false ? " offline" : ""}` }, ico("sat"),
+    mesh.append(h("div", { class: `row tap${s.online === false ? " offline" : ""}`, role: "button", tabindex: 0,
+      onclick: () => satelliteSheet(s), onkeydown: (e) => e.key === "Enter" && satelliteSheet(s) }, ico("sat"),
       h("div", { class: "main" }, h("div", { class: "name" }, s.name),
         h("div", { class: "meta" }, [s.online === false ? "Not connected" : `${s.devices ?? 0} devices`, bh].filter(Boolean).join(" · "))),
       s.online === false ? h("span", { class: "pill bad" }, "Offline") : wired ? h("span", { class: "pill ok" }, "Wired")
@@ -297,6 +298,16 @@ function pauseSheet(p, after) {
   const choose = (minutes, label) => h("button", { class: "btn block", onclick: (e) => act(e.currentTarget, () => api(`/api/profiles/${p.id}/pause`, { body: { minutes } }), `${p.name} paused ${label}`).then(() => { closeSheet(); after(); }) }, label);
   openSheet(h("h3", {}, `Pause ${p.name}`), h("p", { class: "muted small", style: "margin:0" }, `All of ${p.name}'s devices lose internet right away.`),
     choose(15, "for 15 minutes"), choose(30, "for 30 minutes"), choose(60, "for 1 hour"), choose(120, "for 2 hours"), choose(null, "until I resume"));
+}
+
+function satelliteSheet(s) {
+  const pairs = [["Status", s.online === false ? "Not connected" : "Online"], ["Devices", s.devices ?? 0],
+    ["Backhaul", s.backhaul_kind === "wired" ? "Wired (Ethernet)" : s.backhaul ? `${s.backhaul.replace("GHz", " GHz")} wireless` : "—"],
+    s.backhaul_kind === "wired" ? null : ["Signal to router", s.signal == null ? "—" : `${s.signal}%`],
+    ["IP", s.ip], ["Model", s.model], ["Firmware", s.firmware], ["MAC", s.mac]].filter(Boolean);
+  openSheet(h("h3", {}, s.name), h("dl", { class: "kv" }, ...pairs.flatMap(([k, v]) => [h("dt", {}, k), h("dd", {}, v ?? "—")])),
+    s.usually_wired && s.backhaul_kind !== "wired" ? h("div", { class: "note" }, "This satellite is normally wired. Check its Ethernet cable and the switch port, then reboot it.") : null,
+    h("div", { class: "btns" }, h("button", { class: "btn", onclick: closeSheet }, "Close")));
 }
 
 // ---------- Devices ----------
@@ -428,7 +439,7 @@ async function renderFamily() {
   const ac = status.enforce_error ? h("div", { class: "note" }, `Some blocks couldn't be applied: ${status.enforce_error}`) : null;
   setView(ac, intro, ...cards, profiles.length ? defaultCard(profiles) : null,
     h("button", { class: "btn primary block", onclick: () => profileSheet(null) }, "+ New profile"),
-    h("div", { class: "group-label", style: "margin-top:8px" }, "Whole house"), dns, blocking);
+    h("div", { class: "group-label", style: "margin-top:8px" }, "Whole house"), dns, blocking, vpnAttemptsCard());
   every(30000, async () => { if ($("#sheet").hidden) await renderFamily(); });
 }
 
@@ -532,7 +543,31 @@ async function renderHistory() {
     ...events.filter((e) => e.kind !== "outage").slice(0, 60).map((e) => h("div", { class: "row" },
       h("div", { class: "main" }, h("div", { class: "name", style: "white-space:normal" }, e.title), h("div", { class: "meta" }, [fmtWhen(e.ts), e.detail].filter(Boolean).join(" · "))),
       e.severity !== "info" ? h("span", { class: `pill ${e.severity === "error" ? "bad" : "warn"}` }, e.severity === "error" ? "Alert" : "Notice") : null)));
-  setView(chips, uptimeCard, outageCard, speedCard, trafficCard, log);
+  setView(chips, uptimeCard, outageCard, speedCard, trafficCard, log, routerLogCard());
+}
+
+function routerLogCard() {
+  const logList = h("div");
+  const kinds = [["all", "All"], ["dhcp", "DHCP"], ["blocked", "Blocked"], ["logins", "Admin logins"], ["upnp", "UPnP"]];
+  const logChips = h("div", { class: "chips" }, ...kinds.map(([k, l]) => h("button", { class: `chip${logKind === k ? " on" : ""}`, onclick: (e) => {
+    logKind = k; logLimit = 25; logChips.querySelectorAll(".chip").forEach((c) => c.classList.toggle("on", c === e.currentTarget)); loadLog();
+  } }, l)));
+  const logSearch = h("input", { class: "search", type: "search", placeholder: "Search the log (IP, MAC, name…)", value: logQuery,
+    oninput: (e) => { logQuery = e.target.value; logLimit = 25; clearTimeout(logSearch.t); logSearch.t = setTimeout(loadLog, 300); } });
+  let logLimit = 25;
+  async function loadLog() {
+    const res = await api(`/api/routerlog?kind=${logKind}&q=${encodeURIComponent(logQuery)}&limit=${logLimit + 1}`);
+    const rows = res.rows.slice(0, logLimit);
+    const more = res.rows.length > logLimit
+      ? h("button", { class: "btn small block", style: "margin-top:8px", onclick: () => { logLimit += 50; loadLog(); } }, "Show more") : null;
+    fill(logList, ...(rows.length ? rows.map((x) => h("div", { class: "row" }, h("div", { class: "main" },
+      h("div", { class: "name", style: "white-space:normal;font-weight:500;font-size:13.5px" }, x.text.replace(/,?\s*\w+day, \w{3} \d{1,2},\d{4} \d\d:\d\d:\d\d$/, "")),
+      h("div", { class: "meta" }, [fmtWhen(x.ts), x.device].filter(Boolean).join(" · ")))))
+      : [h("div", { class: "empty" }, res.total ? "No matching entries." : "The router log is read every 10 minutes; check back shortly.")]), more);
+  }
+  const logCard = h("section", { class: "card" }, h("h2", {}, "Router log"), logSearch, logChips, logList);
+  loadLog().catch(() => {});
+  return logCard;
 }
 
 function uptimeChart(hist) {
@@ -577,7 +612,7 @@ function barChart(days) {
 
 // ---------- More ----------
 async function renderMore() {
-  const [settings, access, events] = await Promise.all([api("/api/settings"), api("/api/access"), api("/api/events?limit=50")]);
+  const [settings, access, events, st] = await Promise.all([api("/api/settings"), api("/api/access"), api("/api/events?limit=50"), api("/api/status")]);
   api("/api/events/seen", { body: {} }).then(() => ($("#alert-badge").hidden = true)).catch(() => {});
   const alerts = events.filter((e) => e.severity !== "info").slice(0, 8);
   const alertCard = h("section", { class: "card" }, h("h2", {}, "Recent alerts"),
@@ -604,7 +639,11 @@ async function renderMore() {
 
   const rpw = h("input", { type: "password", autocomplete: "off", placeholder: settings.router_configured ? "••••••••" : "Orbi admin password" });
   const certInfo = h("div", {});
+  const routerFacts = [["Model", st.info?.model], ["Firmware", st.info?.firmware], ["Uptime", st.router_uptime],
+    ["Memory used", st.system?.memory != null ? `${st.system.memory}%` : null],
+    ["Access Control", st.access_control == null ? null : st.access_control ? "On (needed for device blocking)" : "Off"]].filter(([, v]) => v != null && v !== "");
   const routerCard = h("section", { class: "card form" }, h("h2", {}, "Router"),
+    routerFacts.length ? h("dl", { class: "kv" }, ...routerFacts.flatMap(([k, v]) => [h("dt", {}, k), h("dd", {}, v)])) : null,
     h("label", { class: "field" }, `Admin password for ${settings.router_host}`, rpw),
     h("button", { class: "btn", onclick: (e) => act(e.currentTarget, () => api("/api/settings/router-password", { body: { password: rpw.value } }), "Router password saved").then(() => (rpw.value = "")) }, "Update password"),
     h("button", { class: "btn", onclick: (e) => act(e.currentTarget, async () => { const f = await api("/api/firmware"); toast(f.available ? `Firmware ${f.available} is available` : `Firmware ${f.current} is up to date`); }) }, "Check for firmware update"),
@@ -638,7 +677,7 @@ async function renderMore() {
   } });
   const advCard = h("section", { class: "card" }, h("h2", {}, "Advanced mode"),
     h("label", { class: "switch" }, "Show the Advanced tab (Wi-Fi networks, DHCP, logs, VPN, firewall rules…)", advToggle));
-  setView(alertCard, phone, advCard, monitoring, routerCard, pinCard, updatesCard(settings),
+  setView(alertCard, phone, remoteCard(), advCard, monitoring, routerCard, pinCard, updatesCard(settings),
     h("div", { class: "muted small center" }, "Orbi Control runs on your PC and talks to the Orbi directly — no cloud. Outside connections: the optional update check to GitHub, and internet checks to 1.1.1.1, 8.8.8.8 and 9.9.9.9."));
 }
 
@@ -883,10 +922,6 @@ async function renderAdvanced() {
       ...rows.map((row) => h("tr", {}, ...row.map((c) => h("td", {}, c == null ? "" : c))))))
     : h("div", { class: "muted small" }, "None.");
 
-  const routerCard = h("section", { class: "card" }, h("h2", {}, "Router"), kv([
-    ["Model", r.info && r.info.model], ["Serial", r.info && r.info.serial], ["Firmware", r.info && r.info.firmware], ["Uptime", d.uptime],
-    ["Memory used", r.system && r.system.memory != null ? `${r.system.memory}%` : null],
-    ["Access Control", r.access_control ? "On (needed for device blocking)" : "Off"]]));
   const wan = h("section", { class: "card" }, h("h2", {}, "Internet (WAN)"), kv([
     ["Connection", (d.wan.type || "").toUpperCase()], ["Public IP", d.wan.ip], ["Gateway", d.wan.gateway], ["Netmask", d.wan.netmask],
     ["DNS", `${d.wan.dns.filter(Boolean).join(", ")} (${d.wan.dns_mode})`], ["ISP's DNS", d.wan.isp_dns.filter(Boolean).join(", ")], ["WAN MAC", d.wan.mac]]));
@@ -894,22 +929,10 @@ async function renderAdvanced() {
     ["Router IP", d.lan.ip], ["Subnet mask", d.lan.netmask], ["DHCP server", d.lan.dhcp_enabled ? `On · hands out ${d.lan.dhcp_start} – ${d.lan.dhcp_end}` : "Off"]]),
     h("div", { class: "group-label" }, `Address reservations · ${d.lan.reservations.length}`),
     table(["IP", "Name", "MAC"], d.lan.reservations.map((x) => [x.ip, x.name, x.mac])),
-    h("div", { class: "muted small", style: "margin-top:8px" }, "Recent DHCP activity is in the Router log below (DHCP filter)."));
+    h("div", { class: "muted small", style: "margin-top:8px" }, "Recent DHCP activity is in History → Router log (DHCP filter)."));
   const wifi = h("section", { class: "card" }, h("h2", {}, "Main Wi-Fi"), table(["Band", "Name", "Channel", "Mode", "Security"],
     (d.wifi || []).map((w) => [w.band, w.ssid + (w.enabled ? "" : " (off)"), w.channel, w.mode, w.security])));
-  const sats = h("section", { class: "card" }, h("h2", {}, "Satellites"), table(["Name", "IP", "Backhaul", "Signal", "Firmware", "MAC"],
-    (r.satellites || []).map((x) => [x.name + (x.online === false ? " (offline)" : ""), x.ip, x.backhaul, x.backhaul_kind === "wired" ? "—" : `${x.signal == null ? "—" : x.signal}%`, x.firmware, x.mac])));
 
-  const vpnAttempts = await api("/api/events?kind=vpn_attempt&limit=20");
-  const vpnRules = d.block_services.rules.filter((x) => /vpn/i.test(x.name));
-  const vpn = h("section", { class: "card" }, h("h2", {}, "VPN"), kv([
-    ["Orbi VPN server", d.vpn.enabled ? `On · ${String(d.vpn.protocol).toUpperCase()} port ${d.vpn.port}` : "Off"],
-    ["Who's connected", d.vpn.enabled ? "The Orbi doesn't report active VPN sessions" : "—"],
-    ["Kids' VPN apps", vpnRules.length ? `Blocked (${vpnRules.map((x) => `${x.name.replace("Block-VPN-", "")} ${x.port}`).join(", ")})` : "Not blocked"]]),
-    h("div", { class: "group-label" }, "Blocked VPN attempts"),
-    vpnAttempts.length ? h("div", {}, ...vpnAttempts.map((e) => h("div", { class: "row" }, h("div", { class: "main" },
-      h("div", { class: "name" }, e.title), h("div", { class: "meta" }, `${fmtWhen(e.ts)} · ${e.detail}`)))))
-      : h("div", { class: "muted small" }, "None so far."));
   const modeLabel = { never: "Off (Never)", perschedule: "On the blocking schedule", always: "Always on" };
   const who = (ips) => ips === "all" ? "Every device" : `${ips}${devName(ips) ? ` (${devName(ips)})` : ""}`;
   const fw = h("section", { class: "card" },
@@ -925,27 +948,53 @@ async function renderAdvanced() {
   const ports = h("section", { class: "card" }, h("h2", {}, "Port forwarding (UPnP)"),
     table(["Device", "Protocol", "Outside", "Inside"], d.upnp.map((x) => [devName(x.ip) ? `${devName(x.ip)} (${x.ip})` : x.ip, x.protocol, x.external_port, x.internal_port])));
 
-  const logList = h("div");
-  const kinds = [["all", "All"], ["dhcp", "DHCP"], ["blocked", "Blocked"], ["logins", "Admin logins"], ["upnp", "UPnP"]];
-  const logChips = h("div", { class: "chips" }, ...kinds.map(([k, l]) => h("button", { class: `chip${logKind === k ? " on" : ""}`, onclick: (e) => {
-    logKind = k; logLimit = 25; logChips.querySelectorAll(".chip").forEach((c) => c.classList.toggle("on", c === e.currentTarget)); loadLog();
-  } }, l)));
-  const logSearch = h("input", { class: "search", type: "search", placeholder: "Search the log (IP, MAC, name…)", value: logQuery,
-    oninput: (e) => { logQuery = e.target.value; logLimit = 25; clearTimeout(logSearch.t); logSearch.t = setTimeout(loadLog, 300); } });
-  let logLimit = 25;
-  async function loadLog() {
-    const res = await api(`/api/routerlog?kind=${logKind}&q=${encodeURIComponent(logQuery)}&limit=${logLimit + 1}`);
-    const rows = res.rows.slice(0, logLimit);
-    const more = res.rows.length > logLimit
-      ? h("button", { class: "btn small block", style: "margin-top:8px", onclick: () => { logLimit += 50; loadLog(); } }, "Show more") : null;
-    fill(logList, ...(rows.length ? rows.map((x) => h("div", { class: "row" }, h("div", { class: "main" },
-      h("div", { class: "name", style: "white-space:normal;font-weight:500;font-size:13.5px" }, x.text.replace(/,?\s*\w+day, \w{3} \d{1,2},\d{4} \d\d:\d\d:\d\d$/, "")),
-      h("div", { class: "meta" }, [fmtWhen(x.ts), x.device].filter(Boolean).join(" · ")))))
-      : [h("div", { class: "empty" }, res.total ? "No matching entries." : "The router log is read every 10 minutes; check back shortly.")]), more);
-  }
-  const logCard = h("section", { class: "card" }, h("h2", {}, "Router log"), logSearch, logChips, logList);
-  loadLog().catch(() => {});
-  setView(head, routerCard, wan, lan, h("div", { class: "group-label" }, "Wi-Fi networks"), wifi, guestCard(), iotCard(), sats, vpn, fw, ports, logCard);
+  setView(head, wan, lan, h("div", { class: "group-label" }, "Wi-Fi networks"), wifi, guestCard(), iotCard(), fw, ports);
+}
+
+// ---------- remote access (More): the Orbi's VPN server + Dynamic DNS ----------
+function remoteCard() {
+  const card = h("section", { class: "card" }, h("h2", {}, "Away from home"), h("div", { class: "muted small" }, h("span", { class: "spinner" }), " Reading from the router…"));
+  const load = async () => {
+    const r = await api("/api/remote-access");
+    if (!r.vpn && !r.ddns) {
+      if (r.reading) { setTimeout(() => load().catch(() => {}), 3000); return; }
+      fill(card, h("h2", {}, "Away from home"), h("div", { class: "error-text" }, r.error || "Couldn't read the VPN and Dynamic DNS settings from the router."));
+      return;
+    }
+    const v = r.vpn || {}, d = r.ddns || {}, c = r.ddns_check;
+    const ddnsState = !d.enabled ? "Off" : c == null ? `${d.host} (checking…)` : c.current ? `${d.host} → ${c.public_ip} ✓`
+      : `${d.host} → ${c.resolves_to.join(", ") || "doesn't resolve"} (your internet address is ${c.public_ip || "unknown"})`;
+    fill(card, h("h2", {}, "Away from home", d.provider !== "NETGEAR" ? h("button", { class: "btn small act", onclick: () => ddnsSheet(d) }, "Dynamic DNS…") : null),
+      h("dl", { class: "kv" },
+        h("dt", {}, "Orbi VPN server"), h("dd", {}, v.enabled ? `On · ${String(v.protocol || "").toUpperCase()} port ${v.port}` : "Off"),
+        h("dt", {}, "Dynamic DNS"), h("dd", {}, d.enabled ? `${d.provider} · ${ddnsState}` : "Off")),
+      c && !c.current ? h("div", { class: "note" }, "Your Dynamic DNS name doesn't point at your current internet address, so connecting from outside may fail until the router updates it.") : null,
+      h("div", { class: "muted small" }, "To use Orbi Control away from home, connect your phone to the Orbi's VPN (set up in the Orbi app), then open the same address as at home. Dynamic DNS keeps a name like myhome.ddns.net pointing at your home's internet address, which the VPN uses to find home."));
+  };
+  load().catch((e) => fill(card, h("h2", {}, "Away from home"), h("div", { class: "error-text" }, e.message)));
+  return card;
+}
+
+function ddnsSheet(d) {
+  const on = h("input", { type: "checkbox", checked: !!d.enabled });
+  const provider = h("select", {}, ...["No-IP", "Dyn"].map((p) => h("option", { value: p, selected: p === d.provider }, p === "No-IP" ? "No-IP (noip.com)" : "Dyn (dyn.com)")));
+  const host = h("input", { value: d.host || "", placeholder: "myhome.ddns.net", autocapitalize: "off", spellcheck: "false" });
+  const user = h("input", { value: d.user || "", autocapitalize: "off", spellcheck: "false" });
+  const pw = h("input", { type: "password", autocomplete: "new-password", placeholder: "Leave blank to keep the current password" });
+  const fields = h("div", {}, h("label", { class: "field" }, "Service", provider), h("label", { class: "field" }, "Host name", host),
+    h("label", { class: "field" }, "User name or email", user), h("label", { class: "field" }, "Password (optional)", pw));
+  const sync = () => { fields.hidden = !on.checked; };
+  on.addEventListener("change", sync); sync();
+  openSheet(h("h3", {}, "Dynamic DNS"), h("label", { class: "switch" }, "Use a Dynamic DNS service", on), fields,
+    h("p", { class: "muted small" }, "The Orbi's VPN uses this name to find your home from outside. If it's wrong or turned off, connecting to the VPN away from home stops working. The account details come from your Dynamic DNS provider."),
+    h("div", { class: "btns" }, h("button", { class: "btn", onclick: closeSheet }, "Cancel"),
+      h("button", { class: "btn primary", onclick: (e) => act(e.currentTarget, async () => {
+        await api("/api/ddns", { method: "PUT", body: { enabled: on.checked, provider: provider.value, host: host.value, user: user.value, password: pw.value || null } });
+        pw.value = "";
+        await waitJob("ddns", "Saving to the router");
+        closeSheet(); renderMore().catch(() => {});
+        return { note: "Dynamic DNS saved" };
+      }) }, "Save")));
 }
 
 // ---------- Guest & IoT Wi-Fi (Advanced, under Main Wi-Fi) ----------
@@ -1073,6 +1122,17 @@ function iotSheet(iot) {
         pw.value = "";
         return routerJob("iot", "Saving (Wi-Fi restarts)", "IoT Wi-Fi saved");
       }) }, "Save")));
+}
+
+// ---------- blocked VPN attempts (Family → Whole house) ----------
+function vpnAttemptsCard() {
+  const card = h("section", { class: "card" }, h("h2", {}, "VPN attempts"), h("div", { class: "muted small" }, h("span", { class: "spinner" })));
+  api("/api/events?kind=vpn_attempt&limit=20").then((list) => fill(card, h("h2", {}, "VPN attempts"),
+    h("div", { class: "muted small", style: "margin-bottom:6px" }, "Devices that tried to connect to a VPN app and were blocked by the router's VPN rules (Advanced → Firewall rules)."),
+    ...(list.length ? list.map((e) => h("div", { class: "row" }, h("div", { class: "main" },
+      h("div", { class: "name" }, e.title), h("div", { class: "meta" }, `${fmtWhen(e.ts)} · ${e.detail}`))))
+      : [h("div", { class: "muted small" }, "None so far.")]))).catch((e) => fill(card, h("h2", {}, "VPN attempts"), h("div", { class: "error-text" }, e.message)));
+  return card;
 }
 
 // ---------- default profile ("everyone else") ----------

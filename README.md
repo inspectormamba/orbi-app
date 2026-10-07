@@ -17,11 +17,13 @@ A local replacement for the Netgear Orbi app. It runs on a Windows PC, talks to 
 - **Content filtering:** choose the router's family-DNS service (AdGuard Family by default: SafeSearch, YouTube Restricted Mode, adult sites blocked, Reddit allowed; it also blocks ads and trackers, which stops some streaming apps such as ESPN from playing). A change snapshots the Internet settings, then verifies the internet still works and rolls back automatically if it doesn't. It applies to the whole house, because the Orbi relays DNS for every device and can't filter per device.
 - **Block apps & sites:** presets (TikTok, Roblox, Instagram, Fortnite…) plus custom keywords, all the time or on a schedule. The Orbi's Block Sites feature enforces them, so blocking works even when the PC is off. Whole house only.
 - **DNS & VPN workarounds:** one button (under Content filtering) adds router rules that block outside DNS (port 53), DNS-over-TLS (853) and the standard VPN ports (OpenVPN 1194, WireGuard 51820). Without those rules, devices can sidestep the filter. Once they're in place, you get an alert naming any device that tries.
-- **Advanced tab** (switch on under More): router, WAN, LAN/DHCP with reservations, Wi-Fi radios, satellites, the VPN server's status, firewall rules, UPnP port forwards, and the searchable router log (DHCP assignments, blocked attempts, admin logins). Failed admin logins raise a security alert.
+- **Advanced tab** (switch on under More): WAN, LAN/DHCP with reservations, the Wi-Fi networks, firewall rules and UPnP port forwards.
   - **Firewall rules** (the router's Block Services): add, edit and delete rules (ports, protocol, and every device, one address or a range) and choose when they apply. Each change is read back from the router to confirm it, and removing or narrowing a rule, or turning rules off, raises an alert.
   - **Wi-Fi networks:** the main network, Guest Wi-Fi (on/off, show its password) and IoT Wi-Fi together. IoT Wi-Fi: turn the separate IoT network on or off and change its name, band, security and password. Saving restarts the router's Wi-Fi for about a minute; the app then checks your main Wi-Fi settings came back unchanged. The password is never shown.
-- **Controls:** guest Wi-Fi on/off (and show its password), router reboot, firmware check, speed tests run by the router (on demand plus a daily test at 04:00).
-- **History:** connection timeline, outages, speed-test trends, daily data usage, activity log.
+- **Controls (More):** router details (model, firmware, uptime, memory), router reboot, firmware check, speed tests run by the router (on demand plus a daily test at 04:00).
+- **Away from home (More):** whether the Orbi's VPN server is on, and the router's Dynamic DNS (No-IP or Dyn), with a check that the name points at your current internet address. You can change the Dynamic DNS settings there; the password is never shown.
+- **History:** connection timeline, outages, speed-test trends, daily data usage, activity log, and the searchable router log (DHCP assignments, blocked attempts, admin logins). Failed admin logins raise a security alert.
+- **Family → Whole house** also lists devices that tried to use a VPN app and were blocked. Tapping a satellite on Home shows its IP, firmware, MAC and backhaul.
 
 ## Using it
 

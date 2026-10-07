@@ -352,6 +352,7 @@ class Monitor:
             self.state["wan"] = self.router.wan()
             self._watch_filter(self.state["wan"].get("dns"))
             self.state["system"] = self.router.system()
+            self.state["router_uptime"] = self.router.uptime()
             sats = self.router.satellites()
             devices = self.router.devices()
             self.state["access_control"] = self.router.access_control_enabled()
@@ -731,6 +732,8 @@ class Monitor:
         self.advanced = {"data": data, "ts": time.time()}
         if data.get("iot"):
             self.state["iot"] = {"data": data["iot"], "ts": time.time()}
+        if data.get("vpn") is not None or data.get("ddns") is not None:
+            self.state["remote"] = {"data": {"vpn": data.get("vpn"), "ddns": data.get("ddns")}, "ts": time.time()}
         self._watch_block_sites(data.get("block_sites"))
         self._watch_block_services(data.get("block_services"))
         return data
