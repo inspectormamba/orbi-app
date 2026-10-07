@@ -25,6 +25,16 @@ def norm_mac(mac: str) -> str:
     return ":".join(m[i:i + 2] for i in range(0, 12, 2)) if len(m) == 12 else str(mac).upper()
 
 
+def backhaul_kind(conn_type: str | None) -> str | None:
+    """'wired' or 'wireless' from a satellite's BHConnType ("wired", "5GHz", "2.4GHz" on an RBR750); None if unknown."""
+    v = (conn_type or "").strip().lower()
+    if any(k in v for k in ("ghz", "wireless", "wifi", "wi-fi")):
+        return "wireless"
+    if v in ("wired", "ethernet") or "ether" in v:
+        return "wired"
+    return None
+
+
 def _num(v):
     try:
         return float(v)
@@ -92,7 +102,8 @@ class RouterClient:
             out.append({
                 "mac": norm_mac(s.get("MAC", "")), "ip": s.get("IP"), "name": s.get("DeviceName") or s.get("ModelName"),
                 "model": s.get("ModelName"), "firmware": s.get("FWVersion"), "signal": _num(s.get("SignalStrength")),
-                "backhaul": s.get("BHConnType") or "", "backhaul_status": s.get("BHConnStatus"),
+                "backhaul": s.get("BHConnType") or "", "backhaul_kind": backhaul_kind(s.get("BHConnType")),
+                "backhaul_status": s.get("BHConnStatus"),
                 "parent_mac": norm_mac(s.get("ParentMac", "")), "hop": s.get("Hop"),
             })
         return out

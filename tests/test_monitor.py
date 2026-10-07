@@ -237,3 +237,41 @@ def test_removing_an_extra_pin_signs_out_its_sessions(tmp_config):
     main, spare = auth.make_session(""), auth.make_session("Spare")
     auth.revoke_pin_sessions("Spare")
     assert auth.valid_session(main) and not auth.valid_session(spare)
+
+
+def test_backhaul_kind():
+    from orbi.router import backhaul_kind
+    assert [backhaul_kind(v) for v in ("wired", "Wired", "5GHz", "2.4GHz", "", None, "???")] == \
+        ["wired", "wired", "wireless", "wireless", None, None, None]
+
+
+def test_satellite_dropping_to_wireless_backhaul_alerts(monitor, fake_router):
+    sat = fake_router.sats[0]
+    sat["backhaul"] = "wired"
+    monitor.scan()
+    sat["backhaul"] = "5GHz"
+    monitor.scan()  # one scan could be a blip while it re-links
+    assert monitor.notes == [] and monitor.state["satellites"][0]["backhaul_kind"] == "wired"
+    monitor.scan()
+    assert monitor.notes == [("Satellite lost its wired link", "Garage Satellite switched to wireless backhaul (5GHz)")]
+    s = monitor.state["satellites"][0]
+    assert s["backhaul_kind"] == "wireless" and s["usually_wired"]
+    ev = monitor.store.q("SELECT * FROM events WHERE kind='satellite'")
+    assert len(ev) == 1 and ev[0]["severity"] == "warn"
+    monitor.scan()  # still wireless: no repeat alert
+    assert len(monitor.notes) == 1
+    sat["backhaul"] = "wired"
+    monitor.scan()
+    monitor.scan()
+    assert monitor.notes[-1] == ("Satellite wired again", "Garage Satellite is using its Ethernet backhaul again")
+
+
+def test_wireless_satellite_blip_is_ignored(monitor, fake_router):
+    sat = fake_router.sats[0]
+    sat["backhaul"] = "wired"
+    monitor.scan()
+    sat["backhaul"] = "5GHz"
+    monitor.scan()
+    sat["backhaul"] = "wired"
+    monitor.scan()
+    assert monitor.notes == [] and not monitor.store.q("SELECT * FROM events WHERE kind='satellite'")

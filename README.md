@@ -5,7 +5,7 @@ A local replacement for the Netgear Orbi app. It runs on a Windows PC, talks to 
 ## What it does
 
 - **Status:** internet up/down with latency, uptime over 24 h / 7 d / 30 d, router and satellite health (backhaul type, signal, device counts), public IP, content-filter DNS detection.
-- **Outage log:** checks the internet every 30 s and records each outage with its start, its duration, and the likely cause (WAN/modem link down vs. ISP vs. router not responding). You get Windows notifications for outages, satellites going offline, and new devices.
+- **Outage log:** checks the internet every 30 s and records each outage with its start, its duration, and the likely cause (WAN/modem link down vs. ISP vs. router not responding). You get Windows notifications for outages, satellites going offline, and new devices. A satellite that normally uses a wired (Ethernet) backhaul and falls back to wireless raises an alert (once two device scans in a row agree, so within 2–4 minutes at the default 2-minute scan interval), and Status marks it "Wireless" until the cable link is back.
 - **Devices:** every connected device, grouped by router/satellite, with IP, band, signal and link rate. You can rename devices, block or unblock them, and search or filter the list.
 - **Family (parental controls):** put each person's devices in a profile, then:
   - pause their internet (15 min to "until I resume");

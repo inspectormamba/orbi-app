@@ -237,11 +237,13 @@ async function renderHome() {
       h("div", { class: "meta" }, [st.router_devices != null ? `${st.router_devices} devices` : null, st.info?.firmware].filter(Boolean).join(" · "))),
     h("span", { class: `pill ${st.router ? "ok" : "bad"}` }, st.router ? "Online" : "Unreachable")));
   for (const s of st.satellites || []) {
-    const bh = s.backhaul === "wired" ? "Wired backhaul" : s.backhaul ? `${s.backhaul.replace("GHz", " GHz")} wireless backhaul` : "";
+    const wired = s.backhaul_kind === "wired";
+    const bh = wired ? "Wired backhaul" : s.backhaul ? `${s.backhaul.replace("GHz", " GHz")} wireless backhaul${s.usually_wired ? " (normally wired: check its cable)" : ""}` : "";
     mesh.append(h("div", { class: `row${s.online === false ? " offline" : ""}` }, ico("sat"),
       h("div", { class: "main" }, h("div", { class: "name" }, s.name),
         h("div", { class: "meta" }, [s.online === false ? "Not connected" : `${s.devices ?? 0} devices`, bh].filter(Boolean).join(" · "))),
-      s.online === false ? h("span", { class: "pill bad" }, "Offline") : s.backhaul === "wired" ? h("span", { class: "pill ok" }, "Wired") : signalBars(s.signal, "")));
+      s.online === false ? h("span", { class: "pill bad" }, "Offline") : wired ? h("span", { class: "pill ok" }, "Wired")
+        : s.usually_wired ? h("span", { class: "pill warn" }, "Wireless") : signalBars(s.signal, "")));
   }
   if (st.scan_error) mesh.append(h("div", { class: "note" }, `Router not answering: ${st.scan_error}`));
 
@@ -890,7 +892,7 @@ async function renderAdvanced() {
   const wifi = h("section", { class: "card" }, h("h2", {}, "Wi-Fi"), table(["Band", "Name", "Channel", "Mode", "Security"],
     (d.wifi || []).map((w) => [w.band, w.ssid + (w.enabled ? "" : " (off)"), w.channel, w.mode, w.security])));
   const sats = h("section", { class: "card" }, h("h2", {}, "Satellites"), table(["Name", "IP", "Backhaul", "Signal", "Firmware", "MAC"],
-    (r.satellites || []).map((x) => [x.name + (x.online === false ? " (offline)" : ""), x.ip, x.backhaul, x.backhaul === "wired" ? "—" : `${x.signal == null ? "—" : x.signal}%`, x.firmware, x.mac])));
+    (r.satellites || []).map((x) => [x.name + (x.online === false ? " (offline)" : ""), x.ip, x.backhaul, x.backhaul_kind === "wired" ? "—" : `${x.signal == null ? "—" : x.signal}%`, x.firmware, x.mac])));
 
   const vpnAttempts = await api("/api/events?kind=vpn_attempt&limit=20");
   const vpnRules = d.block_services.rules.filter((x) => /vpn/i.test(x.name));

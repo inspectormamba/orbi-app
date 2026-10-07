@@ -12,7 +12,7 @@ import time
 from datetime import datetime, timedelta
 
 from . import config, parental
-from .router import RouterClient, RouterError, norm_mac
+from .router import RouterClient, RouterError, backhaul_kind, norm_mac
 from .store import Store
 
 log = logging.getLogger("orbi.monitor")
@@ -63,6 +63,7 @@ class Monitor:
         self._fails = 0
         self._router_fails = 0
         self._missing_sats: dict[str, int] = {}
+        self._backhaul_changes: dict[str, tuple[str, int]] = {}  # mac -> (new kind, scans seen in a row)
         self.protected = local_macs()
 
     # ---- router ----
@@ -254,7 +255,11 @@ class Monitor:
         seen = {s["mac"] for s in sats}
         for s in sats:
             s["devices"] = counts.get(s["mac"], 0)
-            was_offline = s["mac"] in known and not known[s["mac"]].get("online", True)
+            prev = known.get(s["mac"], {})
+            was_offline = s["mac"] in known and not prev.get("online", True)
+            s.setdefault("backhaul_kind", backhaul_kind(s.get("backhaul")))
+            s["usually_wired"] = prev.get("usually_wired", False) or s["backhaul_kind"] == "wired"
+            s["backhaul_kind"] = self._settled_backhaul(s, prev)
             known[s["mac"]] = {**s, "online": True}
             if was_offline:
                 self._sat_back(known[s["mac"]])
@@ -266,6 +271,31 @@ class Monitor:
         router_mac = self._router_mac(sats)
         self.state["satellites"] = list(known.values())
         self.state["router_devices"] = counts.get(router_mac, 0) if router_mac else None
+
+    def _settled_backhaul(self, s, prev) -> str | None:
+        """Reports a wired <-> wireless backhaul switch once two scans in a row agree (a satellite
+        rebooting or re-linking can show the other type briefly). Returns the backhaul type to keep."""
+        now, before = s["backhaul_kind"], prev.get("backhaul_kind")
+        if not before or not now or now == before:
+            self._backhaul_changes.pop(s["mac"], None)
+            return now or before
+        kind, seen = self._backhaul_changes.get(s["mac"], (now, 0))
+        seen = seen + 1 if kind == now else 1
+        if seen < 2:
+            self._backhaul_changes[s["mac"]] = (now, seen)
+            return before
+        self._backhaul_changes.pop(s["mac"], None)
+        if now == "wireless":
+            band = f" ({s['backhaul']})" if s.get("backhaul") else ""
+            self.store.event("satellite", f"{s['name']} switched to wireless backhaul",
+                             detail=f"It was connected by cable and now links to the router over Wi-Fi{band}, so it's slower. "
+                                    "Check the Ethernet cable and the switch port, then reboot the satellite.",
+                             severity="warn", mac=s["mac"])
+            self.notify("Satellite lost its wired link", f"{s['name']} switched to wireless backhaul{band}")
+        else:
+            self.store.event("satellite", f"{s['name']} is back on wired backhaul", mac=s["mac"])
+            self.notify("Satellite wired again", f"{s['name']} is using its Ethernet backhaul again")
+        return now
 
     def _router_mac(self, sats):
         parents = {s["parent_mac"] for s in sats if s.get("parent_mac")}
