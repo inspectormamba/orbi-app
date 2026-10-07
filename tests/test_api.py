@@ -206,3 +206,15 @@ def test_web_app_has_no_duplicate_functions():
     names += re.findall(r"^(?:const|let) (\w+)\s*=", src, re.M)
     dupes = [n for n, c in collections.Counter(names).items() if c > 1]
     assert not dupes, f"defined more than once in web/app.js: {dupes}"
+
+
+def test_page_loads_current_script(client):
+    import hashlib
+    import re
+    from pathlib import Path
+    html = client.get("/")
+    m = re.search(r'/static/app\.js\?v=([0-9a-f]{12})', html.text)
+    js = (Path(__file__).resolve().parent.parent / "web" / "app.js").read_bytes()
+    assert m and m.group(1) == hashlib.sha256(js).hexdigest()[:12]  # a new script means a new address
+    assert re.search(r'/static/app\.css\?v=[0-9a-f]{12}', html.text)
+    assert client.get(f"/static/app.js?v={m.group(1)}").headers["cache-control"] == "no-cache"

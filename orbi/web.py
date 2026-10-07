@@ -1,4 +1,5 @@
 """HTTP API + the web app (served to this PC's browser and phones on the home network)."""
+import hashlib
 import io
 import ipaddress
 import logging
@@ -12,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -179,6 +180,8 @@ def create_app(monitor: Monitor) -> FastAPI:
             log.info("%s %s by %s -> %s", request.method, path, who(request), response.status_code)
         if path.startswith("/api/"):
             response.headers["Cache-Control"] = "no-store"
+        elif path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-cache"  # phones re-check instead of reusing an old copy
         return response
 
     def router() -> RouterClient:
@@ -964,7 +967,13 @@ def create_app(monitor: Monitor) -> FastAPI:
 
     @app.get("/")
     def index():
-        return FileResponse(WEB_DIR / "index.html", headers={"Cache-Control": "no-cache"})
+        # The script and stylesheet are loaded under a fingerprint of their contents, so a phone (especially a
+        # home-screen web app) can't keep running an old copy after an update.
+        html = (WEB_DIR / "index.html").read_text("utf-8")
+        for name in ("app.js", "app.css"):
+            digest = hashlib.sha256((WEB_DIR / name).read_bytes()).hexdigest()[:12]
+            html = html.replace(f"/static/{name}", f"/static/{name}?v={digest}")
+        return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
     return app
 
