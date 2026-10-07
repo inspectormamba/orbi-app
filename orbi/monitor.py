@@ -357,6 +357,7 @@ class Monitor:
             self.state["access_control"] = self.router.access_control_enabled()
         except RouterError as e:
             self.state["scan_error"] = str(e)
+            self._cert_alert(str(e))
             return
         self.state.update(scan_error=None, last_scan=time.time())
         self._update_satellites(sats, devices)
@@ -412,6 +413,24 @@ class Monitor:
             self.store.event("satellite", f"{s['name']} is back on wired backhaul", mac=s["mac"])
             self.notify("Satellite wired again", f"{s['name']} is using its Ethernet backhaul again")
         return now
+
+    def _cert_alert(self, error: str):
+        """One alert per new certificate when the router stops presenting the pinned one."""
+        if "security certificate changed" not in error:
+            return
+        try:
+            from .routercert import presented
+            seen = presented(config.load()["router_host"])
+        except Exception:
+            seen = "?"
+        if self.store.get("cert_alerted") == seen:
+            return
+        self.store.put("cert_alerted", seen)
+        self.store.event("router_cert", "The router's security certificate changed", severity="error",
+                         detail="Orbi Control stopped sending the router its admin password. If you just updated or reset the router, "
+                                "choose \"Trust the router's new certificate\" under More → Router. If you didn't, a device on your "
+                                "network may be impersonating the router.")
+        self.notify("Router certificate changed", "Orbi Control stopped talking to the router. See More → Router.")
 
     def _router_mac(self, sats):
         parents = {s["parent_mac"] for s in sats if s.get("parent_mac")}

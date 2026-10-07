@@ -51,7 +51,15 @@ class RouterClient:
         self.last_error = None
 
     def _connect(self):
+        from . import routercert
+        try:
+            routercert.check(self.host)  # before any password is sent
+        except routercert.CertificateChanged as e:
+            raise RouterError(str(e)) from e
         ng = Netgear(password=self.password, host=self.host, user=self.user, port=443, ssl=True)
+        # Every SOAP request (login included) goes over a connection that must present the pinned certificate.
+        pinned = routercert.session(self.host)
+        ng._post_request = lambda headers, message: pinned.post(ng.soap_url, headers=headers, data=message, timeout=30)
         # HTTPS on 443 only: pynetgear's login_try_port() falls back to plain HTTP (ports 5000/80),
         # which would send the admin password across the LAN unencrypted.
         if not ng.login():
@@ -75,6 +83,8 @@ class RouterClient:
                 except Exception as e:  # network errors, auth errors, empty responses
                     err = e
                     self._ng = None  # force a fresh login next time
+                    if "security certificate changed" in str(e):
+                        break  # retrying won't help, and the user needs to see why
                     log.warning("%s failed (attempt %d): %s", method, attempt + 1, e)
                     if attempt + 1 < attempts:
                         time.sleep(2)

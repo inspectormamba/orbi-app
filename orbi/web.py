@@ -632,6 +632,30 @@ def create_app(monitor: Monitor) -> FastAPI:
             monitor.reload_router()
         return get_settings()
 
+    @app.get("/api/settings/router-cert")
+    def router_cert():
+        from . import routercert
+        host = config.load()["router_host"]
+        pin = (config.load().get("router_cert_pins") or {}).get(host)
+        try:
+            now = routercert.presented(host, timeout=4)
+        except OSError:
+            now = None
+        fmt = lambda fp: ":".join(fp[i:i + 2] for i in range(0, 16, 2)).upper() + "…" if fp else None
+        return {"pinned": fmt(pin), "presented": fmt(now), "changed": bool(pin and now and pin != now)}
+
+    @app.post("/api/settings/router-cert/trust")
+    def trust_router_cert():
+        from . import routercert
+        host = config.load()["router_host"]
+        try:
+            fp = routercert.trust_current(host)
+        except OSError as e:
+            raise HTTPException(502, f"Couldn't reach the router: {e}")
+        store.event("action", "Trusted the router's new security certificate", detail=f"{fp[:16]}…", severity="warn")
+        monitor.reload_router()
+        return {"ok": True}
+
     @app.post("/api/settings/router-password")
     def router_password(body: PasswordBody):
         _save_router_password(body.password)

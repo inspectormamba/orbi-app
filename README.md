@@ -18,6 +18,8 @@ A local replacement for the Netgear Orbi app. It runs on a Windows PC, talks to 
 - **Block apps & sites:** presets (TikTok, Roblox, Instagram, Fortnite…) plus custom keywords, all the time or on a schedule. The Orbi's Block Sites feature enforces them, so blocking works even when the PC is off. Whole house only.
 - **DNS & VPN workarounds:** one button (under Content filtering) adds router rules that block outside DNS (port 53), DNS-over-TLS (853) and the standard VPN ports (OpenVPN 1194, WireGuard 51820). Without those rules, devices can sidestep the filter. Once they're in place, you get an alert naming any device that tries.
 - **Advanced tab** (switch on under More): router, WAN, LAN/DHCP with reservations, Wi-Fi radios, satellites, the VPN server's status, firewall rules, UPnP port forwards, and the searchable router log (DHCP assignments, blocked attempts, admin logins). Failed admin logins raise a security alert.
+  - **Firewall rules** (the router's Block Services): add, edit and delete rules (ports, protocol, and every device, one address or a range) and choose when they apply. Each change is read back from the router to confirm it, and removing or narrowing a rule, or turning rules off, raises an alert.
+  - **IoT Wi-Fi:** turn the separate IoT network on or off and change its name, band, security and password. Saving restarts the router's Wi-Fi for about a minute; the app then checks your main Wi-Fi settings came back unchanged. The password is never shown.
 - **Controls:** guest Wi-Fi on/off (and show its password), router reboot, firmware check, speed tests run by the router (on demand plus a daily test at 04:00).
 - **History:** connection timeline, outages, speed-test trends, daily data usage, activity log.
 
@@ -44,9 +46,9 @@ A local replacement for the Netgear Orbi app. It runs on a Windows PC, talks to 
 - Phones that use a "Private Wi-Fi address" that keeps rotating look like new devices. Turn rotation off for your home network on kids' devices.
 - The Orbi doesn't report usage per device, only totals for the network. So there are no per-device time limits; use schedules, pause and extra time instead.
 - Content filtering and app blocking apply to the whole house. Per-person filtering needs device-level controls (Apple Screen Time / Google Family Link).
-- Outside connections: the update check to GitHub (can be turned off), and connection checks to 1.1.1.1, 8.8.8.8 and 9.9.9.9 (port 443) every 30 seconds to tell an internet outage from a router problem. While this PC can't reach those, it also asks the router to look up a made-up name under example.com, which only the internet can answer, to tell whether the whole house is offline or just this PC. Selenium's usage statistics are turned off.
+- Outside connections: the update check to GitHub (can be turned off), a one-time download of geckodriver (the program that drives Firefox) from Mozilla's GitHub releases, checked against a pinned hash before it's used, and connection checks to 1.1.1.1, 8.8.8.8 and 9.9.9.9 (port 443) every 30 seconds to tell an internet outage from a router problem. While this PC can't reach those, it also asks the router to look up a made-up name under example.com, which only the internet can answer, to tell whether the whole house is offline or just this PC. Selenium's usage statistics are turned off.
 - The app is plain HTTP on your home network, so your PIN and session cookie travel unencrypted over Wi-Fi. Anyone already on your network who can capture traffic could read them. Skip `allow-phone-access.ps1` if you only use it on this PC.
-- The router's admin pages use a self-signed certificate, so the app can't verify it. It only ever logs in over HTTPS, and only to a private (LAN) address. Changing the router address clears the saved password, so it is never sent to a new address until you type it in again.
+- The router's admin pages use a self-signed certificate, which can't be verified the usual way, so the app pins it: the first time it connects to a router address it remembers the certificate's SHA-256 fingerprint, and from then on the SOAP API, the log reader and Firefox all refuse any other certificate before sending the admin password. A firmware update or factory reset can change the certificate; the app then stops, raises an alert, and waits for you to choose "Trust the router's new certificate" under More → Router. It only ever logs in over HTTPS, and only to a private (LAN) address. Changing the router address clears the saved password, so it is never sent to a new address until you type it in again.
 - Browsers that use their own encrypted DNS (DNS-over-HTTPS) can sidestep DNS-based filtering. The protection rules block encrypted DNS on port 853, but not DNS-over-HTTPS, which shares port 443 with normal web traffic.
 - The Orbi doesn't report who is connected to its VPN server.
 - Settings only available on the router's admin pages (DNS, Block Sites, schedules, block rules, VPN status) are read and changed by driving those pages in a headless Firefox. Firefox must stay installed.
@@ -86,6 +88,8 @@ orbi/updater.py    update check against GitHub tags, signature check, download, 
 orbi/ed25519.py    release signatures (RFC 8032 reference code, no dependencies)
 scripts/release.py        tag and sign a release; --verify checks an existing tag
 scripts/lock_requirements.py  regenerate the hash-pinned requirements.txt from requirements.in
+orbi/routercert.py router certificate pinning (trust on first use) for every connection that carries the password
+orbi/geckodriver.py the pinned geckodriver version and its hashes; to upgrade, verify the new release and update all three
 web/               the app (vanilla JS, no build step)
 ```
 

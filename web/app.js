@@ -604,11 +604,17 @@ async function renderMore() {
       health_interval: Number(health.value), scan_interval: Number(scan.value), speedtest_daily_at: speedAt.value, alert_new_devices: newDev.checked } }), "Settings saved") }, "Save"));
 
   const rpw = h("input", { type: "password", autocomplete: "off", placeholder: settings.router_configured ? "••••••••" : "Orbi admin password" });
+  const certInfo = h("div", {});
   const routerCard = h("section", { class: "card form" }, h("h2", {}, "Router"),
     h("label", { class: "field" }, `Admin password for ${settings.router_host}`, rpw),
     h("button", { class: "btn", onclick: (e) => act(e.currentTarget, () => api("/api/settings/router-password", { body: { password: rpw.value } }), "Router password saved").then(() => (rpw.value = "")) }, "Update password"),
     h("button", { class: "btn", onclick: (e) => act(e.currentTarget, async () => { const f = await api("/api/firmware"); toast(f.available ? `Firmware ${f.available} is available` : `Firmware ${f.current} is up to date`); }) }, "Check for firmware update"),
-    h("button", { class: "btn danger", onclick: rebootSheet }, "Reboot router…"));
+    h("button", { class: "btn danger", onclick: rebootSheet }, "Reboot router…"), certInfo);
+  api("/api/settings/router-cert").then((c) => fill(certInfo,
+    c.changed ? h("div", { class: "error-text" }, "The router is showing a different security certificate than the one Orbi Control trusts, so the app has stopped sending it the admin password.") : null,
+    h("div", { class: "muted small" }, c.pinned ? `Security certificate: pinned (${c.pinned})` : "Security certificate: trusted on first connection"),
+    c.changed ? h("div", { class: "muted small" }, "A firmware update or factory reset can change it. If you didn't do either, a device on your network may be pretending to be the router.") : null,
+    c.changed ? h("button", { class: "btn", onclick: (e) => act(e.currentTarget, () => api("/api/settings/router-cert/trust", { body: {} }), "Now trusting the router's new certificate").then(renderMore) }, "Trust the router's new certificate") : null)).catch(() => {});
 
   const cur = h("input", { type: "password", inputmode: "numeric", autocomplete: "current-password" });
   const nw = h("input", { type: "password", inputmode: "numeric", autocomplete: "new-password" });

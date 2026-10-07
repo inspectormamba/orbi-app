@@ -44,15 +44,30 @@ class RouterUI:
     def __enter__(self):
         _lock.acquire()
         try:
+            import shutil
+            import tempfile
+            from pathlib import Path
             from selenium import webdriver
+            from selenium.webdriver.firefox.firefox_profile import FirefoxProfile
             from selenium.webdriver.firefox.options import Options
             from selenium.webdriver.firefox.service import Service
+            from . import geckodriver, routercert
+            try:
+                routercert.check(self.host)  # before Firefox can send the password anywhere
+            except routercert.CertificateChanged as e:
+                raise RouterUIError(str(e)) from e
             opts = Options()
             opts.add_argument("-headless")
             opts.binary_location = FIREFOX
-            opts.accept_insecure_certs = True  # the router's certificate is self-signed
+            # The router's certificate is self-signed. Rather than accept any certificate, the profile trusts
+            # exactly the pinned one; Firefox refuses an impostor before the password is ever sent.
+            opts.accept_insecure_certs = False
+            profile_dir = Path(tempfile.mkdtemp(prefix="orbi-ff-"))
+            (profile_dir / "cert_override.txt").write_text(routercert.firefox_override(self.host), "utf-8")
+            opts.profile = FirefoxProfile(str(profile_dir))
+            shutil.rmtree(profile_dir, ignore_errors=True)  # Selenium has copied it
             opts.enable_bidi = True
-            service = Service()
+            service = Service(executable_path=str(geckodriver.path()))  # pinned and hash-checked
             service.creation_flags = 0x08000000  # CREATE_NO_WINDOW: no console flash under pythonw
             self.d = webdriver.Firefox(options=opts, service=service)
             self.d.set_page_load_timeout(40)
@@ -409,11 +424,14 @@ LOG_LINE = re.compile(r"^\[(?P<kind>[^\]]+)\]\s*(?:from source (?P<src>[\d.]+)\s
 
 def fetch_log(host: str, password: str, user: str = "admin") -> list[dict]:
     """Returns the router's log (newest first) as dicts: ts, kind, source, text."""
-    import requests
     import urllib3
+    from . import routercert
     urllib3.disable_warnings()
-    s = requests.Session()
-    s.verify = False
+    try:
+        routercert.check(host)
+    except routercert.CertificateChanged as e:
+        raise RouterUIError(str(e)) from e
+    s = routercert.session(host)  # must present the pinned certificate
     with _lock:  # don't collide with a browser session
         try:
             # The first request to a protected page answers 401 and hands out an XSRF cookie;
