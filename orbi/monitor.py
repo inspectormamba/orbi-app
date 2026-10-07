@@ -729,6 +729,8 @@ class Monitor:
             data["uptime"] = self.router.uptime()
             data["wifi"] = self.router.wifi()
         self.advanced = {"data": data, "ts": time.time()}
+        if data.get("iot"):
+            self.state["iot"] = {"data": data["iot"], "ts": time.time()}
         self._watch_block_sites(data.get("block_sites"))
         self._watch_block_services(data.get("block_services"))
         return data

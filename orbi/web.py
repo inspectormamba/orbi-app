@@ -307,6 +307,27 @@ def create_app(monitor: Monitor) -> FastAPI:
                 names.setdefault(sat["parent_mac"], "Router")
         return names
 
+    def wifi_names() -> dict:
+        """Guest and IoT network names, to tell which network a wireless device is on."""
+        if "guest" not in monitor.state and monitor.router:
+            try:
+                monitor.state["guest"] = monitor.router.guest_wifi()
+            except RouterError:
+                pass
+        return {"guest": (monitor.state.get("guest") or {}).get("ssid"),
+                "iot": ((monitor.state.get("iot") or {}).get("data") or {}).get("ssid")}
+
+    def network_of(snap: dict, names: dict) -> str:
+        """main | guest | iot | wired | "" (unknown)."""
+        conn, ssid = (snap.get("connection") or "").lower(), snap.get("ssid") or ""
+        if conn == "wired":
+            return "wired"
+        if "iot" in conn or (names["iot"] and ssid == names["iot"]):
+            return "iot"
+        if names["guest"] and ssid == names["guest"]:
+            return "guest"
+        return "main" if ssid or conn else ""
+
     @app.get("/api/devices")
     def devices():
         import json
@@ -316,6 +337,7 @@ def create_app(monitor: Monitor) -> FastAPI:
         protected = monitor.protected_macs()
         aps = ap_names()
         default = monitor.default_profile_id()
+        names = wifi_names()
         now = datetime.now()
         out = []
         for d in store.q("SELECT * FROM devices ORDER BY online DESC, COALESCE(NULLIF(alias,''), NULLIF(router_name,''), mac) COLLATE NOCASE"):
@@ -329,7 +351,7 @@ def create_app(monitor: Monitor) -> FastAPI:
                 "router_name": d["router_name"], "model": d["model"], "ip": d["last_ip"], "online": bool(d["online"]),
                 "connection": snap.get("connection", ""), "signal": snap.get("signal"), "link_rate": snap.get("link_rate"),
                 "ap": aps.get(snap.get("ap_mac"), "Router" if snap.get("connection") == "wired" else ""),
-                "ssid": snap.get("ssid", ""), "profile": prof, "default_profile": inherited, "manual_block": bool(d["manual_block"]),
+                "ssid": snap.get("ssid", ""), "network": network_of(snap, names), "profile": prof, "default_profile": inherited, "manual_block": bool(d["manual_block"]),
                 "held": bool(d["held"]) and bool(d["manual_block"]), "randomized": parental.is_randomized_mac(d["mac"]),
                 "blocked": d["mac"] in applied or bool(snap.get("blocked")), "block_reason": want.get(d["mac"]) or
                 ("Blocked on the router" if snap.get("blocked") else ""), "protected": d["mac"] in protected,
@@ -564,7 +586,8 @@ def create_app(monitor: Monitor) -> FastAPI:
     @app.get("/api/guest")
     def guest():
         try:
-            return router().guest_wifi()
+            monitor.state["guest"] = router().guest_wifi()
+            return monitor.state["guest"]
         except RouterError as e:
             raise HTTPException(502, str(e))
 
@@ -572,6 +595,7 @@ def create_app(monitor: Monitor) -> FastAPI:
     def set_guest(body: EnabledBody):
         try:
             router().set_guest_wifi(body.enabled)
+            monitor.state.pop("guest", None)  # re-read below with the new state
             store.event("action", f"Guest Wi-Fi turned {'on' if body.enabled else 'off'}")
             return router().guest_wifi()
         except RouterError as e:
@@ -916,6 +940,21 @@ def create_app(monitor: Monitor) -> FastAPI:
                              "warn" if body.mode == "never" else "info")
 
     # ---------- IoT Wi-Fi network ----------
+    @app.get("/api/iot")
+    def get_iot():
+        """The IoT network as last read from the router; reads it (about 15 s) if it hasn't been yet."""
+        cached = monitor.state.get("iot")
+        if not cached and router() and not (monitor.jobs.get("iot_read") or {}).get("running"):
+            def read():
+                with monitor.ui_factory() as ui:
+                    data = ui.read_iot()
+                monitor.state["iot"] = {"data": data, "ts": time.time()}
+                return data
+            monitor.run_job("iot_read", read)
+        job = monitor.jobs.get("iot_read") or {}
+        return {"iot": (cached or {}).get("data"), "ts": (cached or {}).get("ts"),
+                "reading": bool(job.get("running")), "error": None if cached else job.get("error")}
+
     @app.put("/api/iot")
     def set_iot(body: IotBody):
         from .routerui import RouterUI

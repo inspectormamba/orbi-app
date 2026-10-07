@@ -100,6 +100,9 @@ class FakeUI:
     def set_rules_mode(self, mode):
         FakeUI.calls.append(("rules_mode", mode))
 
+    def read_iot(self):
+        return {"enabled": True, "ssid": "Home-IoT", "band": "2.4", "security": "WPA2-PSK"}
+
     def set_iot(self, enabled, ssid, band, security, password=None):
         FakeUI.calls.append(("iot", enabled, ssid, band, security, password))
         return {"enabled": enabled, "ssid": ssid, "band": band, "security": security}
@@ -266,3 +269,23 @@ def test_rule_ips_text():
     assert rule_ips_text({"type": "all"}) == "all"
     assert rule_ips_text({"type": "single", "ip": "192.168.1.58"}) == "192.168.1.58"
     assert rule_ips_text({"type": "range", "start": "192.168.1.2", "end": "192.168.1.15"}) == "192.168.1.2 - 192.168.1.15"
+
+
+
+def test_devices_show_their_wifi_network(client, monitor, fake_router):
+    fake_router.devs[0].update(ssid="Home", connection="5GHz")
+    fake_router.devs[1].update(ssid="Home-IoT", connection="2.4GHz - IoT")
+    fake_router.devs[2].update(ssid="", connection="wired")
+    visitor = fake_router._dev("AA:00:00:00:00:09", "visitor", "192.168.1.90", "C8:9E:43:C2:E3:33", "2.4GHz")
+    visitor["ssid"] = "Guest"  # FakeRouter's guest network is called "Guest"
+    fake_router.devs.append(visitor)
+    monitor.scan()
+    nets = {d["name"]: d["network"] for d in client.get("/api/devices").json()}
+    assert nets == {"kid-phone": "main", "kid-tablet": "iot", "tv": "wired", "visitor": "guest"}
+
+
+def test_iot_card_reads_the_router_on_its_own(client, monitor):
+    first = client.get("/api/iot").json()
+    assert first["iot"] is None or first["iot"]["ssid"] == "Home-IoT"
+    wait_job(client, "iot_read")
+    assert client.get("/api/iot").json()["iot"] == {"enabled": True, "ssid": "Home-IoT", "band": "2.4", "security": "WPA2-PSK"}

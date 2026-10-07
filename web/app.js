@@ -308,7 +308,7 @@ async function renderDevices() {
   const search = h("input", { class: "search", type: "search", placeholder: "Search name, IP or MAC", value: devQuery, "aria-label": "Search devices",
     oninput: (e) => { devQuery = e.target.value; draw(); } });
   const chips = h("div", { class: "chips" });
-  const filters = { online: "Online", all: "All", blocked: "Blocked", unassigned: "No profile", new: "New this week" };
+  const filters = { online: "Online", all: "All", blocked: "Blocked", unassigned: "No profile", new: "New this week", guest: "Guest Wi-Fi", iot: "IoT Wi-Fi" };
   for (const [k, label] of Object.entries(filters)) {
     chips.append(h("button", { class: `chip${devFilter === k ? " on" : ""}`, onclick: () => { devFilter = k; renderDevices(); } }, label));
   }
@@ -320,6 +320,7 @@ async function renderDevices() {
       if (devFilter === "blocked" && !d.blocked) return false;
       if (devFilter === "unassigned" && d.profile) return false;
       if (devFilter === "new" && d.first_seen < weekAgo) return false;
+      if ((devFilter === "guest" || devFilter === "iot") && d.network !== devFilter) return false;
       return !q || [d.name, d.ip, d.mac, d.model, d.router_name].some((v) => (v || "").toLowerCase().includes(q));
     });
     const groups = {};
@@ -332,12 +333,18 @@ async function renderDevices() {
   every(30000, async () => { if ($("#sheet").hidden && document.activeElement !== search) await renderDevices(); });
 }
 
+function networkLabel(d) {
+  if (d.network === "iot") return `${d.ssid || "IoT"} (IoT)`;
+  if (d.network === "guest") return `${d.ssid || "Guest"} (guest)`;
+  return d.network === "main" ? d.ssid : "";
+}
+
 function deviceRow(d) {
-  const band = d.connection === "wired" ? "Wired" : d.connection.replace("GHz", " GHz");
+  const band = d.connection === "wired" ? "Wired" : d.connection.replace(/\s*-\s*IoT$/i, "").replace("GHz", " GHz");
   return h("div", { class: `row tap${d.online ? "" : " offline"}`, role: "button", tabindex: 0, onclick: () => deviceSheet(d), onkeydown: (e) => e.key === "Enter" && deviceSheet(d) },
     ico(d.connection === "wired" ? "wired" : "wifi"),
     h("div", { class: "main" }, h("div", { class: "name" }, d.name),
-      h("div", { class: "meta" }, d.online ? [d.ip, band, d.randomized ? "private address" : null].filter(Boolean).join(" · ") : `Last seen ${d.last_seen ? ago(d.last_seen) : "—"}`)),
+      h("div", { class: "meta" }, d.online ? [d.ip, band, networkLabel(d), d.randomized ? "private address" : null].filter(Boolean).join(" · ") : `Last seen ${d.last_seen ? ago(d.last_seen) : "—"}`)),
     d.held ? h("span", { class: "pill warn" }, "Needs approval") : d.blocked ? h("span", { class: "pill bad" }, "Blocked")
       : d.profile ? h("span", { class: "pill accent" }, `${d.profile.emoji || ""} ${d.profile.name}`.trim())
         : d.default_profile ? h("span", { class: "pill", title: "Not in a profile, so it follows the default" }, `↳ ${d.default_profile.name}`) : null,
@@ -367,7 +374,8 @@ function deviceSheet(d) {
     h("dl", { class: "kv" },
       h("dt", {}, "Status"), h("dd", {}, d.online ? "Online" : `Offline · last seen ${d.last_seen ? fmtWhen(d.last_seen) : "—"}`),
       h("dt", {}, "IP"), h("dd", {}, d.ip || "—"), h("dt", {}, "MAC"), h("dd", {}, d.mac),
-      h("dt", {}, "Connected to"), h("dd", {}, [d.ap, d.connection === "wired" ? "wired" : d.connection, d.ssid].filter(Boolean).join(" · ") || "—"),
+      h("dt", {}, "Connected to"), h("dd", {}, [d.ap, d.connection === "wired" ? "wired" : d.connection.replace(/\s*-\s*IoT$/i, "")].filter(Boolean).join(" · ") || "—"),
+      d.network && d.network !== "wired" ? [h("dt", {}, "Wi-Fi network"), h("dd", {}, { main: `${d.ssid} (main)`, guest: `${d.ssid} (guest)`, iot: `${d.ssid} (IoT)` }[d.network] || d.ssid || "—")] : null,
       d.signal != null && d.connection !== "wired" ? [h("dt", {}, "Signal"), h("dd", {}, `${d.signal}%${d.link_rate ? ` · ${d.link_rate} Mbps link` : ""}`)] : null,
       d.model ? [h("dt", {}, "Model"), h("dd", {}, d.model)] : null,
       h("dt", {}, "First seen"), h("dd", {}, d.first_seen ? fmtWhen(d.first_seen) : "—")),
@@ -639,7 +647,7 @@ async function renderMore() {
   } });
   const advCard = h("section", { class: "card" }, h("h2", {}, "Advanced mode"),
     h("label", { class: "switch" }, "Show the Advanced tab (DHCP, logs, VPN, firewall rules…)", advToggle));
-  setView(alertCard, phone, guest, advCard, monitoring, routerCard, pinCard, updatesCard(settings),
+  setView(alertCard, phone, h("div", { class: "group-label" }, "Wi-Fi networks"), guest, iotCard(), advCard, monitoring, routerCard, pinCard, updatesCard(settings),
     h("div", { class: "muted small center" }, "Orbi Control runs on your PC and talks to the Orbi directly — no cloud. Outside connections: the optional update check to GitHub, and internet checks to 1.1.1.1, 8.8.8.8 and 9.9.9.9."));
 }
 
@@ -923,15 +931,6 @@ async function renderAdvanced() {
       h("button", { class: "btn small", onclick: () => firewallRuleSheet(x, i) }, "Edit"),
       h("button", { class: "btn small danger", onclick: () => deleteFirewallRuleSheet(x, i) }, "Delete")))
       : [h("div", { class: "muted small" }, "No rules.")]));
-  const iot = d.iot || {};
-  const iotNow = (cache.devices || []).filter((x) => x.online && /iot/i.test(x.connection || ""));
-  const bandLabel = { "2.4": "2.4 GHz", 5: "5 GHz", both: "2.4 GHz + 5 GHz" };
-  const iotCard = h("section", { class: "card" },
-    h("h2", {}, "IoT Wi-Fi", h("button", { class: "btn small act", onclick: () => iotSheet(iot) }, "Change")),
-    kv([["Network", iot.enabled ? "On" : "Off"], ["Name", iot.enabled ? iot.ssid : null], ["Band", iot.enabled ? bandLabel[iot.band] : null],
-      ["Security", iot.enabled ? (iot.security === "WPA2-PSK" ? "WPA2-PSK [AES]" : "WPA + WPA2 (older devices)") : null],
-      ["Connected now", `${iotNow.length} device${iotNow.length === 1 ? "" : "s"}`]]),
-    h("div", { class: "muted small" }, "A separate network for smart plugs, cameras and other gadgets, so they don't share your main Wi-Fi name and password."));
   const ports = h("section", { class: "card" }, h("h2", {}, "Port forwarding (UPnP)"),
     table(["Device", "Protocol", "Outside", "Inside"], d.upnp.map((x) => [devName(x.ip) ? `${devName(x.ip)} (${x.ip})` : x.ip, x.protocol, x.external_port, x.internal_port])));
 
@@ -955,10 +954,34 @@ async function renderAdvanced() {
   }
   const logCard = h("section", { class: "card" }, h("h2", {}, "Router log"), logSearch, logChips, logList);
   loadLog().catch(() => {});
-  setView(head, routerCard, wan, lan, wifi, iotCard, sats, vpn, fw, ports, logCard);
+  setView(head, routerCard, wan, lan, wifi, sats, vpn, fw, ports, logCard);
 }
 
-// ---------- firewall rules & IoT Wi-Fi (Advanced) ----------
+// ---------- IoT Wi-Fi (More, next to Guest Wi-Fi) ----------
+function iotCard() {
+  const card = h("section", { class: "card" }, h("h2", {}, "IoT Wi-Fi"), h("div", { class: "muted small" }, h("span", { class: "spinner" }), " Reading from the router…"));
+  const bandLabel = { "2.4": "2.4 GHz", 5: "5 GHz", both: "2.4 GHz + 5 GHz" };
+  const load = async () => {
+    const [r, devices] = await Promise.all([api("/api/iot"), cache.devices ? cache.devices : api("/api/devices").catch(() => [])]);
+    if (!r.iot) {
+      if (r.reading) { setTimeout(() => card.isConnected && load().catch(() => {}), 3000); return; }
+      fill(card, h("h2", {}, "IoT Wi-Fi"), h("div", { class: "error-text" }, r.error || "Couldn't read the IoT network from the router."));
+      return;
+    }
+    const iot = r.iot;
+    const now = devices.filter((x) => x.online && x.network === "iot");
+    fill(card, h("h2", {}, "IoT Wi-Fi", h("button", { class: "btn small act", onclick: () => iotSheet(iot) }, "Change")),
+      h("dl", { class: "kv" }, h("dt", {}, "Network"), h("dd", {}, iot.enabled ? "On" : "Off"),
+        iot.enabled ? [h("dt", {}, "Name"), h("dd", {}, iot.ssid), h("dt", {}, "Band"), h("dd", {}, bandLabel[iot.band]),
+          h("dt", {}, "Security"), h("dd", {}, iot.security === "WPA2-PSK" ? "WPA2-PSK [AES]" : "WPA + WPA2 (older devices)")] : null,
+        h("dt", {}, "Connected now"), h("dd", {}, `${now.length} device${now.length === 1 ? "" : "s"}`)),
+      h("div", { class: "muted small" }, "A separate network for smart plugs, cameras and other gadgets, so they don't share your main Wi-Fi name and password."));
+  };
+  load().catch((e) => fill(card, h("h2", {}, "IoT Wi-Fi"), h("div", { class: "error-text" }, e.message)));
+  return card;
+}
+
+// ---------- firewall rules (Advanced) ----------
 async function routerJob(name, label, done) {
   try { await waitJob(name, label); }
   catch (e) {
@@ -1045,7 +1068,9 @@ function iotSheet(iot) {
       h("button", { class: "btn primary", onclick: (e) => act(e.currentTarget, async () => {
         await api("/api/iot", { method: "PUT", body: { enabled: on.checked, ssid: ssid.value, band: band.value, security: sec.value, password: pw.value || null } });
         pw.value = "";
-        return routerJob("iot", "Saving (Wi-Fi restarts)", "IoT Wi-Fi saved");
+        const r = await routerJob("iot", "Saving (Wi-Fi restarts)", "IoT Wi-Fi saved");
+        if (currentTab === "more") renderMore().catch(() => {});
+        return r;
       }) }, "Save")));
 }
 
