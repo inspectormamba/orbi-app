@@ -3,6 +3,7 @@
 Every loop runs in its own thread, catches its own errors, and is restarted by a
 supervisor if it ever dies, so one bad router response can't stop monitoring.
 """
+import contextvars
 import json
 import logging
 import socket
@@ -232,6 +233,7 @@ class Monitor:
             if not self.state["info"]:
                 self.state["info"] = self.router.info()
             self.state["wan"] = self.router.wan()
+            self._watch_filter(self.state["wan"].get("dns"))
             self.state["system"] = self.router.system()
             sats = self.router.satellites()
             devices = self.router.devices()
@@ -551,7 +553,8 @@ class Monitor:
             finally:
                 self.jobs[name]["running"] = False
                 self.jobs[name]["finished"] = time.time()
-        threading.Thread(target=work, name=f"job-{name}", daemon=True).start()
+        ctx = contextvars.copy_context()  # so events from the job still say who asked for it
+        threading.Thread(target=ctx.run, args=(work,), name=f"job-{name}", daemon=True).start()
         return True
 
     def refresh_advanced(self):
@@ -561,7 +564,39 @@ class Monitor:
             data["uptime"] = self.router.uptime()
             data["wifi"] = self.router.wifi()
         self.advanced = {"data": data, "ts": time.time()}
+        self._watch_block_sites(data.get("block_sites"))
         return data
+
+    def _watch_block_sites(self, now):
+        """Alert when whole-house blocking gets weaker (sites removed or blocking turned off), however it happened."""
+        if not now:
+            return
+        before = self.store.get("block_sites_last")
+        self.store.put("block_sites_last", {"mode": now.get("mode"), "keywords": sorted(now.get("keywords") or [])})
+        if not before or before.get("mode") == "never":
+            return
+        was = set(before.get("keywords") or [])
+        removed = sorted(was if now.get("mode") == "never" else was - set(now.get("keywords") or []))
+        weaker = removed or (before.get("mode") == "always" and now.get("mode") == "perschedule")
+        if not weaker:
+            return
+        what = f"No longer blocked: {', '.join(removed)}" if removed else "Changed from always on to a schedule"
+        self.store.event("block_loosened", "Whole-house blocking was loosened", detail=what, severity="warn")
+        self.notify("Blocked sites were unblocked", what)
+
+    def _watch_filter(self, dns):
+        """Alert when the router's DNS stops pointing at a family filter (or switches to a different one)."""
+        from .filtering import PROVIDERS, provider_for
+        if not dns:
+            return
+        now, before = provider_for(dns), self.store.get("filter_last")
+        self.store.put("filter_last", now or "")
+        if before and now != before:
+            name = PROVIDERS[now]["name"] if now else f"no filtering ({', '.join(dns)})"
+            self.store.event("filter_changed", "Content filter changed", detail=f"{PROVIDERS[before]['name']} → {name}",
+                             severity="warn" if not now else "info")
+            if not now:
+                self.notify("Content filter turned off", f"The router no longer uses {PROVIDERS[before]['name']}")
 
     # ---- app updates ----
     def update_loop(self):

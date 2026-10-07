@@ -1,4 +1,5 @@
 """SQLite storage (WAL mode, one connection per thread)."""
+import contextvars
 import json
 import sqlite3
 import threading
@@ -29,6 +30,11 @@ CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS router_log (ts REAL NOT NULL, kind TEXT NOT NULL, source TEXT DEFAULT '', text TEXT NOT NULL, UNIQUE(ts, text));
 CREATE INDEX IF NOT EXISTS router_log_ts ON router_log(ts);
 """
+
+
+# Who is making the current change through the web app, e.g. "Kids-iPad (192.168.1.40)".
+# Set per request by web.py; every event recorded while handling it says who did it.
+ACTOR = contextvars.ContextVar("actor", default="")
 
 
 class Store:
@@ -80,6 +86,8 @@ class Store:
 
     # ---- events ----
     def event(self, kind, title, detail="", severity="info", mac="", ts=None, end_ts=None):
+        if actor := ACTOR.get():
+            detail = f"{detail} · by {actor}" if detail else f"by {actor}"
         return self.x("INSERT INTO events(ts,end_ts,kind,severity,title,detail,mac) VALUES(?,?,?,?,?,?,?)",
                       (ts or time.time(), end_ts, kind, severity, title, detail, mac))
 

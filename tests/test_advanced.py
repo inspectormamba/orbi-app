@@ -141,3 +141,33 @@ def test_routerlog_endpoint(client, monitor):
     blocked = client.get("/api/routerlog?kind=blocked").json()["rows"]
     assert blocked[0]["device"] == "kid-phone"
     assert len(client.get("/api/routerlog?q=192.168.1.99").json()["rows"]) == 1
+
+
+def test_changes_say_who_made_them(client):
+    assert client.post("/api/login", json={"pin": "246810"}).status_code == 200
+    r = client.put("/api/siteblock", json={"mode": "always", "keywords": ["tiktok"]})
+    assert r.status_code == 200 and wait_job(client, "siteblock")["error"] is None
+    events = client.get("/api/events?kind=action").json()
+    blocking = next(e for e in events if e["title"] == "Whole-house blocking updated")
+    assert "by Device at testclient" in blocking["detail"]  # set inside a background job, still attributed
+    assert any(e["title"] == "Signed in to Orbi Control" for e in events)
+
+
+def test_loosened_blocking_alerts(monitor):
+    monitor._watch_block_sites({"mode": "always", "keywords": ["chatgpt.com", "openai.com", "tiktok"]})
+    monitor._watch_block_sites({"mode": "always", "keywords": ["chatgpt.com", "openai.com", "tiktok", "roblox"]})
+    assert monitor.notes == []  # adding sites is not an alert
+    monitor._watch_block_sites({"mode": "always", "keywords": ["roblox", "tiktok"]})
+    assert monitor.notes == [("Blocked sites were unblocked", "No longer blocked: chatgpt.com, openai.com")]
+    monitor._watch_block_sites({"mode": "never", "keywords": ["roblox", "tiktok"]})
+    assert monitor.notes[-1] == ("Blocked sites were unblocked", "No longer blocked: roblox, tiktok")
+    ev = monitor.store.q("SELECT * FROM events WHERE kind='block_loosened'")
+    assert len(ev) == 2 and all(e["severity"] == "warn" for e in ev)
+
+
+def test_filter_turned_off_alerts(monitor):
+    monitor._watch_filter(["1.1.1.3", "1.0.0.3"])
+    monitor._watch_filter(["1.1.1.3", "1.0.0.3"])
+    assert monitor.notes == []
+    monitor._watch_filter(["74.40.74.40", "74.40.74.41"])
+    assert monitor.notes == [("Content filter turned off", "The router no longer uses Cloudflare for Families")]

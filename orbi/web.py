@@ -1,6 +1,7 @@
 """HTTP API + the web app (served to this PC's browser and phones on the home network)."""
 import io
 import ipaddress
+import logging
 import os
 import re
 import socket
@@ -16,7 +17,10 @@ from pydantic import BaseModel, Field
 
 from . import auth, config, parental, updater
 from .monitor import Monitor, fmt_duration
+from .store import ACTOR
 from .router import RouterClient, RouterError, norm_mac
+
+log = logging.getLogger("orbi.web")
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 OPEN_PATHS = {"/api/session", "/api/login", "/api/setup"}
@@ -137,7 +141,14 @@ def create_app(monitor: Monitor) -> FastAPI:
         if path.startswith("/api/") and path not in OPEN_PATHS:
             if not auth.valid_session(request.cookies.get(auth.COOKIE)):
                 return JSONResponse({"detail": "Sign in required"}, status_code=401)
-        response = await call_next(request)
+        token = ACTOR.set(who(request)) if path.startswith("/api/") and request.method != "GET" else None
+        try:
+            response = await call_next(request)
+        finally:
+            if token:
+                ACTOR.reset(token)
+        if token:
+            log.info("%s %s by %s -> %s", request.method, path, who(request), response.status_code)
         if path.startswith("/api/"):
             response.headers["Cache-Control"] = "no-store"
         return response
@@ -152,6 +163,13 @@ def create_app(monitor: Monitor) -> FastAPI:
 
     def client_ip(request: Request) -> str:
         return request.client.host if request.client else "?"
+
+    def who(request: Request) -> str:
+        ip = client_ip(request)
+        if ip in ("127.0.0.1", "::1"):
+            return "this PC"
+        name = monitor.device_by_ip(ip)
+        return name if name.endswith(ip) else f"{name} ({ip})"
 
     def require_pin(pin: str, request: Request, settings: dict, wrong: str = "Wrong PIN"):
         """Every PIN check goes through the lockout, counted before the (slow) hash comparison."""
@@ -190,6 +208,7 @@ def create_app(monitor: Monitor) -> FastAPI:
             raise HTTPException(401, "Wrong PIN")
         require_pin(body.pin, request, s)
         set_cookie(response)
+        store.event("action", "Signed in to Orbi Control")
         return {"ok": True}
 
     @app.post("/api/logout")
@@ -592,7 +611,7 @@ def create_app(monitor: Monitor) -> FastAPI:
         removed = len(config.load().get("extra_pins", []))
         config.save({"pin_hash": auth.hash_pin(body.new), "extra_pins": []})  # a new PIN replaces every old one
         auth.rotate_secret()  # sign out every other device
-        store.event("action", "App PIN changed", detail=f"from {client_ip(request)}" + (f"; {removed} extra PIN(s) removed" if removed else ""))
+        store.event("action", "App PIN changed", detail=f"{removed} extra PIN(s) removed" if removed else "")
         set_cookie(response)
         return {"ok": True}
 
@@ -611,7 +630,7 @@ def create_app(monitor: Monitor) -> FastAPI:
             raise HTTPException(409, "That PIN is already accepted")
         extra.append({"label": body.label.strip()[:40] or f"PIN {len(extra) + 2}", "hash": auth.hash_pin(body.new)})
         config.save({"extra_pins": extra})
-        store.event("action", "Extra app PIN added", detail=f"{extra[-1]['label']} from {client_ip(request)}", severity="warn")
+        store.event("action", "Extra app PIN added", detail=extra[-1]["label"], severity="warn")
         return {"ok": True, "extra": [{"label": e["label"]} for e in extra]}
 
     @app.delete("/api/settings/pins/{label}")
@@ -621,7 +640,7 @@ def create_app(monitor: Monitor) -> FastAPI:
         if len(extra) == len(s.get("extra_pins", [])):
             raise HTTPException(404, "No such PIN")
         config.save({"extra_pins": extra})
-        store.event("action", f"Extra app PIN removed ({label})", detail=f"from {client_ip(request)}")
+        store.event("action", f"Extra app PIN removed ({label})")
         return {"ok": True}
 
     @app.get("/api/access")
@@ -778,7 +797,7 @@ def create_app(monitor: Monitor) -> FastAPI:
             if not info.get("available"):
                 raise RuntimeError("You're already on the latest version")
             res = updater.apply(info, config.DATA_DIR, s["port"])
-            store.event("update", f"Installing Orbi Control {res['to']}", detail=f"from {res['from']}, requested from {client_ip(request)}")
+            store.event("update", f"Installing Orbi Control {res['to']}", detail=f"from {res['from']}")
             threading.Timer(3, os._exit, (0,)).start()  # the helper restarts the app on the new code
             return res
         if updater.is_git_checkout():
