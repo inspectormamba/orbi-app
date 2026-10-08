@@ -74,7 +74,7 @@ Download the zip from GitHub (Code → Download ZIP) and the app can update itse
 - Nothing installs without someone clicking Update. A copy cloned with git is never touched: update it with `git pull` and restart the app.
 - Copies installed before version 1.1.2 have no working updater, so update those once by hand: download the zip, copy its files over the old folder, and restart the app. Versions before 1.1.3 don't check signatures; they start checking once they're on 1.1.3.
 
-**Publishing an update** (only from the PC with the release key): set `VERSION` to the new number (e.g. `1.2.0`) and commit. Then run `.venv\Scripts\python scripts\release.py 1.2.0 "What changed"`, which creates the signed tag, and `git push origin main --tags`. The notes are shown in the app as the release notes, so write them for users. A tag made with plain `git tag` won't install.
+**Publishing an update** (only from the PC with the release key): set `VERSION` to the new number (e.g. `1.2.0`) and commit. Then run `.venv\Scripts\python scripts\release.py 1.2.0 "What changed"`, which adds the notes to `CHANGELOG.md` (as its own commit) and creates the signed tag, and `git push origin main --tags`. The notes are shown in the app as the release notes, so write them for users. A tag made with plain `git tag` won't install.
 
 ## Development
 
