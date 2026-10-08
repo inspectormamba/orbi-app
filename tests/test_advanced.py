@@ -100,6 +100,19 @@ class FakeUI:
     def set_rules_mode(self, mode):
         FakeUI.calls.append(("rules_mode", mode))
 
+    def add_reservation(self, ip, mac, name):
+        FakeUI.calls.append(("add_reservation", ip, mac, name))
+
+    def edit_reservation(self, index, expected_mac, ip, mac, name):
+        FakeUI.calls.append(("edit_reservation", index, expected_mac, ip, mac, name))
+
+    def delete_reservation(self, index, expected_mac):
+        FakeUI.calls.append(("delete_reservation", index, expected_mac))
+
+    def set_upnp(self, enabled):
+        FakeUI.calls.append(("upnp", enabled))
+        return enabled
+
     def read_vpn(self):
         return {"enabled": True, "protocol": "udp", "port": "12973", "port_tap": "12974"}
 

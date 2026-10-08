@@ -18,7 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import auth, config, parental, updater
-from .monitor import Monitor, fmt_duration
+from .monitor import Monitor, fmt_duration, network_of as monitor_network_of
 from .store import ACTOR
 from .router import RouterClient, RouterError, norm_mac
 
@@ -134,6 +134,21 @@ class FirewallRuleEdit(FirewallRuleBody):
 
 class ModeBody(BaseModel):
     mode: str
+
+
+class LateBody(BaseModel):
+    minutes: int
+    profile_ids: list[int] | None = None  # None: every profile with schedules
+
+
+class ReservationBody(BaseModel):
+    ip: str
+    mac: str
+    name: str = ""
+
+
+class ReservationEdit(ReservationBody):
+    expected_mac: str
 
 
 class DdnsBody(BaseModel):
@@ -326,27 +341,6 @@ def create_app(monitor: Monitor) -> FastAPI:
                 names.setdefault(sat["parent_mac"], "Router")
         return names
 
-    def wifi_names() -> dict:
-        """Guest and IoT network names, to tell which network a wireless device is on."""
-        if "guest" not in monitor.state and monitor.router:
-            try:
-                monitor.state["guest"] = monitor.router.guest_wifi()
-            except RouterError:
-                pass
-        return {"guest": (monitor.state.get("guest") or {}).get("ssid"),
-                "iot": ((monitor.state.get("iot") or {}).get("data") or {}).get("ssid")}
-
-    def network_of(snap: dict, names: dict) -> str:
-        """main | guest | iot | wired | "" (unknown)."""
-        conn, ssid = (snap.get("connection") or "").lower(), snap.get("ssid") or ""
-        if conn == "wired":
-            return "wired"
-        if "iot" in conn or (names["iot"] and ssid == names["iot"]):
-            return "iot"
-        if names["guest"] and ssid == names["guest"]:
-            return "guest"
-        return "main" if ssid or conn else ""
-
     @app.get("/api/devices")
     def devices():
         import json
@@ -356,7 +350,7 @@ def create_app(monitor: Monitor) -> FastAPI:
         protected = monitor.protected_macs()
         aps = ap_names()
         default = monitor.default_profile_id()
-        names = wifi_names()
+        names = monitor.wifi_names()
         now = datetime.now()
         out = []
         for d in store.q("SELECT * FROM devices ORDER BY online DESC, COALESCE(NULLIF(alias,''), NULLIF(router_name,''), mac) COLLATE NOCASE"):
@@ -370,7 +364,7 @@ def create_app(monitor: Monitor) -> FastAPI:
                 "router_name": d["router_name"], "model": d["model"], "ip": d["last_ip"], "online": bool(d["online"]),
                 "connection": snap.get("connection", ""), "signal": snap.get("signal"), "link_rate": snap.get("link_rate"),
                 "ap": aps.get(snap.get("ap_mac"), "Router" if snap.get("connection") == "wired" else ""),
-                "ssid": snap.get("ssid", ""), "network": network_of(snap, names), "profile": prof, "default_profile": inherited, "manual_block": bool(d["manual_block"]),
+                "ssid": snap.get("ssid", ""), "network": monitor_network_of(snap, names), "profile": prof, "default_profile": inherited, "manual_block": bool(d["manual_block"]),
                 "held": bool(d["held"]) and bool(d["manual_block"]), "randomized": parental.is_randomized_mac(d["mac"]),
                 "blocked": d["mac"] in applied or bool(snap.get("blocked")), "block_reason": want.get(d["mac"]) or
                 ("Blocked on the router" if snap.get("blocked") else ""), "protected": d["mac"] in protected,
@@ -424,14 +418,14 @@ def create_app(monitor: Monitor) -> FastAPI:
     # ---------- family profiles ----------
     def profile_json(p, rules, devs, now):
         st = parental.profile_state(p, rules, now)
-        return {**p, "rules": rules, "devices": devs, "state": {**st, "until": iso(st["until"])},
+        return {**p, "rules": rules, "devices": devs, "state": {**st, "until": iso(st["until"])}, "late_minutes": (p.get("late") or {}).get("minutes"),
                 "paused": p["paused_until"] is not None and (p["paused_until"] == parental.FOREVER or p["paused_until"] > time.time())}
 
     @app.get("/api/profiles")
     def profiles():
         now = datetime.now()
         out = []
-        for p in store.q("SELECT * FROM profiles ORDER BY name COLLATE NOCASE"):
+        for p in parental.with_late(store.q("SELECT * FROM profiles ORDER BY name COLLATE NOCASE"), store.get("late_bedtime", {}), now):
             rules = store.q("SELECT * FROM rules WHERE profile_id=? ORDER BY start", (p["id"],))
             devs = store.q("SELECT mac, COALESCE(NULLIF(alias,''), NULLIF(router_name,''), mac) AS name, online FROM devices WHERE profile_id=?", (p["id"],))
             out.append(profile_json(p, rules, devs, now))
@@ -605,8 +599,8 @@ def create_app(monitor: Monitor) -> FastAPI:
     @app.get("/api/guest")
     def guest():
         try:
-            monitor.state["guest"] = router().guest_wifi()
-            return monitor.state["guest"]
+            monitor.state["guest"] = {**router().guest_wifi(), "_ts": time.time()}
+            return {k: v for k, v in monitor.state["guest"].items() if k != "_ts"}
         except RouterError as e:
             raise HTTPException(502, str(e))
 
@@ -957,6 +951,132 @@ def create_app(monitor: Monitor) -> FastAPI:
         label = {"never": "off", "perschedule": "on the blocking schedule", "always": "always on"}[body.mode]
         return _firewall_job(lambda ui: ui.set_rules_mode(body.mode), "Firewall rules turned " + label, "",
                              "warn" if body.mode == "never" else "info")
+
+    # ---------- later bedtime tonight ----------
+    @app.get("/api/family/late-bedtime")
+    def late_bedtime():
+        tonight = parental.late_night_date(datetime.now())
+        return {k: v for k, v in (store.get("late_bedtime") or {}).items() if v.get("date") == tonight}
+
+    @app.post("/api/family/late-bedtime")
+    def set_late_bedtime(body: LateBody):
+        if not 15 <= body.minutes <= 240:
+            raise HTTPException(400, "Choose between 15 minutes and 4 hours")
+        now = datetime.now()
+        rules = store.q("SELECT * FROM rules WHERE enabled=1")
+        with_rules = {r["profile_id"] for r in rules}
+        ids = [i for i in (body.profile_ids if body.profile_ids is not None else with_rules) if i in with_rules]
+        if not ids:
+            raise HTTPException(400, "None of those profiles has a schedule")
+        tonight = parental.late_night_date(now)
+        late = {k: v for k, v in (store.get("late_bedtime") or {}).items() if v.get("date") == tonight}
+        late.update({str(i): {"date": tonight, "minutes": body.minutes} for i in ids})
+        store.put("late_bedtime", late)
+        names = ", ".join(p["name"] for p in store.q("SELECT name FROM profiles WHERE id IN (%s)" % ",".join("?" * len(ids)), tuple(ids)))
+        store.event("parental", f"Schedules start {fmt_duration(body.minutes * 60)} later tonight", detail=names)
+        return _apply()
+
+    @app.delete("/api/family/late-bedtime")
+    def cancel_late_bedtime():
+        store.put("late_bedtime", {})
+        store.event("parental", "Later bedtime cancelled", detail="Tonight's schedules are back to normal")
+        return _apply()
+
+    # ---------- per-profile report ----------
+    @app.get("/api/profiles/{pid}/report")
+    def profile_report(pid: int, days: int = 7):
+        from . import report
+        p = _profile_or_404(pid)
+        now = datetime.now()
+        default = monitor.default_profile_id()
+        devs = store.q("SELECT mac, alias, router_name, model, profile_id, online, last_seen FROM devices")
+        mine = {d["mac"]: d for d in devs if parental.effective_profile(d, default, now) == pid}
+        rep = report.build(store, set(mine), now.timestamp() - min(max(days, 1), 90) * 86400)
+        name = lambda d: d["alias"] or d["router_name"] or d["model"] or d["mac"]
+        return {"profile": p["name"], "days": days, "totals": rep["totals"], "summary": report.summary(rep),
+                "devices": [{"mac": mac, "name": name(mine[mac]), **data} for mac, data in rep["devices"].items()]}
+
+    # ---------- DHCP address reservations ----------
+    def _reservation_args(body: ReservationBody) -> tuple:
+        lan = ipaddress.ip_network(f"{config.load()['router_host']}/24", strict=False)
+        try:
+            ip = ipaddress.ip_address(body.ip.strip())
+        except ValueError:
+            raise HTTPException(400, f"{body.ip} isn't an IP address")
+        if ip not in lan or ip in (lan.network_address, lan.broadcast_address, ipaddress.ip_address(config.load()["router_host"])):
+            raise HTTPException(400, f"Choose an address on your home network ({lan}), not the router's")
+        mac = norm_mac(body.mac)
+        if not re.fullmatch(r"([0-9A-F]{2}:){5}[0-9A-F]{2}", mac):
+            raise HTTPException(400, "That isn't a MAC address (like AA:BB:CC:11:22:33)")
+        name = body.name.strip()[:32]
+        if not re.fullmatch(r"[A-Za-z0-9 _.\-']*", name):
+            raise HTTPException(400, "Use letters, numbers, spaces, dots or dashes in the name")
+        return str(ip), mac, name or mac.replace(":", "")[-6:]
+
+    def _reservation_job(fn, title, detail, severity="info"):
+        router()
+
+        def work():
+            with monitor.ui_factory() as ui:
+                res = fn(ui)
+            store.event("action", title, detail=detail, severity=severity)
+            monitor.refresh_advanced()
+            return res
+        if not monitor.run_job("reservation", work):
+            raise HTTPException(409, "A reservation change is already running")
+        return {"ok": True}
+
+    @app.post("/api/reservations")
+    def add_reservation(body: ReservationBody):
+        ip, mac, name = _reservation_args(body)
+        return _reservation_job(lambda ui: ui.add_reservation(ip, mac, name), f"Address reserved: {name}", f"{ip} for {mac}")
+
+    @app.put("/api/reservations/{index}")
+    def edit_reservation(index: int, body: ReservationEdit):
+        ip, mac, name = _reservation_args(body)
+        return _reservation_job(lambda ui: ui.edit_reservation(index, norm_mac(body.expected_mac), ip, mac, name),
+                                f"Address reservation changed: {name}", f"{ip} for {mac}")
+
+    @app.delete("/api/reservations/{index}")
+    def delete_reservation(index: int, mac: str):
+        m = norm_mac(mac)
+        return _reservation_job(lambda ui: ui.delete_reservation(index, m), "Address reservation removed", m, "warn")
+
+    # ---------- UPnP ----------
+    @app.put("/api/upnp")
+    def set_upnp(body: EnabledBody):
+        router()
+
+        def work():
+            with monitor.ui_factory() as ui:
+                ui.set_upnp(body.enabled)
+            store.event("action", f"UPnP turned {'on' if body.enabled else 'off'}",
+                        detail="Devices can open ports to the internet themselves" if body.enabled
+                        else "Devices can no longer open ports by themselves; forwards they opened are closed", severity="warn")
+            monitor.refresh_advanced()
+            return {"enabled": body.enabled}
+        if not monitor.run_job("upnp", work):
+            raise HTTPException(409, "A UPnP change is already running")
+        return {"ok": True}
+
+    # ---------- router settings backup + firmware ----------
+    @app.get("/api/router-backup")
+    def router_backup():
+        folder = config.DATA_DIR / "router-backups"
+        files = sorted(folder.glob("NETGEAR_*.cfg"), reverse=True) if folder.exists() else []
+        return {"last": store.get("router_backup"), "folder": str(folder), "job": monitor.jobs.get("backup"),
+                "files": [{"name": f.name, "size": f.stat().st_size, "ts": f.stat().st_mtime} for f in files]}
+
+    @app.post("/api/router-backup")
+    def backup_now():
+        router()
+        if not monitor.run_job("backup", monitor.backup_router):
+            raise HTTPException(409, "A backup is already running")
+        return {"ok": True}
+
+    @app.get("/api/firmware-status")
+    def firmware_status():
+        return monitor.state.get("firmware") or {}
 
     # ---------- remote access: Orbi VPN server + Dynamic DNS ----------
     @app.get("/api/remote-access")

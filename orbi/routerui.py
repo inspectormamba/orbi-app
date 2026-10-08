@@ -161,10 +161,12 @@ class RouterUI:
         out["vpn"] = self.read_vpn()
         out["ddns"] = self.read_ddns()
         upnp = []
-        for cells in self.rows("UPNP_upnp.htm"):
+        out["upnp_enabled"] = self.form("UPNP_upnp.htm").get("UPnP") == "UPnP"
+        for cells in self.rows():
             if len(cells) >= 5 and cells[1] in ("TCP", "UDP"):
                 upnp.append({"active": cells[0], "protocol": cells[1], "internal_port": cells[2], "external_port": cells[3], "ip": cells[4]})
         out["upnp"] = upnp
+        out["port_forwards"] = self.read_port_forwards()
         out["iot"] = self.read_iot()
         return out
 
@@ -288,6 +290,84 @@ class RouterUI:
                 self.add_rule(name, protocol, port, port, {"type": "all"})
                 changed.append(name)
         return changed
+
+    # ---- DHCP address reservations (LAN Setup) ----
+    def read_reservations(self) -> list[dict]:
+        f = self.form("LAN_reserv_add.htm")
+        ips = (f.get("reserved_ips") or "").split()
+        macs = (f.get("reserved_macs") or "").split()
+        names = (f.get("reserved_devname") or "").split("|")
+        return [{"ip": ip, "mac": mac.upper(), "name": names[i] if i < len(names) else ""} for i, (ip, mac) in enumerate(zip(ips, macs))]
+
+    def _fill_reservation(self, ip: str, mac: str, name: str):
+        for i, octet in enumerate(ip.split("."), 1):
+            self._set(f"rsv_ip{i}", octet)
+        self._set("rsv_mac", mac)
+        self._set("dv_name", name)
+
+    def _check_reservations(self, expect: list[dict], what: str):
+        got = self.read_reservations()
+        norm = lambda rs: [(r["ip"], r["mac"].upper()) for r in rs]
+        if norm(got) != norm(expect):
+            raise RouterUIError(f"The router didn't {what} as asked (it lists {norm(got)})")
+        return got
+
+    def add_reservation(self, ip: str, mac: str, name: str) -> list[dict]:
+        before = self.read_reservations()
+        if any(r["mac"] == mac.upper() or r["ip"] == ip for r in before):
+            raise RouterUIError(f"{ip} or {mac} already has a reservation")
+        self.open("LAN_reserv_add.htm", settle=2)
+        self._fill_reservation(ip, mac, name)
+        self._click("add", wait=6)
+        return self._check_reservations(before + [{"ip": ip, "mac": mac}], "save the reservation")
+
+    def _select_reservation(self, index: int, expected_mac: str) -> list[dict]:
+        before = self.read_reservations()
+        if index >= len(before) or before[index]["mac"] != expected_mac.upper():
+            raise RouterUIError("The router's reservation list changed; refresh and try again")
+        self.open("LAN_lan.htm", settle=2)
+        self.d.execute_script("document.querySelectorAll('input[name=ruleSelect]')[arguments[0]].click()", index)
+        return before
+
+    def edit_reservation(self, index: int, expected_mac: str, ip: str, mac: str, name: str) -> list[dict]:
+        before = self._select_reservation(index, expected_mac)
+        self._click("edit", wait=4)  # opens LAN_reserv_edit; nothing changes until it's applied
+        if (self.form().get("orig_rsv_mac") or "").upper() != expected_mac.upper():
+            raise RouterUIError("The router opened the wrong reservation for editing")
+        self._fill_reservation(ip, mac, name)
+        self.d.execute_script("document.forms[0].elements['Apply'].click()")
+        import time
+        time.sleep(1)
+        self._accept_alerts()
+        time.sleep(5)
+        expect = [dict(r) for r in before]
+        expect[index] = {"ip": ip, "mac": mac}
+        return self._check_reservations(expect, "change the reservation")
+
+    def delete_reservation(self, index: int, expected_mac: str) -> list[dict]:
+        before = self._select_reservation(index, expected_mac)
+        self._click("delete", wait=6)
+        return self._check_reservations(before[:index] + before[index + 1:], "delete the reservation")
+
+    # ---- UPnP and manual port forwarding ----
+    def read_port_forwards(self) -> list[dict]:
+        """Manual port-forwarding rules (FW_forward3.htm), shown read-only."""
+        out = []
+        for cells in self.rows("FW_forward3.htm"):
+            cells = [c for c in cells if c != ""]
+            if len(cells) >= 5 and cells[0].isdigit() and re.fullmatch(r"\d+\.\d+\.\d+\.\d+", cells[-1]):
+                out.append({"name": cells[1], "external_port": cells[2], "internal_port": cells[3], "ip": cells[-1]})
+        return out
+
+    def set_upnp(self, enabled: bool) -> bool:
+        self.open("UPNP_upnp.htm", settle=2)
+        if self.d.execute_script("return document.getElementById('upnp').checked") != enabled:
+            self.d.execute_script("document.getElementById('upnp').click()")
+        self._click("apply", wait=6)
+        got = self.form("UPNP_upnp.htm").get("UPnP") == "UPnP"
+        if got != enabled:
+            raise RouterUIError("The router didn't change UPnP as asked")
+        return got
 
     # ---- remote access: the Orbi's VPN server and Dynamic DNS ----
     def read_vpn(self) -> dict:
@@ -484,6 +564,35 @@ def fetch_log(host: str, password: str, user: str = "admin") -> list[dict]:
     m = re.search(r"<textarea[^>]*>(.*?)</textarea>", html, re.S | re.I)
     import html as htmllib
     return parse_log(htmllib.unescape(m.group(1)) if m else "")
+
+
+def fetch_backup(host: str, password: str, user: str = "admin", model: str = "RBR750") -> bytes:
+    """The router's settings file, exactly what its Backup button downloads (NETGEAR_<model>.cfg)."""
+    import urllib3
+    from . import routercert
+    urllib3.disable_warnings()
+    try:
+        routercert.check(host)
+    except routercert.CertificateChanged as e:
+        raise RouterUIError(str(e)) from e
+    s = routercert.session(host)
+    with _lock:
+        try:
+            url = f"https://{host}/NETGEAR_{model}.cfg"
+            r = s.get(url, auth=(user, password), timeout=60)
+            if r.status_code == 401:
+                r = s.get(url, auth=(user, password), timeout=60)
+            if r.status_code != 200:
+                raise RouterUIError(f"The router didn't hand over its settings (HTTP {r.status_code})")
+            data = r.content
+        finally:
+            try:
+                s.get(f"https://{host}/LGO_logout.htm", auth=(user, password), timeout=10)
+            except Exception:
+                pass
+    if len(data) < 1024 or data.lstrip()[:1] == b"<":
+        raise RouterUIError("The router sent a web page instead of its settings file")
+    return data
 
 
 def parse_log(text: str) -> list[dict]:

@@ -93,6 +93,18 @@ def uptime_seconds(text: str | None) -> int | None:
     return d * 86400 + h * 3600 + mi * 60 + s
 
 
+def network_of(snap: dict, names: dict) -> str:
+    """Which Wi-Fi a device is on: main | guest | iot | wired | "" (unknown)."""
+    conn, ssid = (snap.get("connection") or "").lower(), snap.get("ssid") or ""
+    if conn == "wired":
+        return "wired"
+    if "iot" in conn or (names.get("iot") and ssid == names["iot"]):
+        return "iot"
+    if names.get("guest") and ssid == names["guest"]:
+        return "guest"
+    return "main" if ssid or conn else ""
+
+
 def local_macs() -> set[str]:
     """MACs of this PC's adapters, so the app never blocks the machine it runs on."""
     import subprocess
@@ -159,7 +171,7 @@ class Monitor:
         self.reload_router()
         loops = {"health": self.health_loop, "scan": self.scan_loop, "enforce": self.enforce_loop,
                  "traffic": self.traffic_loop, "speedtest": self.speedtest_schedule_loop, "maintenance": self.maintenance_loop,
-                 "routerlog": self.routerlog_loop, "updates": self.update_loop}
+                 "routerlog": self.routerlog_loop, "updates": self.update_loop, "weekly": self.weekly_loop}
         self._loops = loops
         for name in loops:
             self._spawn(name)
@@ -363,6 +375,7 @@ class Monitor:
         self.state.update(scan_error=None, last_scan=time.time())
         self._update_satellites(sats, devices)
         self._update_devices(devices)
+        self._watch_networks()
         self._verify_blocks(devices)
 
     def _update_satellites(self, sats, devices):
@@ -505,8 +518,12 @@ class Monitor:
             self.wake_enforcer.wait(20)
             self.wake_enforcer.clear()
 
+    def profiles_now(self, now=None) -> list[dict]:
+        """Profiles with tonight's "later bedtime" attached."""
+        return parental.with_late(self.store.q("SELECT * FROM profiles"), self.store.get("late_bedtime", {}), now or datetime.now())
+
     def desired(self, now=None) -> dict[str, str]:
-        profiles = self.store.q("SELECT * FROM profiles")
+        profiles = self.profiles_now(now)
         rules = self.store.q("SELECT * FROM rules")
         devices = self.store.q("SELECT mac, profile_id, manual_block, online, last_seen FROM devices")
         return parental.desired_blocks(profiles, rules, devices, now or datetime.now(), self.protected_macs(),
@@ -823,7 +840,127 @@ class Monitor:
     # ---- app updates ----
     def update_loop(self):
         self.stop_event.wait(60)  # let startup settle first
-        self._every(lambda: 12 * 3600, self.check_updates)
+        self._every(lambda: 12 * 3600, self._twice_daily)
+
+    def _twice_daily(self):
+        try:
+            self.check_firmware()
+        except Exception:
+            log.exception("firmware check failed")
+        self.check_updates()
+
+    # ---- router firmware ----
+    def check_firmware(self) -> dict:
+        """Alerts once per new firmware version the router says is available."""
+        if not self.router:
+            return {}
+        fw = self.router.firmware_update()
+        self.state["firmware"] = {**fw, "checked": time.time()}
+        new = fw.get("available")
+        if new and self.store.get("firmware_notified") != new:
+            self.store.put("firmware_notified", new)
+            self.store.event("firmware", f"Router firmware {new} is available", severity="warn",
+                             detail=f"You have {fw.get('current')}. Update it in the Orbi app or on the router's Firmware Update page "
+                                    "(Advanced → Administration). Back up the router's settings first (More → Router).")
+            self.notify("Router firmware update", f"Version {new} is available for your Orbi")
+        return fw
+
+    # ---- weekly: settings backup and per-profile reports ----
+    def weekly_loop(self):
+        self.stop_event.wait(300)
+        self._every(lambda: 3600, self._weekly_tick)
+
+    def _weekly_tick(self, now=None):
+        now = now or datetime.now()
+        last = (self.store.get("router_backup") or {}).get("ts", 0)
+        if self.router and time.time() - last > 7 * 86400 and not (self.jobs.get("backup") or {}).get("running"):
+            try:
+                self.backup_router()
+            except Exception as e:
+                log.warning("weekly router backup failed: %s", e)
+                if not self._recent_alert("backup_failed", "", 86400):
+                    self.store.event("backup_failed", "Couldn't back up the router's settings", detail=str(e)[:300], severity="warn")
+        week = now.strftime("%G-W%V")
+        if now.weekday() == 6 and now.hour >= 18 and self.store.get("weekly_report_week") != week:
+            self.store.put("weekly_report_week", week)
+            self.weekly_reports(now)
+
+    BACKUPS_KEPT = 8
+
+    def backup_router(self) -> dict:
+        from .routerui import fetch_backup
+        s = config.load()
+        model = (self.state.get("info") or {}).get("model") or "RBR750"
+        data = fetch_backup(s["router_host"], config.router_password(s), s["router_user"], model)
+        folder = config.DATA_DIR / "router-backups"
+        folder.mkdir(parents=True, exist_ok=True)
+        f = folder / f"NETGEAR_{model}-{datetime.now():%Y-%m-%d_%H%M}.cfg"
+        f.write_bytes(data)
+        for old in sorted(folder.glob("NETGEAR_*.cfg"))[:-self.BACKUPS_KEPT]:
+            old.unlink()
+        info = {"ts": time.time(), "file": f.name, "size": len(data)}
+        self.store.put("router_backup", info)
+        self.store.event("backup", "Router settings backed up", detail=f"{f.name} ({len(data) // 1024} KB)")
+        return info
+
+    def weekly_reports(self, now=None) -> list[dict]:
+        """A "what did they try?" summary per restricted profile for the past 7 days, into Activity."""
+        from . import report
+        now = now or datetime.now()
+        rules = self.store.q("SELECT * FROM rules")
+        devices = self.store.q("SELECT mac, profile_id, online, last_seen FROM devices")
+        default = self.default_profile_id()
+        out = []
+        for p in self.store.q("SELECT * FROM profiles"):
+            if not parental.is_restricted(p, [r for r in rules if r["profile_id"] == p["id"]], now):
+                continue
+            macs = {d["mac"] for d in devices if parental.effective_profile(d, default, now) == p["id"]}
+            rep = report.build(self.store, macs, now.timestamp() - 7 * 86400)
+            line = report.summary(rep)
+            if line:
+                self.store.event("report", f"Weekly report: {p['name']}", detail=line)
+                out.append({"profile": p["name"], "summary": line})
+        if out:
+            self.notify("Weekly reports", "See Family for what was blocked this week")
+        return out
+
+    # ---- which Wi-Fi network kids' devices are on ----
+    def wifi_names(self) -> dict:
+        """Guest and IoT network names (the guest name is re-read from the router every few hours)."""
+        g = self.state.get("guest")
+        if self.router and (not g or time.time() - g.get("_ts", 0) > 6 * 3600):
+            try:
+                self.state["guest"] = {**self.router.guest_wifi(), "_ts": time.time()}
+            except RouterError:
+                pass
+        return {"guest": (self.state.get("guest") or {}).get("ssid"),
+                "iot": ((self.state.get("iot") or {}).get("data") or {}).get("ssid")}
+
+    def _watch_networks(self, now=None):
+        """Alerts when a device in a restricted profile joins the IoT or Guest Wi-Fi."""
+        now = now or datetime.now()
+        names = self.wifi_names()
+        profiles = {p["id"]: p for p in self.store.q("SELECT * FROM profiles")}
+        rules = self.store.q("SELECT * FROM rules")
+        default = self.default_profile_id()
+        seen = self.store.get("device_networks", {})
+        for d in self.store.q("SELECT * FROM devices WHERE online=1"):
+            snap = json.loads(d["snapshot"] or "{}")
+            net = network_of(snap, names)
+            prev, seen[d["mac"]] = seen.get(d["mac"]), net
+            if net not in ("iot", "guest") or prev == net:
+                continue
+            pid = parental.effective_profile(d, default, now)
+            p = profiles.get(pid)
+            if not p or not parental.is_restricted(p, [r for r in rules if r["profile_id"] == pid], now):
+                continue
+            label = "IoT Wi-Fi" if net == "iot" else "Guest Wi-Fi"
+            name = d["alias"] or d["router_name"] or d["model"] or d["mac"]
+            self.store.event("network_join", f"{name} joined the {label}", severity="warn", mac=d["mac"],
+                             detail=f"{p['name']}'s device · {snap.get('ssid') or label}. Blocks and schedules still apply; "
+                                    f"if it shouldn't be there, change the {label} password.")
+            self.notify(f"Device on the {label}", f"{name} ({p['name']}) joined the {label}")
+        self.store.put("device_networks", seen)
 
     def check_updates(self, force: bool = False) -> dict:
         from . import updater

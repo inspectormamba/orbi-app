@@ -392,7 +392,12 @@ function deviceSheet(d) {
       h("dt", {}, "First seen"), h("dd", {}, d.first_seen ? fmtWhen(d.first_seen) : "—")),
     h("label", { class: "field" }, "Name", alias),
     h("label", { class: "field" }, "Family profile", profileSel),
-    h("div", { class: "btns" }, approve, save, d.held ? null : blockBtn));
+    h("div", { class: "btns" }, approve, save, d.held ? null : blockBtn),
+    d.online && d.ip && !d.held ? h("button", { class: "btn small", style: "margin-top:8px", onclick: (e) => act(e.currentTarget, async () => {
+      await api("/api/reservations", { body: { ip: d.ip, mac: d.mac, name: d.name } });
+      await waitJob("reservation", "Saving to the router");
+      return { note: `${d.name} will always get ${d.ip}` };
+    }) }, `Reserve this address (${d.ip})`) : null);
 }
 
 // ---------- Family ----------
@@ -415,7 +420,8 @@ async function renderFamily() {
         : h("button", { class: "btn danger", onclick: () => pauseSheet(p, renderFamily) }, "Pause internet"),
       p.state.reason === "Extra time" ? h("button", { class: "btn", onclick: (e) => act(e.currentTarget, () => api(`/api/profiles/${p.id}/bonus/cancel`, { body: {} }), "Extra time ended").then(renderFamily) }, "End extra time")
         : p.state.blocked && !p.paused ? h("button", { class: "btn", onclick: () => bonusSheet(p) }, "Give extra time") : null,
-      h("button", { class: "btn", onclick: () => profileSheet(p) }, "Edit"));
+      h("button", { class: "btn", onclick: () => profileSheet(p) }, "Edit"),
+      h("button", { class: "btn", onclick: () => reportSheet(p) }, "Report"));
     const devs = p.devices.length ? h("div", { class: "sub-list" }, ...p.devices.map((d) => h("div", { class: `row${d.online ? "" : " offline"}` }, ico("wifi"),
       h("div", { class: "main" }, h("div", { class: "name" }, d.name), h("div", { class: "meta" }, d.online ? "Online" : "Offline")),
       h("button", { class: "btn small", title: "Remove from profile", onclick: (e) => act(e.currentTarget, () => api(`/api/devices/${d.mac}`, { method: "PATCH", body: { clear_profile: true } })).then(renderFamily) }, "Remove"))))
@@ -437,7 +443,7 @@ async function renderFamily() {
   const dns = filteringCard();
   const blocking = siteBlockCard();
   const ac = status.enforce_error ? h("div", { class: "note" }, `Some blocks couldn't be applied: ${status.enforce_error}`) : null;
-  setView(ac, intro, ...cards, profiles.length ? defaultCard(profiles) : null,
+  setView(ac, intro, profiles.some((p) => p.rules.some((r) => r.enabled)) ? lateCard(profiles) : null, ...cards, profiles.length ? defaultCard(profiles) : null,
     h("button", { class: "btn primary block", onclick: () => profileSheet(null) }, "+ New profile"),
     h("div", { class: "group-label", style: "margin-top:8px" }, "Whole house"), dns, blocking, vpnAttemptsCard());
   every(30000, async () => { if ($("#sheet").hidden) await renderFamily(); });
@@ -639,6 +645,7 @@ async function renderMore() {
 
   const rpw = h("input", { type: "password", autocomplete: "off", placeholder: settings.router_configured ? "••••••••" : "Orbi admin password" });
   const certInfo = h("div", {});
+  const backupInfo = h("div", {});
   const routerFacts = [["Model", st.info?.model], ["Firmware", st.info?.firmware], ["Uptime", st.router_uptime],
     ["Memory used", st.system?.memory != null ? `${st.system.memory}%` : null],
     ["Access Control", st.access_control == null ? null : st.access_control ? "On (needed for device blocking)" : "Off"]].filter(([, v]) => v != null && v !== "");
@@ -647,7 +654,11 @@ async function renderMore() {
     h("label", { class: "field" }, `Admin password for ${settings.router_host}`, rpw),
     h("button", { class: "btn", onclick: (e) => act(e.currentTarget, () => api("/api/settings/router-password", { body: { password: rpw.value } }), "Router password saved").then(() => (rpw.value = "")) }, "Update password"),
     h("button", { class: "btn", onclick: (e) => act(e.currentTarget, async () => { const f = await api("/api/firmware"); toast(f.available ? `Firmware ${f.available} is available` : `Firmware ${f.current} is up to date`); }) }, "Check for firmware update"),
-    h("button", { class: "btn danger", onclick: rebootSheet }, "Reboot router…"), certInfo);
+    h("button", { class: "btn danger", onclick: rebootSheet }, "Reboot router…"), certInfo, backupInfo);
+  api("/api/router-backup").then((b) => fill(backupInfo, h("div", { class: "group-label" }, "Settings backup"),
+    h("div", { class: "muted small" }, b.last ? `Last backup ${fmtWhen(b.last.ts)} · ${b.files.length} kept on this PC (${b.folder}). Backed up weekly; restore from the router's Backup Settings page.` : "Not backed up yet. The app backs the router's settings up to this PC every week."),
+    h("button", { class: "btn small", style: "margin-top:6px", onclick: (e) => act(e.currentTarget, async () => {
+      await api("/api/router-backup", { body: {} }); await waitJob("backup", "Backing up"); renderMore().catch(() => {}); return { note: "Router settings backed up" }; }) }, "Back up now"))).catch(() => {});
   api("/api/settings/router-cert").then((c) => fill(certInfo,
     c.changed ? h("div", { class: "error-text" }, "The router is showing a different security certificate than the one Orbi Control trusts, so the app has stopped sending it the admin password.") : null,
     h("div", { class: "muted small" }, c.pinned ? `Security certificate: pinned (${c.pinned})` : "Security certificate: trusted on first connection"),
@@ -927,8 +938,11 @@ async function renderAdvanced() {
     ["DNS", `${d.wan.dns.filter(Boolean).join(", ")} (${d.wan.dns_mode})`], ["ISP's DNS", d.wan.isp_dns.filter(Boolean).join(", ")], ["WAN MAC", d.wan.mac]]));
   const lan = h("section", { class: "card" }, h("h2", {}, "LAN & DHCP"), kv([
     ["Router IP", d.lan.ip], ["Subnet mask", d.lan.netmask], ["DHCP server", d.lan.dhcp_enabled ? `On · hands out ${d.lan.dhcp_start} – ${d.lan.dhcp_end}` : "Off"]]),
-    h("div", { class: "group-label" }, `Address reservations · ${d.lan.reservations.length}`),
-    table(["IP", "Name", "MAC"], d.lan.reservations.map((x) => [x.ip, x.name, x.mac])),
+    h("div", { class: "group-label" }, `Address reservations · ${d.lan.reservations.length}`, h("button", { class: "btn small act", onclick: () => reservationSheet() }, "Add")),
+    h("div", { class: "muted small" }, "A reserved device always gets the same address, which keeps firewall rules for one device or a range pointed at the right device."),
+    ...d.lan.reservations.map((x, i) => h("div", { class: "row" }, h("div", { class: "main" }, h("div", { class: "name" }, x.name || x.mac), h("div", { class: "meta" }, `${x.ip} · ${x.mac}`)),
+      h("button", { class: "btn small", onclick: () => reservationSheet(x, i) }, "Edit"),
+      h("button", { class: "btn small danger", onclick: () => deleteReservationSheet(x, i) }, "Delete"))),
     h("div", { class: "muted small", style: "margin-top:8px" }, "Recent DHCP activity is in History → Router log (DHCP filter)."));
   const wifi = h("section", { class: "card" }, h("h2", {}, "Main Wi-Fi"), table(["Band", "Name", "Channel", "Mode", "Security"],
     (d.wifi || []).map((w) => [w.band, w.ssid + (w.enabled ? "" : " (off)"), w.channel, w.mode, w.security])));
@@ -945,8 +959,14 @@ async function renderAdvanced() {
       h("button", { class: "btn small", onclick: () => firewallRuleSheet(x, i) }, "Edit"),
       h("button", { class: "btn small danger", onclick: () => deleteFirewallRuleSheet(x, i) }, "Delete")))
       : [h("div", { class: "muted small" }, "No rules.")]));
-  const ports = h("section", { class: "card" }, h("h2", {}, "Port forwarding (UPnP)"),
-    table(["Device", "Protocol", "Outside", "Inside"], d.upnp.map((x) => [devName(x.ip) ? `${devName(x.ip)} (${x.ip})` : x.ip, x.protocol, x.external_port, x.internal_port])));
+  const upnpToggle = h("input", { type: "checkbox", checked: d.upnp_enabled !== false, onchange: (e) => upnpSheet(e.target, d.upnp.map((x) => devName(x.ip) || x.ip)) });
+  const ports = h("section", { class: "card" }, h("h2", {}, "Port forwarding"),
+    h("label", { class: "switch" }, "UPnP (devices open ports themselves)", upnpToggle),
+    h("div", { class: "group-label" }, "Opened by UPnP"),
+    table(["Device", "Protocol", "Outside", "Inside"], d.upnp.map((x) => [devName(x.ip) ? `${devName(x.ip)} (${x.ip})` : x.ip, x.protocol, x.external_port, x.internal_port])),
+    h("div", { class: "group-label" }, "Manual rules"),
+    table(["Service", "Outside", "Inside", "Device"], (d.port_forwards || []).map((x) => [x.name, x.external_port, x.internal_port, devName(x.ip) ? `${devName(x.ip)} (${x.ip})` : x.ip])),
+    h("div", { class: "muted small" }, "Manual rules are added on the router's Port Forwarding page."));
 
   setView(head, wan, lan, h("div", { class: "group-label" }, "Wi-Fi networks"), wifi, guestCard(), iotCard(), fw, ports);
 }
@@ -1030,6 +1050,47 @@ function ddnsSheet(d) {
         closeSheet(); renderMore().catch(() => {});
         return { note: "Dynamic DNS saved" };
       }) }, "Save")));
+}
+
+// ---------- address reservations & UPnP (Advanced) ----------
+function reservationSheet(x, index) {
+  const ip = h("input", { value: x ? x.ip : "", placeholder: "192.168.1.x", inputmode: "decimal" });
+  const mac = h("input", { value: x ? x.mac : "", placeholder: "AA:BB:CC:11:22:33", autocapitalize: "characters", spellcheck: "false" });
+  const name = h("input", { value: x ? x.name : "", maxlength: 32 });
+  openSheet(h("h3", {}, x ? `Edit ${x.name || x.mac}` : "Reserve an address"),
+    h("label", { class: "field" }, "IP address", ip), h("label", { class: "field" }, "Device MAC address", mac), h("label", { class: "field" }, "Name", name),
+    h("p", { class: "muted small" }, "Tip: Devices → tap a device → Reserve this address fills these in. The device picks up a changed address the next time it reconnects."),
+    h("div", { class: "btns" }, h("button", { class: "btn", onclick: closeSheet }, "Cancel"),
+      h("button", { class: "btn primary", onclick: (e) => act(e.currentTarget, async () => {
+        const body = { ip: ip.value, mac: mac.value, name: name.value };
+        if (x) await api(`/api/reservations/${index}`, { method: "PUT", body: { ...body, expected_mac: x.mac } });
+        else await api("/api/reservations", { body });
+        return routerJob("reservation", "Saving to the router", "Reservation saved");
+      }) }, "Save")));
+}
+
+function deleteReservationSheet(x, index) {
+  openSheet(h("h3", {}, `Remove the reservation for ${x.name || x.mac}?`),
+    h("p", { style: "margin:0" }, `${x.ip} will go back to being handed out to any device. Firewall rules that name ${x.ip} may then apply to a different device.`),
+    h("div", { class: "btns" }, h("button", { class: "btn", onclick: closeSheet }, "Cancel"),
+      h("button", { class: "btn danger solid", onclick: (e) => act(e.currentTarget, async () => {
+        await api(`/api/reservations/${index}?mac=${encodeURIComponent(x.mac)}`, { method: "DELETE" });
+        return routerJob("reservation", "Removing on the router", "Reservation removed");
+      }) }, "Remove")));
+}
+
+function upnpSheet(toggle, users) {
+  const turningOn = toggle.checked;
+  toggle.checked = !turningOn;  // only changes once confirmed and saved
+  openSheet(h("h3", {}, turningOn ? "Turn UPnP on?" : "Turn UPnP off?"),
+    h("p", { style: "margin:0" }, turningOn
+      ? "Any device on your network will be able to open ports to the internet by itself. Game consoles and media servers like this, but so does malware."
+      : `Devices will no longer open ports by themselves, and the ones they opened close.${users.length ? ` That affects ${[...new Set(users)].join(", ")}: online gaming or remote streaming on them may stop working until you add manual forwards.` : ""}`),
+    h("div", { class: "btns" }, h("button", { class: "btn", onclick: closeSheet }, "Cancel"),
+      h("button", { class: `btn ${turningOn ? "primary" : "danger solid"}`, onclick: (e) => act(e.currentTarget, async () => {
+        await api("/api/upnp", { method: "PUT", body: { enabled: turningOn } });
+        return routerJob("upnp", "Saving to the router", `UPnP ${turningOn ? "on" : "off"}`);
+      }) }, turningOn ? "Turn on" : "Turn off")));
 }
 
 // ---------- Guest & IoT Wi-Fi (Advanced, under Main Wi-Fi) ----------
@@ -1157,6 +1218,56 @@ function iotSheet(iot) {
         pw.value = "";
         return routerJob("iot", "Saving (Wi-Fi restarts)", "IoT Wi-Fi saved");
       }) }, "Save")));
+}
+
+// ---------- later bedtime tonight ----------
+function lateCard(profiles) {
+  const late = profiles.filter((p) => p.late_minutes);
+  if (late.length) {
+    const mins = late[0].late_minutes;
+    return h("div", { class: "note" }, `Tonight's schedules start ${mins >= 60 ? `${mins / 60} hour${mins === 60 ? "" : "s"}` : `${mins} minutes`} later for ${late.map((p) => p.name).join(", ")}. Morning times are unchanged. `,
+      h("button", { class: "btn small", onclick: (e) => act(e.currentTarget, () => api("/api/family/late-bedtime", { method: "DELETE" }), "Back to normal").then(renderFamily) }, "Cancel"));
+  }
+  return h("button", { class: "btn block", onclick: () => lateSheet(profiles) }, "🌙 Later bedtime tonight…");
+}
+
+function lateSheet(profiles) {
+  const withRules = profiles.filter((p) => p.rules.some((r) => r.enabled));
+  let minutes = 60;
+  const choices = h("div", { class: "chips" }, ...[30, 60, 90, 120].map((m) => h("button", { class: `chip${m === minutes ? " on" : ""}`, onclick: (e) => {
+    minutes = m; choices.querySelectorAll(".chip").forEach((c) => c.classList.toggle("on", c === e.currentTarget)); } }, m < 60 ? `${m} min` : `${m / 60} hour${m === 60 ? "" : "s"}`)));
+  const boxes = withRules.map((p) => [p, h("input", { type: "checkbox", checked: true })]);
+  openSheet(h("h3", {}, "Later bedtime tonight"),
+    h("p", { class: "muted small", style: "margin:0" }, "Tonight's schedules start later, for example for no school tomorrow. When they end in the morning doesn't change, pauses still apply, and everything is back to normal tomorrow."),
+    choices, ...boxes.map(([p, box]) => h("label", { class: "switch" }, `${p.emoji || ""} ${p.name}`.trim(), box)),
+    h("div", { class: "btns" }, h("button", { class: "btn", onclick: closeSheet }, "Cancel"),
+      h("button", { class: "btn primary", onclick: (e) => act(e.currentTarget, async () => {
+        await api("/api/family/late-bedtime", { body: { minutes, profile_ids: boxes.filter(([, b]) => b.checked).map(([p]) => p.id) } });
+        closeSheet(); renderFamily();
+        return { note: "Bedtime moved later for tonight" };
+      }) }, "Save")));
+}
+
+// ---------- per-profile "what did they try?" report ----------
+function reportSheet(p) {
+  const body = h("div", {}, h("span", { class: "spinner" }));
+  let days = 7;
+  const chips = h("div", { class: "chips" }, ...[[1, "Today"], [7, "7 days"], [30, "30 days"]].map(([d, l]) => h("button", { class: `chip${d === days ? " on" : ""}`, onclick: (e) => {
+    days = d; chips.querySelectorAll(".chip").forEach((c) => c.classList.toggle("on", c === e.currentTarget)); load(); } }, l)));
+  const list = (obj) => Object.entries(obj).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${v}×`).join(", ");
+  const load = () => api(`/api/profiles/${p.id}/report?days=${days}`).then((r) => {
+    if (!r.devices.length) { fill(body, h("div", { class: "muted small" }, "Nothing blocked or unusual in this period.")); return; }
+    fill(body, h("div", { class: "note" }, r.summary),
+      ...r.devices.map((d) => h("div", { class: "sub-list" }, h("div", { class: "group-label" }, d.name),
+        Object.keys(d.sites).length ? h("div", { class: "row" }, h("div", { class: "main" }, h("div", { class: "name" }, "Blocked sites & apps"), h("div", { class: "meta", style: "white-space:normal" }, list(d.sites)))) : null,
+        Object.keys(d.bypass).length ? h("div", { class: "row" }, h("div", { class: "main" }, h("div", { class: "name" }, "Tried to get around the content filter"), h("div", { class: "meta", style: "white-space:normal" }, list(d.bypass)))) : null,
+        Object.keys(d.vpn).length ? h("div", { class: "row" }, h("div", { class: "main" }, h("div", { class: "name" }, "VPN attempts"), h("div", { class: "meta", style: "white-space:normal" }, list(d.vpn)))) : null,
+        ...d.networks.map((n) => h("div", { class: "row" }, h("div", { class: "main" }, h("div", { class: "name" }, n.title), h("div", { class: "meta" }, fmtWhen(n.ts))))))));
+  }).catch((e) => fill(body, h("div", { class: "error-text" }, e.message)));
+  openSheet(h("h3", {}, `${p.name}: what was blocked`), chips, body,
+    h("p", { class: "muted small" }, "From the router's log: each blocked attempt by this profile's devices. Apps retry automatically, so large numbers are normal; what matters is what they tried and when. A summary is also added to History every Sunday evening."),
+    h("div", { class: "btns" }, h("button", { class: "btn", onclick: closeSheet }, "Close")));
+  load();
 }
 
 // ---------- blocked VPN attempts (Family → Whole house) ----------

@@ -5,10 +5,14 @@ Precedence for a profile, highest first:
   2. bonus time (allow_until in the future) overrides schedules
   3. any active schedule rule (e.g. Bedtime 21:00-07:00) blocks
 Days are Mon=0 .. Sun=6, as in datetime.weekday().
+
+"Later bedtime tonight" (profile["late"] = {"date": "YYYY-MM-DD", "minutes": N}) delays only the *start* of
+evening schedule windows (starting 5 PM or later) that begin on that date; when they end is unchanged.
 """
 from datetime import datetime, timedelta
 
 FOREVER = -1
+LATE_FROM = 17 * 60  # "later bedtime tonight" only moves evening schedules (starting 5 PM or later), not e.g. Homework
 
 
 def _minutes(hhmm: str) -> int:
@@ -16,7 +20,18 @@ def _minutes(hhmm: str) -> int:
     return int(h) * 60 + int(m)
 
 
-def rule_active(rule: dict, now: datetime) -> bool:
+def rule_active(rule: dict, now: datetime, late: dict | None = None) -> bool:
+    if not _rule_on(rule, now):
+        return False
+    if late and late.get("minutes") and rule["start"] != rule["end"] and _minutes(rule["start"]) >= LATE_FROM:
+        start, t = _minutes(rule["start"]), now.hour * 60 + now.minute
+        began = now.date() if t >= start else (now - timedelta(days=1)).date()
+        if began.isoformat() == late.get("date") and (t - start) % 1440 < late["minutes"]:
+            return False
+    return True
+
+
+def _rule_on(rule: dict, now: datetime) -> bool:
     if not rule.get("enabled", 1):
         return False
     days = str(rule.get("days", ""))
@@ -41,20 +56,21 @@ def profile_state(profile: dict, rules: list[dict], now: datetime) -> dict:
     bonus = profile.get("allow_until")
     if bonus and bonus > ts:
         return {"blocked": False, "reason": "Extra time", "until": datetime.fromtimestamp(bonus)}
-    active = [r for r in rules if rule_active(r, now)]
+    late = profile.get("late")
+    active = [r for r in rules if rule_active(r, now, late)]
     if active:
-        return {"blocked": True, "reason": active[0].get("label") or "Schedule", "until": next_change(rules, now, True)}
-    return {"blocked": False, "reason": "", "until": next_change(rules, now, False)}
+        return {"blocked": True, "reason": active[0].get("label") or "Schedule", "until": next_change(rules, now, True, late=late)}
+    return {"blocked": False, "reason": "", "until": next_change(rules, now, False, late=late)}
 
 
-def next_change(rules: list[dict], now: datetime, currently_blocked: bool, horizon_minutes: int = 8 * 24 * 60):
+def next_change(rules: list[dict], now: datetime, currently_blocked: bool, horizon_minutes: int = 8 * 24 * 60, late=None):
     """First minute (within 8 days) at which the schedule-blocked state flips."""
     if not any(r.get("enabled", 1) for r in rules):
         return None
     t = now.replace(second=0, microsecond=0)
     for _ in range(horizon_minutes):
         t += timedelta(minutes=1)
-        if any(rule_active(r, t) for r in rules) != currently_blocked:
+        if any(rule_active(r, t, late) for r in rules) != currently_blocked:
             return t
     return None
 
@@ -96,6 +112,27 @@ def desired_blocks(profiles: list[dict], rules: list[dict], devices: list[dict],
         if st and st["blocked"]:
             out[mac] = f"{names[pid]}: {st['reason']}" + (" (default profile)" if d.get("profile_id") is None else "")
     return out
+
+
+def late_night_date(now: datetime) -> str:
+    """The evening a "later bedtime tonight" applies to (before 5 AM it's still last night)."""
+    return (now - timedelta(hours=5)).date().isoformat()
+
+
+def with_late(profiles: list[dict], late_map: dict, now: datetime) -> list[dict]:
+    """Profiles with their "late" entry attached when it's for tonight (late_map: {"<pid>": {"date", "minutes"}})."""
+    tonight = late_night_date(now)
+    out = []
+    for p in profiles:
+        late = (late_map or {}).get(str(p["id"]))
+        out.append({**p, "late": late} if late and late.get("date") == tonight else dict(p))
+    return out
+
+
+def is_restricted(profile: dict, rules: list[dict], now: datetime) -> bool:
+    """A profile that limits its devices at all (has schedules, or is paused): its devices count as kids' devices."""
+    paused = profile.get("paused_until")
+    return any(r.get("enabled", 1) for r in rules) or (paused is not None and (paused == FOREVER or paused > now.timestamp()))
 
 
 GENERIC_NAMES = {"", "iphone", "ipad", "android", "apple", "macbookpro", "macbook-pro", "macbookair", "macbook", "unknown",
