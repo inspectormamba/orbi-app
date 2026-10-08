@@ -178,6 +178,16 @@ class ExtraPinBody(BaseModel):
     label: str = ""
 
 
+ROUTER_UNSAFE = re.compile(r'["\\<>`]')  # characters that could break out of the router's own admin pages
+
+
+def router_safe(text: str, what: str):
+    """Text the app types into the router's pages ends up inside the router's HTML and JavaScript (as in
+    var resrv_name = "..."), so refuse characters that could break out of it and plant script there."""
+    if ROUTER_UNSAFE.search(text or ""):
+        raise HTTPException(400, f"The {what} can't contain \" \\ < > or `")
+
+
 def ddns_points_to(host: str, router_host: str) -> list[str]:
     """What a Dynamic DNS name resolves to right now (asked through the router, like every device does)."""
     import dns.message
@@ -973,7 +983,8 @@ def create_app(monitor: Monitor) -> FastAPI:
         late.update({str(i): {"date": tonight, "minutes": body.minutes} for i in ids})
         store.put("late_bedtime", late)
         names = ", ".join(p["name"] for p in store.q("SELECT name FROM profiles WHERE id IN (%s)" % ",".join("?" * len(ids)), tuple(ids)))
-        store.event("parental", f"Schedules start {fmt_duration(body.minutes * 60)} later tonight", detail=names)
+        store.event("parental", f"Schedules start {fmt_duration(body.minutes * 60)} later tonight", detail=names, severity="warn")
+        monitor.notify("Later bedtime tonight", f"{names}: schedules start {fmt_duration(body.minutes * 60)} later tonight")  # a loosening
         return _apply()
 
     @app.delete("/api/family/late-bedtime")
@@ -1050,6 +1061,8 @@ def create_app(monitor: Monitor) -> FastAPI:
         def work():
             with monitor.ui_factory() as ui:
                 ui.set_upnp(body.enabled)
+            if body.enabled:
+                monitor.notify("UPnP turned on", "Devices can now open ports to the internet by themselves")
             store.event("action", f"UPnP turned {'on' if body.enabled else 'off'}",
                         detail="Devices can open ports to the internet themselves" if body.enabled
                         else "Devices can no longer open ports by themselves; forwards they opened are closed", severity="warn")
@@ -1123,6 +1136,8 @@ def create_app(monitor: Monitor) -> FastAPI:
                 raise HTTPException(400, "Enter the account's user name or email")
             if body.password and (len(body.password) > 64 or not body.password.isprintable()):
                 raise HTTPException(400, "The password must be up to 64 characters")
+            router_safe(user, "user name")
+            router_safe(body.password or "", "password")
         router()
 
         def work():
@@ -1167,6 +1182,8 @@ def create_app(monitor: Monitor) -> FastAPI:
                 raise HTTPException(400, "Security must be WPA2-PSK or WPA-AUTO-PSK")
             if body.password and not (re.fullmatch(r"[ -~]{8,63}", body.password) or re.fullmatch(r"[0-9A-Fa-f]{64}", body.password)):
                 raise HTTPException(400, "The password must be 8–63 characters (or 64 hex digits)")
+            router_safe(ssid, "network name")
+            router_safe(body.password or "", "password")
         router()
 
         def work():

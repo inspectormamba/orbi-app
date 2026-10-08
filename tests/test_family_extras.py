@@ -167,3 +167,55 @@ def test_upnp_api(client):
     assert wait_job(client, "upnp")["error"] is None
     assert FakeUI.calls == [("upnp", False)]
     assert client.get("/api/events?kind=action").json()[0]["title"] == "UPnP turned off"
+
+
+
+# ---------- security review (2026-10-07) ----------
+def test_text_sent_to_router_pages_cant_break_out(client):
+    for body in ({"enabled": True, "ssid": 'Home"<script>', "band": "2.4"},
+                 {"enabled": True, "ssid": "Home", "band": "2.4", "password": 'abc"defgh</'}):
+        assert client.put("/api/iot", json=body).status_code == 400, body
+    for body in ({"enabled": True, "provider": "No-IP", "host": "home.ddns.net", "user": 'me"<x>'},
+                 {"enabled": True, "provider": "No-IP", "host": "home.ddns.net", "user": "me", "password": "pa`ss"}):
+        assert client.put("/api/ddns", json=body).status_code == 400, body
+    assert client.post("/api/reservations", json={"ip": "192.168.1.50", "mac": "AA:BB:CC:11:22:33", "name": 'x"y'}).status_code == 400
+
+
+def test_backup_file_name_ignores_odd_model_names(monitor, monkeypatch, tmp_config):
+    import orbi.routerui as rui
+    monkeypatch.setattr(rui, "fetch_backup", lambda host, pw, user, model: b"x" * 2048)
+    monitor.state["info"] = {"model": "..\\..\\evil/RBR750"}
+    info = monitor.backup_router()
+    assert info["file"].startswith("NETGEAR_evilRBR750-") and (tmp_config / "router-backups" / info["file"]).exists()
+
+
+def test_loosening_actions_notify(client, monitor):
+    pid = client.post("/api/profiles", json={"name": "Kid"}).json()["id"]
+    client.post(f"/api/profiles/{pid}/rules", json={"label": "Bedtime", "days": "0123456", "start": "21:00", "end": "07:00"})
+    client.post("/api/family/late-bedtime", json={"minutes": 60})
+    client.put("/api/upnp", json={"enabled": True})
+    wait_job(client, "upnp")
+    assert {"Later bedtime tonight", "UPnP turned on"} <= {n[0] for n in monitor.notes}
+    ev = client.get("/api/events?kind=parental").json()[0]
+    assert ev["severity"] == "warn" and "by " in ev["detail"]  # recorded with who did it
+
+
+def test_every_api_endpoint_requires_sign_in(client):
+    """Regression guard: new endpoints must sit behind the sign-in check (only session/login/setup are open)."""
+    from orbi.web import OPEN_PATHS
+    client.cookies.clear()
+    checked = 0
+    for r in client.app.routes:
+        path = getattr(r, "path", "")
+        if not path.startswith("/api/") or path in OPEN_PATHS:
+            continue
+        for method in r.methods - {"HEAD", "OPTIONS"}:
+            url = re_sub_params(path)
+            assert client.request(method, url, json={}).status_code == 401, (method, path)
+            checked += 1
+    assert checked > 60
+
+
+def re_sub_params(path: str) -> str:
+    import re
+    return re.sub(r"\{(\w+)\}", lambda m: {"pid": "1", "index": "0", "rid": "1"}.get(m.group(1), "x"), path)

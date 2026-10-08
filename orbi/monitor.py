@@ -890,7 +890,7 @@ class Monitor:
     def backup_router(self) -> dict:
         from .routerui import fetch_backup
         s = config.load()
-        model = (self.state.get("info") or {}).get("model") or "RBR750"
+        model = re.sub(r"[^A-Za-z0-9_-]", "", (self.state.get("info") or {}).get("model") or "") or "RBR750"  # used in a file name
         data = fetch_backup(s["router_host"], config.router_password(s), s["router_user"], model)
         folder = config.DATA_DIR / "router-backups"
         folder.mkdir(parents=True, exist_ok=True)

@@ -578,7 +578,7 @@ def fetch_backup(host: str, password: str, user: str = "admin", model: str = "RB
     s = routercert.session(host)
     with _lock:
         try:
-            url = f"https://{host}/NETGEAR_{model}.cfg"
+            url = f"https://{host}/NETGEAR_{re.sub(r'[^A-Za-z0-9_-]', '', model) or 'RBR750'}.cfg"
             r = s.get(url, auth=(user, password), timeout=60)
             if r.status_code == 401:
                 r = s.get(url, auth=(user, password), timeout=60)

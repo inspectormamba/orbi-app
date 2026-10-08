@@ -145,8 +145,12 @@ def test_outage_lifecycle(monitor, monkeypatch):
 
 def test_speedtest_runs_and_records(monitor, monkeypatch):
     monkeypatch.setattr(monitor_mod.time, "sleep", lambda s: None)
+    release = threading.Event()  # hold the test open so "one at a time" is checked while it's really running
+    poll = monitor.router.speedtest_poll
+    monkeypatch.setattr(monitor.router, "speedtest_poll", lambda: release.wait(5) and poll())
     assert monitor.start_speedtest()
     assert not monitor.start_speedtest()  # only one at a time
+    release.set()
     for t in threading.enumerate():
         if t.name == "speedtest-run":
             t.join(5)
