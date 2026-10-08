@@ -2,6 +2,31 @@
 
 What changed in each version, newest first. The same notes appear in the app under More → Updates.
 
+## 1.1.6 (2026-10-08)
+
+### New for parents
+- Reports: for each profile, see what its devices tried that got blocked: sites and apps, attempts to get around the content filter, VPN attempts, and joining the IoT or Guest Wi-Fi. A weekly summary goes into History every Sunday evening.
+- An alert when a device in a profile with schedules (or a paused one) joins the IoT or Guest Wi-Fi.
+- Later bedtime tonight: evening schedules start 30 minutes to 2 hours later for one night. Morning times don't change, and everything is back to normal the next day.
+
+### New for the network
+- Address reservations: add, edit and delete them on the Advanced tab, or use Devices → a device → Reserve this address. Every change is read back from the router to confirm it took.
+- UPnP on/off. Turning it off warns you which devices use it. Manual port-forwarding rules are listed too.
+- A weekly backup of the router's settings to this PC (the last 8 are kept).
+- An alert when new router firmware is available (checked twice a day).
+
+### Wi-Fi changes that actually stick
+- The Orbi doesn't always disconnect devices that were already connected when a network gets a new name or password, or is turned off. They can stay on with the old password until the router restarts. About 2 minutes after you change the IoT Wi-Fi, or turn the Guest Wi-Fi off, the app checks which devices stayed on. If any did, you get an alert and the offer to restart the router now or tonight at 3 AM. It also lists the devices that came back with the new password, so you can spot one that shouldn't have it. After the restart, it reports who rejoined.
+- Restarting the router from the app now saves the router's log first, because a restart clears it. It also warns you if a satellite is offline. A restart scheduled for 3 AM is skipped (and you're told) if this PC was asleep then, rather than happening later in the morning.
+- WPS on the Advanced tab. Pressing Sync on the router (and probably on a satellite) lets a device that supports WPS join your main Wi-Fi without the password for 2 minutes. This Orbi firmware has no setting to turn WPS off, and the router doesn't log it. Keep "Hold new devices" on so a device that joins this way stays blocked until you approve it.
+
+### Security
+- The Orbi makes itself a new security certificate every time it restarts, which used to stop the app until someone chose "Trust the router's new certificate". After a restart the app asked for, it now trusts the new certificate on its own, but only if all of these are true: it's Netgear's own router certificate, it was created after the restart, it shows up within 20 minutes, and it comes from the router's hardware address as recorded before the restart. Anything else stops the app and alerts you, as before.
+- Text the app types into the router's pages (the IoT network name and password, and the Dynamic DNS user name and password) can no longer contain " \ < > or `. The router puts these values inside its own pages, so they could have been used to plant script there.
+- Later bedtime and turning UPnP on now send a notification, because both loosen controls.
+
+After updating, sign in again (the restart signs everyone out).
+
 ## 1.1.5 (2026-10-07)
 
 ### New
