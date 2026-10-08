@@ -168,7 +168,25 @@ class RouterUI:
         out["upnp"] = upnp
         out["port_forwards"] = self.read_port_forwards()
         out["iot"] = self.read_iot()
+        try:
+            out["wps"] = self.read_wps()
+        except Exception as e:  # not on every model's pages
+            log.info("couldn't read WPS: %s", e)
+            out["wps"] = None
         return out
+
+    def read_wps(self) -> dict:
+        """WPS: pressing Sync on the router or a satellite lets a WPS device join the main Wi-Fi without the
+        password for 2 minutes. Netgear took the WPS on/off setting out of this firmware (RBR750 V7.2.8.8: the
+        old field is commented out of the Advanced Wireless page), but the Add WPS Client page still offers
+        push-button pairing, so WPS is on and can't be turned off."""
+        self.open("WPS.htm", settle=2)
+        return self.d.execute_script("""
+            const text = document.body ? document.body.innerText : '';
+            const off = document.querySelector('[name=wps_enable]');  // only if a firmware brings the setting back
+            const offered = /Push Button/i.test(text);
+            return {enabled: off && off.type !== 'hidden' ? off.value !== 'disabled' : (offered ? true : null),
+                    adjustable: !!(off && off.type !== 'hidden')};""")
 
     # ---- writes (each verified by reading the page back) ----
     def set_dns(self, primary: str, secondary: str):

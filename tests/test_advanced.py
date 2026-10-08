@@ -80,7 +80,8 @@ class FakeUI:
                 "block_sites": {"mode": "never", "keywords": [], "trusted_ip": None},
                 "schedule": {"days": "0123456", "all_day": True, "start": "00:00", "end": "00:00"},
                 "vpn": {"enabled": True, "protocol": "udp", "port": "12973", "port_tap": "12974"}, "upnp": [],
-                "iot": {"enabled": True, "ssid": "Home-IoT", "band": "2.4", "security": "WPA2-PSK"}}
+                "iot": {"enabled": True, "ssid": "Home-IoT", "band": "2.4", "security": "WPA2-PSK"},
+                "wps": {"enabled": True, "adjustable": False}}
 
     def set_schedule(self, days, start, end):
         FakeUI.calls.append(("schedule", days, start, end))
@@ -303,7 +304,7 @@ def test_devices_show_their_wifi_network(client, monitor, fake_router):
     fake_router.devs[0].update(ssid="Home", connection="5GHz")
     fake_router.devs[1].update(ssid="Home-IoT", connection="2.4GHz - IoT")
     fake_router.devs[2].update(ssid="", connection="wired")
-    visitor = fake_router._dev("AA:00:00:00:00:09", "visitor", "192.168.1.90", "C8:9E:43:C2:E3:33", "2.4GHz")
+    visitor = fake_router._dev("AA:00:00:00:00:09", "visitor", "192.168.1.90", "C8:9E:43:00:00:01", "2.4GHz")
     visitor["ssid"] = "Guest"  # FakeRouter's guest network is called "Guest"
     fake_router.devs.append(visitor)
     monitor.scan()
@@ -351,3 +352,133 @@ def test_ddns_api(client, monkeypatch):
 
 def test_status_includes_router_uptime(client):
     assert client.get("/api/status").json()["router_uptime"] == "2 days 07:21:36"
+
+
+
+# ---------- after a Wi-Fi change: who stayed connected, and restarting ----------
+@pytest.fixture
+def wifi(client, monitor, fake_router, monkeypatch):
+    """kid-phone and kid-tablet on the IoT network; checks run without the two-minute wait."""
+    monkeypatch.setattr("orbi.monitor.WIFI_CHECK_DELAY", 0)
+    monitor.state["iot"] = {"data": {"enabled": True, "ssid": "Home-IoT"}, "ts": time.time()}
+    for d in fake_router.devs[:2]:
+        d.update(ssid="Home-IoT", connection="2.4GHz")
+    return fake_router
+
+
+def test_iot_password_change_finds_devices_that_stayed_on(client, monitor, wifi):
+    # kid-tablet rejoined (the router handed it an address); kid-phone never dropped off
+    monitor.store.x("INSERT INTO router_log(ts,kind,source,text) VALUES(?,?,?,?)", (time.time() + 1, "DHCP IP: (192.168.1.21)", "",
+                    "[DHCP IP: (192.168.1.21)] to MAC address AA:00:00:00:00:02, Thursday, Oct 08,2026 14:53:23"))
+    client.put("/api/iot", json={"enabled": True, "ssid": "Home-IoT", "band": "2.4", "security": "WPA2-PSK", "password": "correct horse"})
+    assert wait_job(client, "iot")["result"]["checking"] is True
+    check = wait_job(client, "wifi_check")["result"]
+    assert [d["mac"] for d in check["devices"]] == ["AA:00:00:00:00:01"] and check["change"] == "credentials"
+    ev = monitor.store.one("SELECT * FROM events WHERE kind='wifi_check' AND title LIKE '%still on%'")
+    assert ev["severity"] == "warn" and "kid-phone" in ev["detail"] and "until the router restarts" in ev["detail"]
+    assert "Still on the IoT Wi-Fi" in [n[0] for n in monitor.notes]
+    assert [d["name"] for d in check["rejoined"]] == ["kid-tablet"]  # has the new password
+    assert "kid-tablet" in monitor.store.one("SELECT detail FROM events WHERE title LIKE '%with the new password'")["detail"]
+    assert client.get("/api/router/reboot").json()["wifi_check"]["devices"][0]["name"] == "kid-phone"
+
+    # restart, then the scan after it reports who came back
+    assert client.post("/api/router/reboot", json={"confirm": True}).status_code == 200
+    f = monitor.store.get("restart_followup")
+    assert f["restart_ts"] and f["macs"] == {"AA:00:00:00:00:01": "kid-phone"}
+    monitor.store.put("restart_followup", {**f, "restart_ts": time.time() - 400})
+    wifi.devs[0].update(ssid="Home", connection="5GHz")  # couldn't rejoin IoT: it doesn't have the new password
+    monitor.scan()
+    ev = monitor.store.one("SELECT * FROM events WHERE kind='wifi_check' ORDER BY id DESC LIMIT 1")
+    assert ev["title"] == "After the restart: 1 of 1 stayed off the IoT Wi-Fi" and ev["severity"] == "info"
+    assert monitor.store.get("restart_followup") is None
+
+
+def test_settings_only_change_isnt_checked(client, wifi):
+    client.put("/api/iot", json={"enabled": True, "ssid": "Home-IoT", "band": "both", "security": "WPA2-PSK"})
+    assert wait_job(client, "iot")["result"]["checking"] is False
+
+
+def test_nobody_left_means_no_alert(monitor, wifi):
+    before = monitor.wifi_snapshot("iot")
+    assert set(before["macs"]) == {"AA:00:00:00:00:01", "AA:00:00:00:00:02"}
+    for d in wifi.devs[:2]:
+        d.update(ssid="Home", connection="5GHz")  # both dropped off and went back to the main Wi-Fi
+    assert monitor.check_wifi_change(before, "credentials", delay=0)["devices"] == []
+    assert not monitor.store.one("SELECT 1 AS x FROM events WHERE kind='wifi_check'") and monitor.notes == []
+
+
+def test_turning_iot_off_flags_anything_still_on_it(client, monitor, wifi):
+    client.put("/api/iot", json={"enabled": False})
+    assert wait_job(client, "iot")["result"]["checking"] is True
+    check = wait_job(client, "wifi_check")["result"]
+    assert check["change"] == "off" and len(check["devices"]) == 2
+
+
+def test_turning_guest_off_flags_guests_still_on_it(client, monitor, fake_router, monkeypatch):
+    monkeypatch.setattr("orbi.monitor.WIFI_CHECK_DELAY", 0)
+    fake_router.guest = True
+    fake_router.devs[2].update(ssid="Guest", connection="2.4GHz")
+    r = client.post("/api/guest", json={"enabled": False}).json()
+    assert r["checking"] is True and r["enabled"] is False
+    check = wait_job(client, "wifi_check")["result"]
+    assert check["label"] == "Guest Wi-Fi" and [d["mac"] for d in check["devices"]] == ["AA:00:00:00:00:03"]
+    assert client.post("/api/guest", json={"enabled": True}).json()["checking"] is False  # turning on: nothing to check
+
+
+def test_restart_saves_the_router_log_first(client, monitor, fake_router):
+    order = []
+    monitor.log_fetcher = lambda: order.append("log") or []
+    fake_router.reboot = lambda: order.append("reboot")
+    assert client.post("/api/router/reboot", json={"confirm": True}).json()["note"].startswith("Rebooting")
+    assert order == ["log", "reboot"]
+
+
+def test_restart_tonight(client, monitor, fake_router):
+    r = client.post("/api/router/reboot", json={"confirm": True, "when": "tonight"}).json()
+    assert time.localtime(r["at"]).tm_hour == 3 and r["at"] > time.time() and ("reboot",) not in fake_router.calls
+    assert client.get("/api/router/reboot").json()["scheduled_at"] == r["at"]
+    monitor.restart_tick(now=r["at"] - 60)
+    assert ("reboot",) not in fake_router.calls
+    monitor.restart_tick(now=r["at"] + 30)
+    assert ("reboot",) in fake_router.calls and monitor.store.get("restart_at") is None
+    titles = [e["title"] for e in client.get("/api/events?kind=action").json()]
+    assert "Router restarted as scheduled" in titles
+    assert client.post("/api/router/reboot", json={"confirm": True, "when": "sometime"}).status_code == 400
+
+
+def test_missed_restart_is_skipped_not_done_late(client, monitor, fake_router):
+    client.post("/api/router/reboot", json={"confirm": True, "when": "tonight"})
+    monitor.restart_tick(now=monitor.store.get("restart_at") + 5 * 3600)  # the PC slept through 3 AM
+    assert ("reboot",) not in fake_router.calls and "Router restart skipped" in [n[0] for n in monitor.notes]
+
+
+def test_cancel_scheduled_restart(client, monitor):
+    client.post("/api/router/reboot", json={"confirm": True, "when": "tonight"})
+    client.delete("/api/router/reboot")
+    assert client.get("/api/router/reboot").json()["scheduled_at"] is None
+
+
+def test_next_restart_time():
+    from datetime import datetime
+    from orbi.monitor import Monitor
+    afternoon = datetime(2026, 10, 8, 14, 0).timestamp()
+    assert datetime.fromtimestamp(Monitor.next_restart_time(afternoon)) == datetime(2026, 10, 9, 3, 0)
+    small_hours = datetime(2026, 10, 9, 1, 30).timestamp()
+    assert datetime.fromtimestamp(Monitor.next_restart_time(small_hours)) == datetime(2026, 10, 9, 3, 0)
+
+
+def test_restart_sheet_warns_about_offline_satellites(client, monitor):
+    known = monitor.store.get("satellites", {})
+    for s in known.values():
+        s["online"] = False
+    monitor.store.put("satellites", known)
+    assert client.get("/api/router/reboot").json()["satellites_offline"] == ["Garage Satellite"]
+
+
+def test_advanced_shows_wps_and_new_device_hold(client):
+    from orbi import config
+    config.save({"hold_new_devices": True})
+    client.post("/api/advanced/refresh", json={})
+    wait_job(client, "advanced")
+    r = client.get("/api/advanced").json()
+    assert r["data"]["wps"] == {"enabled": True, "adjustable": False} and r["hold_new_devices"] is True

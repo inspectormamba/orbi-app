@@ -116,6 +116,13 @@ def local_macs() -> set[str]:
     return {norm_mac(line.split(",")[0].strip('"')) for line in out.splitlines() if line.strip()}
 
 
+REBOOT_CERT_WINDOW = 20 * 60  # a new router certificate seen this soon after a restart the app asked for is trusted
+WIFI_CHECK_DELAY = 120  # after a Wi-Fi change, how long devices get to drop off and rejoin before we look
+RESTART_FOLLOWUP_AFTER = 6 * 60  # after a restart, how long devices get to rejoin before we report who did
+SCHEDULED_RESTART_HOUR = 3  # "Restart tonight" means 3 AM
+NET_LABELS = {"iot": "IoT Wi-Fi", "guest": "Guest Wi-Fi", "main": "main Wi-Fi"}
+
+
 class Monitor:
     def __init__(self, store: Store, notify=lambda title, msg: None, router_factory=None, ui_factory=None, log_fetcher=None):
         self.store = store
@@ -171,7 +178,8 @@ class Monitor:
         self.reload_router()
         loops = {"health": self.health_loop, "scan": self.scan_loop, "enforce": self.enforce_loop,
                  "traffic": self.traffic_loop, "speedtest": self.speedtest_schedule_loop, "maintenance": self.maintenance_loop,
-                 "routerlog": self.routerlog_loop, "updates": self.update_loop, "weekly": self.weekly_loop}
+                 "routerlog": self.routerlog_loop, "updates": self.update_loop, "weekly": self.weekly_loop,
+                 "restart": self.restart_loop}
         self._loops = loops
         for name in loops:
             self._spawn(name)
@@ -376,6 +384,7 @@ class Monitor:
         self._update_satellites(sats, devices)
         self._update_devices(devices)
         self._watch_networks()
+        self._restart_followup(devices)
         self._verify_blocks(devices)
 
     def _update_satellites(self, sats, devices):
@@ -428,9 +437,182 @@ class Monitor:
             self.notify("Satellite wired again", f"{s['name']} is using its Ethernet backhaul again")
         return now
 
+    # ---- router restarts ----
+    def reboot_router(self):
+        """Restarts the router now. A restart wipes the router's log, so it is saved first."""
+        try:
+            self.ingest_router_log()
+        except Exception:
+            log.warning("couldn't save the router log before restarting", exc_info=True)
+        from . import routercert
+        mac = routercert.gateway_mac(config.load()["router_host"])  # before it goes down, to recognise it after
+        self.router.reboot()
+        self.note_reboot(mac)
+        followup = self.store.get("restart_followup")
+        if followup and not followup.get("restart_ts"):
+            self.store.put("restart_followup", {**followup, "restart_ts": time.time()})
+
+    @staticmethod
+    def next_restart_time(now: float | None = None) -> float:
+        """The next SCHEDULED_RESTART_HOUR o'clock (local time) after `now`."""
+        now_dt = datetime.fromtimestamp(time.time() if now is None else now)
+        at = now_dt.replace(hour=SCHEDULED_RESTART_HOUR, minute=0, second=0, microsecond=0)
+        if at <= now_dt:
+            at += timedelta(days=1)
+        return at.timestamp()
+
+    def restart_loop(self):
+        self._every(lambda: 60, self.restart_tick)
+
+    def restart_tick(self, now: float | None = None):
+        """Carries out a restart scheduled for tonight."""
+        at = self.store.get("restart_at")
+        now = time.time() if now is None else now
+        if not at or now < at:
+            return
+        self.store.put("restart_at", None)
+        when = time.strftime("%I:%M %p", time.localtime(at)).lstrip("0")
+        if now - at > 3600:  # this PC was asleep or off: don't knock the house offline at a random time
+            self.store.event("action", "Skipped the scheduled router restart", severity="warn",
+                             detail=f"It was set for {when}, but this PC was asleep or off then. Restart it from More → Router.")
+            self.notify("Router restart skipped", f"The restart set for {when} didn't happen (this PC was asleep or off)")
+            return
+        if not self.router:
+            return
+        try:
+            self.reboot_router()
+        except RouterError as e:
+            self.store.event("action", "The scheduled router restart failed", detail=str(e), severity="error")
+            return
+        self.store.event("action", "Router restarted as scheduled", detail="Internet was down for a few minutes.", severity="warn")
+
+    def offline_satellites(self) -> list[str]:
+        return [s.get("name") or s["mac"] for s in self.store.get("satellites", {}).values() if not s.get("online", True)]
+
+    # ---- after a Wi-Fi change: who is still connected ----
+    @staticmethod
+    def _on(d: dict, net: str, names: dict, ssids: set) -> bool:
+        return network_of(d, names) == net or bool(d.get("ssid") and d["ssid"] in ssids)
+
+    def wifi_snapshot(self, net: str, ssid: str | None = None) -> dict | None:
+        """The devices on `net` right now, read fresh from the router, taken just before changing it."""
+        names = self.wifi_names()
+        ssids = {x for x in (ssid, names.get(net)) if x}
+        try:
+            devices = self.router.devices()
+        except (RouterError, AttributeError):
+            return None
+        macs = {}
+        for d in devices:
+            if self._on(d, net, names, ssids):
+                label = self.device_label(d["mac"])
+                macs[d["mac"]] = d.get("name") or label if label == d["mac"] else label
+        return {"net": net, "ts": time.time(), "ssids": sorted(ssids), "macs": macs}
+
+    def _dhcp_since(self, mac: str, since: float) -> bool:
+        """Whether the router handed `mac` an address since `since`: a device that rejoins asks for one."""
+        return bool(self.store.one("SELECT 1 AS x FROM router_log WHERE kind LIKE 'DHCP IP%' AND ts >= ? AND text LIKE ?",
+                                   (since - 5, f"%{mac.upper()}%")))
+
+    def check_wifi_change(self, before: dict, change: str, delay: float | None = None) -> dict:
+        """A couple of minutes after a Wi-Fi network was turned off ("off") or got a new name or password
+        ("credentials"), finds the devices still on it. The Orbi doesn't always drop devices that were already
+        connected; they stay on, with the old password, until the router restarts."""
+        self.stop_event.wait(WIFI_CHECK_DELAY if delay is None else delay)
+        try:
+            self.ingest_router_log()  # fresh DHCP lines: who rejoined
+        except Exception:
+            log.warning("couldn't read the router log for the Wi-Fi check", exc_info=True)
+        names, ssids, net = self.wifi_names(), set(before["ssids"]), before["net"]
+        now_on = {d["mac"]: d for d in self.router.devices() if self._on(d, net, names, ssids)}
+        if change == "off":
+            stuck = list(now_on)
+        else:
+            stuck = [m for m in before["macs"] if m in now_on and not self._dhcp_since(m, before["ts"])]
+        label = NET_LABELS[net]
+        name = lambda m: before["macs"].get(m) or self.device_label(m)  # noqa: E731
+        devices = [{"mac": m, "name": name(m)} for m in stuck]
+        # On it now and not left over from before: it has the new password. A kid's device here means it was shared.
+        rejoined = [{"mac": m, "name": name(m)} for m in now_on if m not in stuck] if change == "credentials" else []
+        out = {"net": net, "label": label, "change": change, "ts": time.time(), "devices": devices, "rejoined": rejoined}
+        if rejoined:
+            self.store.event("wifi_check", f"{len(rejoined)} device{'' if len(rejoined) == 1 else 's'} on the {label} with the new password",
+                             detail=f"{', '.join(d['name'] for d in rejoined)}. If one of these shouldn't have the password, "
+                                    "it was shared; block the device or change the password again.")
+        self.state["wifi_check"] = out
+        if devices:
+            who = ", ".join(d["name"] for d in devices)
+            how = "is turned off" if change == "off" else "has a new name or password"
+            self.store.event("wifi_check", f"{len(devices)} device{'' if len(devices) == 1 else 's'} still on the {label} after the change",
+                             severity="warn", detail=f"{who}. The {label} {how}, but {'it' if len(devices) == 1 else 'they'} stayed connected "
+                                                     f"and will stay on until the router restarts (More → Router → Reboot router).")
+            self.notify(f"Still on the {label}", f"{who} stayed connected after the change. Restart the router to make it stick.")
+            self.store.put("restart_followup", {"net": net, "label": label, "change": change, "ssids": sorted(ssids),
+                                                "macs": {d["mac"]: d["name"] for d in devices}, "ts": time.time()})
+        return out
+
+    def _restart_followup(self, devices):
+        """After a restart, reports which of the devices that had stayed on a changed network came back to it."""
+        f = self.store.get("restart_followup")
+        if not f:
+            return
+        if not f.get("restart_ts"):
+            if time.time() - f["ts"] > 2 * 86400:
+                self.store.put("restart_followup", None)  # never restarted from the app; stop waiting
+            return
+        if time.time() - f["restart_ts"] < RESTART_FOLLOWUP_AFTER:
+            return
+        self.store.put("restart_followup", None)
+        names = self.wifi_names()
+        on = {d["mac"] for d in devices if self._on(d, f["net"], names, set(f["ssids"]))}
+        back = [n for m, n in f["macs"].items() if m in on]
+        gone = [n for m, n in f["macs"].items() if m not in on]
+        parts = []
+        if gone:
+            parts.append(f"Off it now: {', '.join(gone)}.")
+        if back:
+            parts.append(f"Back on it: {', '.join(back)}. {'It has' if len(back) == 1 else 'They have'} the current password"
+                         + (" (or the network is still on)." if f.get("change") == "off" else "."))
+        self.store.event("wifi_check", f"After the restart: {len(gone)} of {len(f['macs'])} stayed off the {f['label']}",
+                         severity="warn" if back else "info", detail=" ".join(parts))
+        if back:
+            self.notify(f"Back on the {f['label']}", f"{', '.join(back)} rejoined after the restart")
+
+    def note_reboot(self, router_mac: str | None):
+        """This app just asked the router to restart: it will come back with a new certificate."""
+        self.store.put("reboot_router_mac", router_mac)
+        self.store.put("reboot_requested", time.time())
+
+    def _trust_after_reboot(self) -> bool:
+        """Trusts the router's new certificate without asking if it was made during a restart this app asked for."""
+        since = self.store.get("reboot_requested")
+        if not since or time.time() - since > REBOOT_CERT_WINDOW:
+            return False
+        from . import routercert
+        host = config.load()["router_host"]
+        try:
+            fp = routercert.renewed_since(host, since)
+        except OSError:
+            return False
+        if not fp:
+            return False
+        want, seen = self.store.get("reboot_router_mac"), routercert.gateway_mac(host)
+        if not want or seen != want:  # answered from different hardware than before the restart
+            log.warning("new certificate from %s not trusted automatically: hardware address %s, expected %s", host, seen, want)
+            return False
+        routercert.trust(host, fp)
+        self.store.put("reboot_requested", None)  # one certificate per restart
+        self.store.event("router_cert", "Trusted the router's new security certificate", severity="info",
+                         detail=f"The Orbi makes a new one each time it restarts; this one was created during the restart "
+                                f"Orbi Control asked for at {time.strftime('%I:%M %p', time.localtime(since)).lstrip('0')}. {fp[:16]}…")
+        self.reload_router()
+        return True
+
     def _cert_alert(self, error: str):
         """One alert per new certificate when the router stops presenting the pinned one."""
         if "security certificate changed" not in error:
+            return
+        if self._trust_after_reboot():
             return
         try:
             from .routercert import presented

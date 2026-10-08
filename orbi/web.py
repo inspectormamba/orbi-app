@@ -82,6 +82,10 @@ class ConfirmBody(BaseModel):
     confirm: bool = False
 
 
+class RebootBody(ConfirmBody):
+    when: str = "now"  # now | tonight
+
+
 class SettingsPatch(BaseModel):
     health_interval: int | None = None
     scan_interval: int | None = None
@@ -617,22 +621,48 @@ def create_app(monitor: Monitor) -> FastAPI:
     @app.post("/api/guest")
     def set_guest(body: EnabledBody):
         try:
+            before = None if body.enabled else monitor.wifi_snapshot("guest")
             router().set_guest_wifi(body.enabled)
             monitor.state.pop("guest", None)  # re-read below with the new state
             store.event("action", f"Guest Wi-Fi turned {'on' if body.enabled else 'off'}")
-            return router().guest_wifi()
+            g = router().guest_wifi()
         except RouterError as e:
             raise HTTPException(502, str(e))
+        # Guests may stay connected after it's turned off; look again in a couple of minutes.
+        checking = bool(before) and monitor.run_job("wifi_check", lambda: monitor.check_wifi_change(before, "off"))
+        return g | {"checking": checking}
+
+    @app.get("/api/router/reboot")
+    def reboot_info():
+        return {"scheduled_at": store.get("restart_at"), "satellites_offline": monitor.offline_satellites(),
+                "wifi_check": monitor.state.get("wifi_check")}
 
     @app.post("/api/router/reboot")
-    def reboot(body: ConfirmBody):
+    def reboot(body: RebootBody):
         if not body.confirm:
             raise HTTPException(400, "Confirmation required")
+        if body.when not in ("now", "tonight"):
+            raise HTTPException(400, "Restart now or tonight")
+        router()
+        if body.when == "tonight":
+            at = monitor.next_restart_time()
+            store.put("restart_at", at)
+            when = time.strftime("%I:%M %p", time.localtime(at)).lstrip("0")
+            store.event("action", f"Router restart scheduled for {when}", detail="Internet will be down for a few minutes then.")
+            return {"ok": True, "at": at, "note": f"The router will restart at {when}"}
         try:
-            router().reboot()
+            monitor.reboot_router()
         except RouterError as e:
             raise HTTPException(502, str(e))
+        store.put("restart_at", None)  # done now instead
         store.event("action", "Router reboot requested", detail="Internet will be down for a few minutes.", severity="warn")
+        return {"ok": True, "note": "Rebooting — back in a few minutes"}
+
+    @app.delete("/api/router/reboot")
+    def cancel_reboot():
+        if store.get("restart_at"):
+            store.put("restart_at", None)
+            store.event("action", "Scheduled router restart cancelled")
         return {"ok": True}
 
     @app.get("/api/firmware")
@@ -771,7 +801,7 @@ def create_app(monitor: Monitor) -> FastAPI:
         if adv["data"] is None and not monitor.jobs.get("advanced", {}).get("running"):
             monitor.run_job("advanced", monitor.refresh_advanced)
         st = monitor.state
-        return {"data": adv["data"], "ts": adv["ts"], "job": monitor.jobs.get("advanced"),
+        return {"data": adv["data"], "ts": adv["ts"], "job": monitor.jobs.get("advanced"), "hold_new_devices": bool(config.load().get("hold_new_devices")),
                 "info": st["info"], "system": st["system"], "satellites": st["satellites"], "access_control": st["access_control"]}
 
     @app.post("/api/advanced/refresh")
@@ -1185,8 +1215,13 @@ def create_app(monitor: Monitor) -> FastAPI:
             router_safe(ssid, "network name")
             router_safe(body.password or "", "password")
         router()
+        old_ssid = ((monitor.state.get("iot") or {}).get("data") or {}).get("ssid")
+        # The Orbi doesn't always drop devices already connected when the network gets a new name or password
+        # or is turned off, so afterwards the app looks for devices that stayed on.
+        check = not body.enabled or bool(body.password) or (old_ssid is not None and ssid != old_ssid)
 
         def work():
+            before = monitor.wifi_snapshot("iot", old_ssid) if check else None
             with monitor.ui_factory() as ui:
                 got = ui.set_iot(body.enabled, ssid, body.band, body.security, body.password or None)
             band = {"2.4": "2.4 GHz", "5": "5 GHz", "both": "2.4 + 5 GHz"}[got["band"]]
@@ -1195,7 +1230,9 @@ def create_app(monitor: Monitor) -> FastAPI:
                         if body.enabled else "IoT devices are disconnected until it's turned back on",
                         severity="info" if body.enabled else "warn")
             monitor.refresh_advanced()
-            return got
+            checking = bool(before) and monitor.run_job(
+                "wifi_check", lambda: monitor.check_wifi_change(before, "credentials" if body.enabled else "off"))
+            return got | {"checking": checking}
         if not monitor.run_job("iot", work):
             raise HTTPException(409, "An IoT Wi-Fi change is already running")
         return {"ok": True}

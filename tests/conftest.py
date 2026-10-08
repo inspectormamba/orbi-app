@@ -5,7 +5,7 @@ from orbi.monitor import Monitor
 from orbi.router import RouterError
 from orbi.store import Store
 
-ROUTER_MAC = "C8:9E:43:C2:E3:33"
+ROUTER_MAC = "C8:9E:43:00:00:01"
 SAT_MAC = "C8:9E:43:C4:3B:94"
 
 
@@ -119,6 +119,7 @@ def monitor(tmp_config, fake_router, monkeypatch):
     monkeypatch.setattr("orbi.monitor.house_online", lambda host: False)
     monkeypatch.setattr("orbi.monitor.internet_route", lambda host: {"vpn": False, "local_ip": "192.168.1.58"})
     monkeypatch.setattr("orbi.monitor.adapter_name", lambda ip: "")
+    monkeypatch.setattr("orbi.routercert.gateway_mac", lambda host: ROUTER_MAC)
     store = Store(tmp_config / "orbi.db")
     notes = []
     m = Monitor(store, notify=lambda t, msg: notes.append((t, msg)), router_factory=lambda: fake_router,

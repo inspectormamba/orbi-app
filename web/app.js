@@ -646,6 +646,7 @@ async function renderMore() {
   const rpw = h("input", { type: "password", autocomplete: "off", placeholder: settings.router_configured ? "••••••••" : "Orbi admin password" });
   const certInfo = h("div", {});
   const backupInfo = h("div", {});
+  const restartInfo = h("div", {});
   const routerFacts = [["Model", st.info?.model], ["Firmware", st.info?.firmware], ["Uptime", st.router_uptime],
     ["Memory used", st.system?.memory != null ? `${st.system.memory}%` : null],
     ["Access Control", st.access_control == null ? null : st.access_control ? "On (needed for device blocking)" : "Off"]].filter(([, v]) => v != null && v !== "");
@@ -654,7 +655,9 @@ async function renderMore() {
     h("label", { class: "field" }, `Admin password for ${settings.router_host}`, rpw),
     h("button", { class: "btn", onclick: (e) => act(e.currentTarget, () => api("/api/settings/router-password", { body: { password: rpw.value } }), "Router password saved").then(() => (rpw.value = "")) }, "Update password"),
     h("button", { class: "btn", onclick: (e) => act(e.currentTarget, async () => { const f = await api("/api/firmware"); toast(f.available ? `Firmware ${f.available} is available` : `Firmware ${f.current} is up to date`); }) }, "Check for firmware update"),
-    h("button", { class: "btn danger", onclick: rebootSheet }, "Reboot router…"), certInfo, backupInfo);
+    h("button", { class: "btn danger", onclick: rebootSheet }, "Reboot router…"), restartInfo, certInfo, backupInfo);
+  api("/api/router/reboot").then((r) => r.scheduled_at && fill(restartInfo, h("div", { class: "note" }, `Router restart scheduled for ${fmtAt(r.scheduled_at)}. `,
+    h("button", { class: "btn small", onclick: (e) => act(e.currentTarget, () => api("/api/router/reboot", { method: "DELETE" }), "Scheduled restart cancelled").then(() => restartInfo.replaceChildren()) }, "Cancel")))).catch(() => {});
   api("/api/router-backup").then((b) => fill(backupInfo, h("div", { class: "group-label" }, "Settings backup"),
     h("div", { class: "muted small" }, b.last ? `Last backup ${fmtWhen(b.last.ts)} · ${b.files.length} kept on this PC (${b.folder}). Backed up weekly; restore from the router's Backup Settings page.` : "Not backed up yet. The app backs the router's settings up to this PC every week."),
     h("button", { class: "btn small", style: "margin-top:6px", onclick: (e) => act(e.currentTarget, async () => {
@@ -737,11 +740,36 @@ async function installUpdate(btn, version) {
   }
 }
 
-function rebootSheet() {
+const fmtAt = (ts) => new Date(ts * 1000).toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" });
+
+function rebootSheet(why) {
+  const reason = typeof why === "string" ? why : "";  // also used as a click handler
+  const info = h("div", {});
+  const restart = (when) => (e) => act(e.currentTarget, () => api("/api/router/reboot", { body: { confirm: true, when } })).then(() => { closeSheet(); if (currentTab === "more") renderMore().catch(() => {}); });
   openSheet(h("h3", {}, "Reboot the router?"),
-    h("p", { style: "margin:0" }, "Internet and Wi-Fi will be down for about 3–5 minutes while the Orbi restarts. Satellites reconnect on their own."),
-    h("div", { class: "btns" }, h("button", { class: "btn", onclick: closeSheet }, "Cancel"),
-      h("button", { class: "btn danger solid", onclick: (e) => act(e.currentTarget, () => api("/api/router/reboot", { body: { confirm: true } }), "Rebooting — back in a few minutes").then(closeSheet) }, "Reboot now")));
+    reason ? h("p", {}, reason) : null,
+    h("p", { style: "margin:0" }, "Internet and Wi-Fi will be down for about 3–5 minutes while the Orbi restarts. Satellites reconnect on their own. The app saves the router's log first, since a restart clears it."),
+    info,
+    h("div", { class: "btns" }, h("button", { class: "btn", onclick: closeSheet }, reason ? "Not now" : "Cancel"),
+      h("button", { class: "btn", onclick: restart("tonight") }, "Tonight at 3 AM"),
+      h("button", { class: "btn danger solid", onclick: restart("now") }, "Restart now")));
+  api("/api/router/reboot").then((r) => fill(info,
+    r.satellites_offline.length ? h("div", { class: "note" }, `${r.satellites_offline.join(", ")} ${r.satellites_offline.length === 1 ? "is" : "are"} offline right now. A satellite that misses a change can come back with the old settings, so check it's plugged in and wait until it's back before restarting.`) : null,
+    r.scheduled_at ? h("p", { class: "muted small" }, `A restart is already scheduled for ${fmtAt(r.scheduled_at)}.`) : null)).catch(() => {});
+}
+
+// After a Wi-Fi network is turned off or gets a new name or password, the server looks (about 2 minutes later)
+// for devices that stayed connected; the Orbi doesn't always drop them. Offer a restart if any did.
+async function afterWifiChange(r) {
+  if (!r || !r.checking) return;
+  let c;
+  try { c = await waitJob("wifi_check", "Checking which devices are still connected"); } catch (e) { toast(e.message); return; }
+  if (!c) return;
+  if (!c.devices.length) { toast(`Checked: nothing stayed on the ${c.label} from before the change`); return; }
+  const names = c.devices.map((d) => d.name).join(", ");
+  const one = c.devices.length === 1;
+  toast(`${names} ${one ? "is" : "are"} still on the ${c.label}`);
+  rebootSheet(`${names} ${one ? "is" : "are"} still connected to the ${c.label} ${c.change === "off" ? "even though it's turned off" : "with the old password"}. ${one ? "It stays" : "They stay"} on until the router restarts.`);
 }
 
 // ---------- background router jobs ----------
@@ -968,7 +996,7 @@ async function renderAdvanced() {
     table(["Service", "Outside", "Inside", "Device"], (d.port_forwards || []).map((x) => [x.name, x.external_port, x.internal_port, devName(x.ip) ? `${devName(x.ip)} (${x.ip})` : x.ip])),
     h("div", { class: "muted small" }, "Manual rules are added on the router's Port Forwarding page."));
 
-  setView(head, wan, lan, h("div", { class: "group-label" }, "Wi-Fi networks"), wifi, guestCard(), iotCard(), fw, ports);
+  setView(head, wan, lan, h("div", { class: "group-label" }, "Wi-Fi networks"), wifi, guestCard(), iotCard(), wpsCard(d.wps, r.hold_new_devices), fw, ports);
 }
 
 // ---------- remote access (More): the Orbi's VPN server + Dynamic DNS ----------
@@ -1097,7 +1125,7 @@ function upnpSheet(toggle, users) {
 function guestCard() {
   const guest = h("section", { class: "card" }, h("h2", {}, "Guest Wi-Fi"), h("div", { class: "muted small" }, h("span", { class: "spinner" })));
   api("/api/guest").then((g) => {
-    const toggle = h("input", { type: "checkbox", checked: g.enabled, onchange: (e) => act(null, () => api("/api/guest", { body: { enabled: e.target.checked } }), `Guest Wi-Fi ${e.target.checked ? "on" : "off"}`).catch(() => (e.target.checked = !e.target.checked)) });
+    const toggle = h("input", { type: "checkbox", checked: g.enabled, onchange: (e) => act(null, () => api("/api/guest", { body: { enabled: e.target.checked } }), `Guest Wi-Fi ${e.target.checked ? "on" : "off"}`).then(afterWifiChange, () => (e.target.checked = !e.target.checked)) });
     const pw = h("span", {}, "••••••••");
     guest.replaceChildren(h("h2", {}, "Guest Wi-Fi"), h("label", { class: "switch" }, "Guest network", toggle),
       h("dl", { class: "kv" }, h("dt", {}, "Name"), h("dd", {}, g.ssid || "—"), h("dt", {}, "Password"),
@@ -1129,15 +1157,26 @@ function iotCard() {
   return card;
 }
 
+function wpsCard(w, hold) {
+  if (!w || w.enabled == null) return null;
+  return h("section", { class: "card" }, h("h2", {}, "WPS (Sync button)"),
+    h("dl", { class: "kv" }, h("dt", {}, "WPS"), h("dd", {}, w.enabled ? (w.adjustable ? "On" : "On (this firmware can't turn it off)") : "Off"),
+      h("dt", {}, "New devices"), h("dd", {}, hold ? "Held until you approve them" : "Allowed straight away")),
+    w.enabled ? h("div", { class: "muted small" }, "Pressing Sync on the router or any satellite opens a 2-minute window in which a device that supports WPS (Windows PCs, printers, some TVs and game consoles; not iPhones, iPads, Apple Watches or most current Android phones) can join the main Wi-Fi without the password, and a Windows PC can then show the password. The router doesn't log it. ",
+      hold ? "A device that joins this way is new to the app, so it stays blocked until you approve it." : "Turn on \"Hold new devices\" (Family → Everyone else) so a device that joins this way stays blocked until you approve it.",
+      w.adjustable ? " You can turn WPS off on the router's Advanced Wireless page." : "") : null);
+}
+
 // ---------- firewall rules (Advanced) ----------
 async function routerJob(name, label, done) {
-  try { await waitJob(name, label); }
+  let result;
+  try { result = await waitJob(name, label); }
   catch (e) {
     if (/Can't reach/.test(e.message)) return { note: "Lost contact while the router applied it. Refresh Advanced in a minute to confirm." };
     throw e;
   }
   closeSheet(); renderAdvanced().catch(() => {});
-  return { note: done };
+  return { note: done, result };
 }
 
 function firewallRuleSheet(rule, index) {
@@ -1211,12 +1250,14 @@ function iotSheet(iot) {
   const sync = () => { fields.hidden = !on.checked; };
   on.addEventListener("change", sync); sync();
   openSheet(h("h3", {}, "IoT Wi-Fi"), h("label", { class: "switch" }, "IoT network on", on), fields,
-    h("p", { class: "muted small" }, "Saving restarts Wi-Fi on the router and satellites for about a minute, and every wireless device reconnects. Changing the name or password, or turning the network off, disconnects IoT devices until each one is set up again."),
+    h("p", { class: "muted small" }, "Saving can pause Wi-Fi on the router and satellites for about a minute. The Orbi doesn't always drop devices that were already connected, so after a new name or password, or turning it off, the app checks who stayed on and offers to restart the router."),
     h("div", { class: "btns" }, h("button", { class: "btn", onclick: closeSheet }, "Cancel"),
       h("button", { class: "btn primary", onclick: (e) => act(e.currentTarget, async () => {
         await api("/api/iot", { method: "PUT", body: { enabled: on.checked, ssid: ssid.value, band: band.value, security: sec.value, password: pw.value || null } });
         pw.value = "";
-        return routerJob("iot", "Saving (Wi-Fi restarts)", "IoT Wi-Fi saved");
+        const r = await routerJob("iot", "Saving (Wi-Fi restarts)", "IoT Wi-Fi saved");
+        afterWifiChange(r.result);
+        return r;
       }) }, "Save")));
 }
 
