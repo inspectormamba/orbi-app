@@ -247,7 +247,7 @@ def create_app(monitor: Monitor) -> FastAPI:
         ip = client_ip(request)
         if ip in ("127.0.0.1", "::1"):
             return "this PC"
-        name = monitor.device_by_ip(ip)
+        name = monitor.identify(ip)[0]
         return name if name.endswith(ip) else f"{name} ({ip})"
 
     def require_pin(pin: str, request: Request, settings: dict, wrong: str = "Wrong PIN") -> str:
@@ -256,10 +256,12 @@ def create_app(monitor: Monitor) -> FastAPI:
         ip = client_ip(request)
         wait = throttle.attempt(ip)
         if wait:
+            monitor.wrong_pin(ip, who(request), monitor.identify(ip)[1])  # still guessing while locked out
             raise HTTPException(429, f"Too many wrong PINs. Try again in {fmt_duration(wait)}.")
         label = auth.pin_label(pin, settings)
         if label is None:
             throttle.failure(ip)
+            monitor.wrong_pin(ip, who(request), monitor.identify(ip)[1])
             raise HTTPException(401, wrong)
         throttle.success(ip)
         return label

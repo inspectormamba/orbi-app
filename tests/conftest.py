@@ -120,6 +120,7 @@ def monitor(tmp_config, fake_router, monkeypatch):
     monkeypatch.setattr("orbi.monitor.internet_route", lambda host: {"vpn": False, "local_ip": "192.168.1.58"})
     monkeypatch.setattr("orbi.monitor.adapter_name", lambda ip: "")
     monkeypatch.setattr("orbi.routercert.gateway_mac", lambda host: ROUTER_MAC)
+    monkeypatch.setattr("orbi.monitor.arp_mac", lambda ip: None)
     store = Store(tmp_config / "orbi.db")
     notes = []
     m = Monitor(store, notify=lambda t, msg: notes.append((t, msg)), router_factory=lambda: fake_router,

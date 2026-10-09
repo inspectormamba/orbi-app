@@ -105,6 +105,12 @@ def network_of(snap: dict, names: dict) -> str:
     return "main" if ssid or conn else ""
 
 
+def arp_mac(ip: str) -> str | None:
+    """The hardware address this PC's ARP table has for a LAN address right now (e.g. AA:BB:..), or None."""
+    from . import routercert
+    return routercert.gateway_mac(ip)
+
+
 def local_macs() -> set[str]:
     """MACs of this PC's adapters, so the app never blocks the machine it runs on."""
     import subprocess
@@ -117,6 +123,7 @@ def local_macs() -> set[str]:
 
 
 REBOOT_CERT_WINDOW = 20 * 60  # a new router certificate seen this soon after a restart the app asked for is trusted
+PIN_ALERT_AFTER = 3  # wrong PINs from one address within an hour before it's reported as guessing
 WIFI_CHECK_DELAY = 120  # after a Wi-Fi change, how long devices get to drop off and rejoin before we look
 RESTART_FOLLOWUP_AFTER = 6 * 60  # after a restart, how long devices get to rejoin before we report who did
 SCHEDULED_RESTART_HOUR = 3  # "Restart tonight" means 3 AM
@@ -148,6 +155,10 @@ class Monitor:
         self._pc_fails = 0
         self._missing_sats: dict[str, int] = {}
         self._backhaul_changes: dict[str, tuple[str, int]] = {}  # mac -> (new kind, scans seen in a row)
+        self._arp_cache: dict[str, tuple[str | None, float]] = {}  # ip -> (mac, when looked up)
+        self._wrong_pins: dict[str, list[float]] = {}  # ip -> times of wrong PINs in the last hour
+        self._pin_alerted: dict[str, float] = {}  # ip -> when the last "guessing the PIN" alert went out
+        self._address_mismatch: dict[str, float] = {}  # "mac ip" -> first scan that saw it
         self.protected = local_macs()
 
     # ---- router ----
@@ -383,6 +394,7 @@ class Monitor:
         self.state.update(scan_error=None, last_scan=time.time())
         self._update_satellites(sats, devices)
         self._update_devices(devices)
+        self._watch_addresses(devices)
         self._watch_networks()
         self._restart_followup(devices)
         self._verify_blocks(devices)
@@ -656,6 +668,75 @@ class Monitor:
         if not first_scan:
             self.store.put("first_scan_done", True)
 
+    def _dhcp_leases(self, days: float = 3) -> dict[str, str]:
+        """ip -> the MAC the router's DHCP most recently gave it to, from the router log."""
+        from .report import DHCP
+        leases = {}
+        for r in self.store.q("SELECT text FROM router_log WHERE kind LIKE 'DHCP IP%' AND ts > ? ORDER BY ts", (time.time() - days * 86400,)):
+            if m := DHCP.search(r["text"]):
+                leases[m.group(1)] = m.group(2).upper()
+        return leases
+
+    def _watch_addresses(self, devices):
+        """Alerts when a device is on an address the router's DHCP last gave to a different device. Its address
+        was set by hand, which is how a laptop passes as, say, the Echo in an unrestricted profile.
+        A mismatch counts only once the router log has been read again after it was first seen, so a device
+        that just got that address from the router (its log line not collected yet) isn't reported."""
+        leases = self._dhcp_leases()
+        ingested = self.state.get("log_ingested") or 0
+        now, seen = time.time(), set()
+        alerted = self.store.get("address_alerted", {})
+        for d in devices:
+            owner = leases.get(d["ip"])
+            if not owner or owner == d["mac"] or d["mac"] in self.protected:
+                continue
+            key = f"{d['mac']} {d['ip']}"
+            seen.add(key)
+            first = self._address_mismatch.setdefault(key, now)
+            if ingested <= first or now - alerted.get(key, 0) < 86400:
+                continue
+            alerted[key] = now
+            who, rightful = self.device_label(d["mac"]), self.device_label(owner)
+            self.store.event("address", f"{who} is using {rightful}'s address",
+                             detail=f"The router gave {d['ip']} to {rightful}, but {who} ({d['mac']}) is using it, so its address was "
+                                    "set by hand. That's a way to pass as another device. If you don't know it, block it in Devices.",
+                             severity="error", mac=d["mac"])
+            self.notify("Device using another's address", f"{who} is using {rightful}'s address ({d['ip']})")
+        self._address_mismatch = {k: v for k, v in self._address_mismatch.items() if k in seen}
+        self.store.put("address_alerted", {k: v for k, v in alerted.items() if now - v < 86400})
+
+    def identify(self, ip: str) -> tuple[str, str]:
+        """(name, MAC) of whoever is at `ip` right now, for live requests. Goes by the hardware address in this
+        PC's ARP table, because the address a scan last saw a device on can since have been taken by another
+        device; falls back to that last-seen address. Lookups are cached for 30 seconds."""
+        mac, when = self._arp_cache.get(ip, (None, 0.0))
+        if time.time() - when > 30:
+            mac = arp_mac(ip) if re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", ip or "") else None
+            self._arp_cache[ip] = (mac, time.time())
+        owner = self.mac_by_ip(ip)
+        if not mac:
+            return self.device_by_ip(ip), owner
+        if not self.store.one("SELECT mac FROM devices WHERE mac=?", (mac,)):
+            return f"unknown device {mac}", mac
+        if owner and owner != mac:
+            return f"{self.device_label(mac)}, using {self.device_label(owner)}'s address", mac
+        return self.device_label(mac), mac
+
+    def wrong_pin(self, ip: str, who: str, mac: str = ""):
+        """A wrong (or locked-out) PIN attempt. The PIN_ALERT_AFTER-th within an hour from one address is
+        reported, then at most once an hour per address."""
+        now = time.time()
+        hits = [t for t in self._wrong_pins.get(ip, []) if now - t < 3600] + [now]
+        self._wrong_pins[ip] = hits
+        if len(hits) < PIN_ALERT_AFTER or now - self._pin_alerted.get(ip, 0) < 3600:
+            return
+        self._pin_alerted[ip] = now
+        self.store.event("pin_guess", f"Wrong PINs from {who}",
+                         detail=f"{len(hits)} wrong PINs for Orbi Control in the last hour. If that wasn't you, "
+                                "someone is trying to guess it: block the device in Devices, and change the PIN if you think it's known.",
+                         severity="error", mac=mac)
+        self.notify("Someone is guessing the PIN", f"{len(hits)} wrong PINs from {who}")
+
     def _handle_new_device(self, d, alert):
         """A never-seen MAC. If its name matches devices in a profile, it's probably that person's device
         with a new private address, but a name is easy to fake (rename a phone to match a parent's laptop),
@@ -855,6 +936,10 @@ class Monitor:
         self._every(lambda: config.load()["log_interval"], self.ingest_router_log)
 
     def ingest_router_log(self):
+        self._ingest_router_log()
+        self.state["log_ingested"] = time.time()
+
+    def _ingest_router_log(self):
         if not self.router:
             return
         entries = self.log_fetcher()
@@ -1102,9 +1187,44 @@ class Monitor:
             if line:
                 self.store.event("report", f"Weekly report: {p['name']}", detail=line)
                 out.append({"profile": p["name"], "summary": line})
+        if line := self.unrestricted_review(now):
+            out.append({"profile": None, "summary": line})
         if out:
             self.notify("Weekly reports", "See Family for what was blocked this week")
         return out
+
+    def unrestricted_review(self, now=None) -> str:
+        """Weekly: the devices with no limits at all that were on this week, so a kid's device hiding in an
+        adults' profile (renamed to look like an Echo, say) gets looked at. Those that joined this week or
+        tried to get around the content filter are listed first."""
+        from . import report
+        now = now or datetime.now()
+        since = now.timestamp() - 7 * 86400
+        rules = self.store.q("SELECT * FROM rules")
+        restricted = {p["id"] for p in self.store.q("SELECT * FROM profiles")
+                      if parental.is_restricted(p, [r for r in rules if r["profile_id"] == p["id"]], now)}
+        default = self.default_profile_id()
+        free = [d for d in self.store.q("SELECT mac, profile_id, manual_block, online, last_seen, first_seen FROM devices WHERE last_seen > ?", (since,))
+                if parental.effective_profile(d, default, now) not in restricted and not d["manual_block"] and d["mac"] not in self.protected]
+        if not free:
+            return ""
+        bypass = report.build(self.store, {d["mac"] for d in free}, since)["devices"]
+        flagged = []
+        for d in free:
+            why = []
+            if (d["first_seen"] or 0) > since:
+                why.append("new this week")
+            if n := sum(bypass.get(d["mac"], {}).get("bypass", {}).values()):
+                why.append(f"tried to get around the filter {n}×")
+            if why:
+                flagged.append(f"{self.device_label(d['mac'])} ({', '.join(why)})")
+        line = f"{len(free)} devices had no bedtime or limits this week."
+        if flagged:
+            line += " Look at: " + "; ".join(flagged) + "."
+        line += " If one of them is a kid's, move it to their profile in Devices."
+        self.store.event("report", "Weekly check: devices without limits", detail=line,
+                         severity="warn" if flagged else "info")
+        return line
 
     # ---- which Wi-Fi network kids' devices are on ----
     def wifi_names(self) -> dict:

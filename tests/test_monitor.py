@@ -4,7 +4,7 @@ import time
 import orbi.monitor as monitor_mod
 from orbi import auth, parental
 
-from .conftest import SAT_MAC
+from .conftest import ROUTER_MAC, SAT_MAC
 
 
 def add_profile(m, name="Kid", paused=None):
@@ -361,3 +361,40 @@ def test_only_real_upstream_answers_count():
     failed = dns.message.make_response(q)
     failed.set_rcode(dns.rcode.SERVFAIL)
     assert not monitor_mod.upstream_answered(failed)
+
+
+def _lease(store, ip, mac, ts):
+    store.x("INSERT INTO router_log(ts,kind,source,text) VALUES(?,?,?,?)",
+            (ts, f"DHCP IP: ({ip})", "", f"[DHCP IP: ({ip})] to MAC address {mac}, Thursday"))
+
+
+def test_alert_when_a_device_takes_another_devices_address(monitor, fake_router):
+    """A laptop sets its address by hand to the Echo's: the router's DHCP gave that address to someone else."""
+    import time as _t
+    monitor.scan()
+    _lease(monitor.store, "192.168.1.20", "AA:00:00:00:00:01", _t.time() - 3600)  # kid-phone's lease
+    fake_router.devs.append(fake_router._dev("AA:00:00:00:00:09", "Echo-Spot", "192.168.1.20", ROUTER_MAC))
+    monitor.scan()  # seen, but the router log hasn't been read since: maybe it just got a lease
+    assert not monitor.store.q("SELECT * FROM events WHERE kind='address'")
+    monitor.state["log_ingested"] = _t.time() + 1
+    monitor.scan()
+    monitor.scan()  # once a day, not every scan
+    ev = monitor.store.q("SELECT * FROM events WHERE kind='address'")
+    assert len(ev) == 1 and ev[0]["title"].endswith("is using kid-phone's address") and ev[0]["mac"] == "AA:00:00:00:00:09"
+    assert ev[0]["severity"] == "error"
+
+
+def test_no_address_alert_for_a_fresh_lease(monitor, fake_router):
+    """The router handed the address on: the latest lease names the new device."""
+    import time as _t
+    monitor.scan()
+    _lease(monitor.store, "192.168.1.20", "AA:00:00:00:00:01", _t.time() - 7200)
+    _lease(monitor.store, "192.168.1.20", "AA:00:00:00:00:09", _t.time() - 60)
+    fake_router.devs[0]["ip"] = "192.168.1.30"  # kid-phone moved on to another address
+    _lease(monitor.store, "192.168.1.30", "AA:00:00:00:00:01", _t.time() - 30)
+    fake_router.devs.append(fake_router._dev("AA:00:00:00:00:09", "new-phone", "192.168.1.20", ROUTER_MAC))
+    monitor.state["log_ingested"] = _t.time() + 1
+    monitor.scan()
+    monitor.state["log_ingested"] = _t.time() + 2
+    monitor.scan()
+    assert not monitor.store.q("SELECT * FROM events WHERE kind='address'")

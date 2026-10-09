@@ -93,8 +93,27 @@ def test_weekly_reports_once_a_week(monitor, monkeypatch):
     monkeypatch.setattr("orbi.monitor.time.time", lambda: datetime(2026, 10, 11, 18, 30).timestamp())
     monitor._weekly_tick(sunday)
     monitor._weekly_tick(sunday)
-    ev = monitor.store.q("SELECT * FROM events WHERE kind='report'")
+    ev = monitor.store.q("SELECT * FROM events WHERE kind='report' AND title LIKE 'Weekly report%'")
     assert len(ev) == 1 and ev[0]["title"] == "Weekly report: Kid" and "chatgpt 2" in ev[0]["detail"]
+    review = monitor.store.q("SELECT * FROM events WHERE kind='report' AND title LIKE 'Weekly check%'")
+    assert len(review) == 1 and "2 devices had no bedtime" in review[0]["detail"]  # kid-tablet and tv
+
+
+def test_weekly_check_flags_unrestricted_devices(monitor, fake_router):
+    """A kid's laptop hiding in an adults' profile: new this week, and trying to get around the filter."""
+    monitor.scan()
+    pid = monitor.store.x("INSERT INTO profiles(name, created) VALUES('Kid', 0)")
+    monitor.store.x("INSERT INTO rules(profile_id,label,days,start,end,enabled) VALUES(?,?,?,?,?,1)", (pid, "Bedtime", "0123456", "21:00", "07:00"))
+    monitor.store.x("UPDATE devices SET profile_id=? WHERE mac IN ('AA:00:00:00:00:01','AA:00:00:00:00:03')", (pid,))
+    now = datetime.now()
+    monitor.store.x("UPDATE devices SET first_seen=? WHERE mac='AA:00:00:00:00:02'", (now.timestamp() - 3600,))
+    monitor.store.x("INSERT INTO router_log(ts,kind,source,text) VALUES(?,?,?,?)",
+                    (now.timestamp() - 60, "service blocked: Block-External-DNS-2", "192.168.1.21",
+                     "[service blocked: Block-External-DNS-2] from source 192.168.1.21"))
+    line = monitor.unrestricted_review(now)
+    assert line.startswith("1 devices had no bedtime") and "kid-tablet (new this week, tried to get around the filter 1×)" in line
+    ev = monitor.store.one("SELECT * FROM events WHERE title='Weekly check: devices without limits'")
+    assert ev["severity"] == "warn"
 
 
 # ---------- kids' devices on the IoT / Guest Wi-Fi ----------

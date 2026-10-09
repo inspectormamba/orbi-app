@@ -218,3 +218,33 @@ def test_page_loads_current_script(client):
     assert m and m.group(1) == hashlib.sha256(js).hexdigest()[:12]  # a new script means a new address
     assert re.search(r'/static/app\.css\?v=[0-9a-f]{12}', html.text)
     assert client.get(f"/static/app.js?v={m.group(1)}").headers["cache-control"] == "no-cache"
+
+
+def test_wrong_pins_raise_an_alert(client, monitor):
+    """A kid guessing the PIN is reported (once an hour), not just locked out."""
+    setup_pin(client)
+    client.post("/api/logout")
+    client.cookies.clear()
+    for _ in range(2):
+        client.post("/api/login", json={"pin": "000000"})
+    assert not monitor.store.q("SELECT * FROM events WHERE kind='pin_guess'")
+    for _ in range(10):  # the rest run into the lockout and still count
+        client.post("/api/login", json={"pin": "000000"})
+    ev = monitor.store.q("SELECT * FROM events WHERE kind='pin_guess'")
+    assert len(ev) == 1 and ev[0]["severity"] == "error" and "3 wrong PINs" in ev[0]["detail"]
+    assert "Someone is guessing the PIN" in [n[0] for n in monitor.notes]
+
+
+def test_requests_named_by_hardware_address(monitor, monkeypatch):
+    """A device that took another's address by hand is named as itself, not as the device it's posing as."""
+    monitor.scan()  # kid-phone .20, kid-tablet .21, tv .22
+    monkeypatch.setattr("orbi.monitor.arp_mac", lambda ip: "AA:00:00:00:00:02")
+    assert monitor.identify("192.168.1.20") == ("kid-tablet, using kid-phone's address", "AA:00:00:00:00:02")
+    assert monitor.identify("192.168.1.21") == ("kid-tablet", "AA:00:00:00:00:02")
+    monkeypatch.setattr("orbi.monitor.arp_mac", lambda ip: "02:11:22:33:44:55")
+    monitor._arp_cache.clear()
+    assert monitor.identify("192.168.1.20")[0] == "unknown device 02:11:22:33:44:55"
+    monkeypatch.setattr("orbi.monitor.arp_mac", lambda ip: None)
+    monitor._arp_cache.clear()
+    assert monitor.identify("192.168.1.20")[0] == "kid-phone"  # not in the ARP table: last address seen
+    assert monitor.identify("testclient")[0] == "Device at testclient"
