@@ -2,6 +2,16 @@
 
 What changed in each version, newest first. The same notes appear in the app under More → Updates.
 
+## 1.1.7 (2026-10-08)
+
+### Catching a device that's trying to get around the controls
+- Someone guessing the PIN: three wrong PINs from one device within an hour now raise an alert (at most once an hour per device), including attempts made while PIN entry is locked. Before, they were only locked out, and nothing told you.
+- A device passing as another: if a device is using an address the router gave to a different device, its address was set by hand. That's how a laptop renamed "Echo" can take the real Echo's address and land in an unrestricted profile. You now get an alert naming both devices.
+- The activity log names the right device: sign-ins and changes are credited to the device by its hardware address at that moment, not by whichever device last had that address. A device using someone else's address shows as "X, using Y's address".
+- A weekly check of devices without limits: with Sunday's reports, History lists the devices that had no bedtime or limits that week. Any that joined that week, or tried to get around the content filter, are named, so a kid's device hiding in an adults' profile gets noticed.
+
+After updating, sign in again (the restart signs everyone out).
+
 ## 1.1.6 (2026-10-08)
 
 ### New for parents
