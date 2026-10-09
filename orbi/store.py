@@ -29,6 +29,10 @@ CREATE TABLE IF NOT EXISTS applied_blocks (mac TEXT PRIMARY KEY, reason TEXT, si
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS router_log (ts REAL NOT NULL, kind TEXT NOT NULL, source TEXT DEFAULT '', text TEXT NOT NULL, UNIQUE(ts, text));
 CREATE INDEX IF NOT EXISTS router_log_ts ON router_log(ts);
+CREATE TABLE IF NOT EXISTS pin_attempts (
+  id INTEGER PRIMARY KEY, ts REAL NOT NULL, ip TEXT, mac TEXT, device TEXT, agent TEXT,
+  outcome TEXT NOT NULL, guess TEXT, automated INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS pin_attempts_ts ON pin_attempts(ts);
 """
 
 

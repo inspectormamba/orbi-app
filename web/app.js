@@ -684,6 +684,8 @@ async function renderMore() {
       : h("div", { class: "muted small" }, "None"))).catch((e) => fill(extraPins, h("div", { class: "error-text" }, e.message)));
   }
   renderExtraPins();
+  const securityCard = h("section", { class: "card form" }, h("h2", {}, "Break-in attempts"), h("div", { class: "muted small" }, h("span", { class: "spinner" })));
+  renderSecurity(securityCard);
 
   const advToggle = h("input", { type: "checkbox", checked: advancedOn(), onchange: (e) => {
     try { localStorage.setItem(ADV_KEY, e.target.checked ? "1" : "0"); } catch {}
@@ -691,8 +693,33 @@ async function renderMore() {
   } });
   const advCard = h("section", { class: "card" }, h("h2", {}, "Advanced mode"),
     h("label", { class: "switch" }, "Show the Advanced tab (Wi-Fi networks, DHCP, logs, VPN, firewall rules…)", advToggle));
-  setView(alertCard, phone, remoteCard(), advCard, monitoring, routerCard, pinCard, updatesCard(settings),
+  setView(alertCard, phone, remoteCard(), advCard, monitoring, routerCard, pinCard, securityCard, updatesCard(settings),
     h("div", { class: "muted small center" }, "Orbi Control runs on your PC and talks to the Orbi directly — no cloud. Outside connections: the optional update check to GitHub, and internet checks to 1.1.1.1, 8.8.8.8 and 9.9.9.9."));
+}
+
+// ---------- break-in attempts ----------
+async function renderSecurity(card) {
+  let s;
+  try { s = await api("/api/security"); } catch (e) { return fill(card, h("h2", {}, "Break-in attempts"), h("div", { class: "error-text" }, e.message)); }
+  const label = { wrong: "Wrong PIN", locked: "Sent while locked out", ok: "Signed in" };
+  const reveal = h("input", { type: "checkbox", onchange: () => list.replaceChildren(...rows()) });
+  const rows = () => s.attempts.length ? s.attempts.slice(0, 40).map((a) => h("div", { class: "row" }, h("div", { class: "main" },
+    h("div", { class: "name", style: "white-space:normal" }, `${a.device || a.ip}${a.automated ? " · program" : ""}`),
+    h("div", { class: "meta" }, [fmtWhen(a.ts), label[a.outcome] || a.outcome, a.ip, a.mac,
+      reveal.checked ? (a.guess != null ? `typed “${a.guess}”` : "typed: erased (that device then signed in)") : null].filter(Boolean).join(" · ")),
+    a.automated || !/Mozilla/.test(a.agent || "") ? h("div", { class: "meta" }, `Sent by: ${a.agent || "no program name"}`) : null)))
+    : [h("div", { class: "muted small" }, "No wrong PINs in the last 30 days.")];
+  const list = h("div", {}, ...rows());
+  const block = h("input", { type: "checkbox", checked: s.block_pin_attackers, onchange: (e) =>
+    act(null, () => api("/api/settings", { method: "PATCH", body: { block_pin_attackers: e.target.checked } }), "Saved").catch(() => {}) });
+  fill(card, h("h2", {}, "Break-in attempts"),
+    h("div", { class: "muted small" }, "Every wrong PIN, with the device it came from. A program guessing (too fast for a person, carrying on through the lockout, or not a web browser) is shut out of the app for a day and you get an alert. What was typed is kept encrypted for 30 days and erased if that device then signs in, since it was probably a typo."),
+    ...s.bans.map((b) => h("div", { class: "note" }, `Shut out until ${fmtAt(b.until)}: ${b.who}. ${b.why}. `,
+      h("button", { class: "btn small", onclick: (e) => act(e.currentTarget, () => api(`/api/security/bans/${encodeURIComponent(b.ip)}`, { method: "DELETE" }), "It can use the app again").then(() => renderSecurity(card)) }, "Let it back in"))),
+    h("label", { class: "switch" }, "Also block the device at the router", block),
+    h("label", { class: "switch" }, "Show what was typed", reveal),
+    list,
+    s.attempts.length ? h("button", { class: "btn small", onclick: (e) => act(e.currentTarget, () => api("/api/security/attempts", { method: "DELETE" }), "Cleared").then(() => renderSecurity(card)) }, "Clear the list") : null);
 }
 
 // ---------- app updates ----------

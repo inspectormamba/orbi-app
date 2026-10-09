@@ -100,6 +100,16 @@ class FakeRouter:
                  "security": "WPA2/WPA3-Personal", "broadcast": True, "mac": ""}]
 
 
+@pytest.fixture(autouse=True)
+def quiet_guard(monkeypatch):
+    """Tests fire PINs and requests faster than any person, from a client called "testclient": switch the
+    break-in detection off unless a test turns it back on (tests/test_guard.py)."""
+    monkeypatch.setattr("orbi.guard.FAST", (10**6, 1.0))
+    monkeypatch.setattr("orbi.guard.THROUGH_LOCKOUT", (10**6, 1.0))
+    monkeypatch.setattr("orbi.guard.PROBE", (10**6, 1.0))
+    monkeypatch.setattr("orbi.guard.scripted_agent", lambda agent: False)
+
+
 @pytest.fixture
 def tmp_config(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "DATA_DIR", tmp_path)

@@ -18,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import auth, config, parental, updater
+from .guard import PinGuard
 from .monitor import Monitor, fmt_duration, network_of as monitor_network_of
 from .store import ACTOR
 from .router import RouterClient, RouterError, norm_mac
@@ -92,6 +93,7 @@ class SettingsPatch(BaseModel):
     speedtest_daily_at: str | None = None
     alert_new_devices: bool | None = None
     alert_admin_login_failures: bool | None = None
+    block_pin_attackers: bool | None = None
     mute_new_device_macs: list[str] | None = None
     router_host: str | None = None
     check_updates: bool | None = None
@@ -210,13 +212,19 @@ def iso(dt):
 def create_app(monitor: Monitor) -> FastAPI:
     store = monitor.store
     throttle = auth.Throttle()
+    guard = PinGuard(monitor)
     app = FastAPI(title="Orbi Control", docs_url=None, redoc_url=None)
+    app.state.guard = guard
 
     @app.middleware("http")
     async def require_login(request: Request, call_next):
         path = request.url.path
+        if guard.banned(client_ip(request)):
+            log.info("%s %s by %s -> 403 (banned for attacking the PIN)", request.method, path, who(request))
+            return JSONResponse({"detail": "This device tried to break into Orbi Control and is shut out for a day."}, status_code=403)
         if path.startswith("/api/") and path not in OPEN_PATHS:
             if not auth.valid_session(request.cookies.get(auth.COOKIE), touch=True):
+                guard.refused(client_ip(request), path, who(request))
                 return JSONResponse({"detail": "Sign in required"}, status_code=401)
         token = ACTOR.set(who(request)) if path.startswith("/api/") and request.method != "GET" else None
         try:
@@ -254,16 +262,18 @@ def create_app(monitor: Monitor) -> FastAPI:
         """Every PIN check goes through the lockout, counted before the (slow) hash comparison.
         Returns the label of the PIN used ("" for the main PIN)."""
         ip = client_ip(request)
+        agent = request.headers.get("user-agent", "")
         wait = throttle.attempt(ip)
         if wait:
-            monitor.wrong_pin(ip, who(request), monitor.identify(ip)[1])  # still guessing while locked out
+            guard.attempt(ip, "locked", pin, agent, who(request))  # still guessing while locked out
             raise HTTPException(429, f"Too many wrong PINs. Try again in {fmt_duration(wait)}.")
         label = auth.pin_label(pin, settings)
         if label is None:
             throttle.failure(ip)
-            monitor.wrong_pin(ip, who(request), monitor.identify(ip)[1])
+            guard.attempt(ip, "wrong", pin, agent, who(request))
             raise HTTPException(401, wrong)
         throttle.success(ip)
+        guard.attempt(ip, "ok", "", agent, who(request))
         return label
 
     # ---------- session ----------
@@ -297,6 +307,25 @@ def create_app(monitor: Monitor) -> FastAPI:
         label = require_pin(body.pin, request, s)
         set_cookie(response, label)
         store.event("action", "Signed in to Orbi Control", detail=f"with the extra PIN \"{label}\"" if label else "")
+        return {"ok": True}
+
+    # ---------- break-in attempts ----------
+    @app.get("/api/security")
+    def security():
+        bans = [{"ip": ip, **b} for ip, b in guard.bans().items()]
+        return {"attempts": guard.recent(), "bans": sorted(bans, key=lambda b: -b["since"]),
+                "block_pin_attackers": config.load().get("block_pin_attackers", True)}
+
+    @app.delete("/api/security/attempts")
+    def clear_attempts():
+        store.x("DELETE FROM pin_attempts")
+        store.event("action", "Cleared the record of PIN attempts")
+        return {"ok": True}
+
+    @app.delete("/api/security/bans/{ip}")
+    def lift_ban(ip: str):
+        guard.lift(ip=ip)
+        store.event("action", f"Let {ip} use Orbi Control again")
         return {"ok": True}
 
     @app.post("/api/logout")
@@ -415,6 +444,7 @@ def create_app(monitor: Monitor) -> FastAPI:
         store.x("UPDATE devices SET manual_block=?, held=CASE WHEN ? THEN held ELSE 0 END WHERE mac=?", (int(body.blocked), int(body.blocked), mac))
         note = ""
         if not body.blocked:
+            guard.lift(mac=mac)  # unblocking a device also lets it use the app again
             applied = store.one("SELECT mac FROM applied_blocks WHERE mac=?", (mac,))
             if not applied:  # blocked outside this app (e.g. in the Orbi app): undo it directly
                 try:
@@ -679,7 +709,7 @@ def create_app(monitor: Monitor) -> FastAPI:
     def get_settings():
         s = config.load()
         return {k: s[k] for k in ("router_host", "health_interval", "scan_interval", "speedtest_daily_at", "alert_new_devices",
-                                   "alert_admin_login_failures", "mute_new_device_macs", "port", "check_updates")} | {
+                                   "alert_admin_login_failures", "block_pin_attackers", "mute_new_device_macs", "port", "check_updates")} | {
             "router_configured": bool(s["router_password_enc"])}
 
     @app.patch("/api/settings")
