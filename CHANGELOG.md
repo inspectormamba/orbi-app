@@ -2,6 +2,21 @@
 
 What changed in each version, newest first. The same notes appear in the app under More → Updates.
 
+## 1.1.8 (2026-10-09)
+
+### Break-in detection on the PIN page
+- Every PIN attempt is recorded under More → Break-in attempts: the device it came from (by hardware address), the program that sent it, and what was typed. What was typed is encrypted, kept 30 days, never written to the log, and erased when that device then signs in, since it was probably a typo of the real PIN.
+- A program attacking the PIN page (PINs faster than anyone can type, guessing straight through the lockout, a client that isn't a web browser, or dozens of requests without signing in) raises an immediate alert. That device is shut out of the app for 24 hours and blocked at the router (you can switch the router block off). This PC is never shut out.
+- Unblocking the device in Devices, or "Let it back in", lifts the ban.
+
+### Router certificate after a filter change
+- Saving the router's Internet settings, which is how the content filter is changed, makes the Orbi create a new security certificate. Orbi Control used to cut itself off from the router until someone trusted it by hand. It now follows the router to its new certificate and trusts it on its own, only if it's Netgear's own certificate from the router's hardware address. History records it, and the filter change finishes normally.
+
+### Reports
+- A device that set another device's address by hand is now credited with what it tried from that address, instead of the device the router gave the address to.
+
+After updating, sign in again (the restart signs everyone out).
+
 ## 1.1.7 (2026-10-08)
 
 ### Catching a device that's trying to get around the controls
