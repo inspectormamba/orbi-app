@@ -9,10 +9,11 @@ certificate. A device on the LAN impersonating the router is refused before any 
 A firmware update or factory reset can give the router a new certificate. The app then stops talking
 to it and raises an alert until someone chooses "Trust the router's new certificate" (More → Router).
 
-The Orbi also makes itself a new self-signed certificate every time it restarts. When the restart came
-from this app, a certificate that looks like the router's own (Netgear's routerlogin.net certificate), was
-created after the restart was asked for, and comes from the router's hardware address as it was before
-the restart, is trusted without asking; see renewed_since() and Monitor._trust_after_reboot().
+The Orbi also makes itself a new self-signed certificate every time it restarts, and every time its
+Internet settings are saved (which is how the content filter is changed). When this app caused it, a
+certificate that looks like the router's own (Netgear's routerlogin.net certificate), was created after the
+restart or save, and comes from the router's hardware address as it was before, is trusted without asking;
+see renewed_since(), follow_renewal() and Monitor._trust_after_reboot().
 """
 import datetime
 import hashlib
@@ -103,7 +104,10 @@ def renewed_since(host: str, since: float, now: float | None = None) -> str | No
     `since` (when this app asked the router to restart), else None. The router's clock can be a little off."""
     import time
     now = time.time() if now is None else now
-    der = presented_der(host)
+    return _renewal(presented_der(host), since, now)
+
+
+def _renewal(der: bytes, since: float, now: float) -> str | None:
     try:
         info = describe(der)
     except Exception:  # whatever answered sent something we can't read: not the router's certificate
@@ -111,6 +115,38 @@ def renewed_since(host: str, since: float, now: float | None = None) -> str | No
     if looks_like_router_cert(info) and since - 120 <= info["not_before"] <= now + 120:
         return hashlib.sha256(der).hexdigest()
     return None
+
+
+def follow_renewal(host: str, since: float, mac: str | None, wait: float = 90, settle: float = 30, poll: float = 3) -> str | None:
+    """Call right after saving a router setting that can make the Orbi create a new certificate (`since` is just
+    before the save, `mac` the router's hardware address from before it). Watches for the new certificate and
+    trusts it if it's the router's own, made after `since`, from the same hardware address. Returns its
+    fingerprint, or None if the pinned certificate is still there after `settle` seconds. Raises
+    CertificateChanged if any other certificate turns up, or the router doesn't answer within `wait` seconds."""
+    import time
+    start = time.time()
+    while True:
+        now = time.time()
+        try:
+            der = presented_der(host, timeout=5)
+        except OSError:  # its web server is restarting
+            der = None
+        if der is not None:
+            fp = hashlib.sha256(der).hexdigest()
+            if fp == pinned(host):
+                if now - start >= settle:
+                    return None
+            else:
+                new = _renewal(der, since, now)
+                seen = gateway_mac(host)
+                if new and mac and seen == mac:
+                    log.info("the router made a new certificate after a settings change: %s", new)
+                    return trust(host, new)
+                log.warning("new certificate from %s not trusted automatically (hardware address %s, expected %s)", host, seen, mac)
+                raise CertificateChanged(host)
+        if now - start >= wait:
+            raise CertificateChanged(host)
+        time.sleep(poll)
 
 
 def pinned(host: str) -> str:

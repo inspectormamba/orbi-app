@@ -241,3 +241,77 @@ def test_gateway_mac_reads_the_arp_table(monkeypatch):
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: Done)
     assert routercert.gateway_mac("192.168.1.1") == "C8:9E:43:00:00:01"
     assert routercert.gateway_mac("192.168.1.2") is None
+
+
+ROUTER = "C8:9E:43:00:00:01"
+OLD = fake_cert("261001000000Z")
+
+
+@pytest.fixture
+def saving(tmp_config, monkeypatch):
+    """The router right after its Internet settings were saved: `seq` is what it presents on each look."""
+    clock, seq = [RESTART], []
+    monkeypatch.setattr("time.time", lambda: clock[0])
+    monkeypatch.setattr("time.sleep", lambda s: clock.__setitem__(0, clock[0] + s))
+
+    def presented_der(host, port=443, timeout=10):
+        der = seq.pop(0) if len(seq) > 1 else seq[0]
+        if der is None:
+            raise ConnectionRefusedError
+        return der
+    monkeypatch.setattr(routercert, "presented_der", presented_der)
+    monkeypatch.setattr(routercert, "gateway_mac", lambda host: ROUTER)
+    config.save({"router_cert_pins": {"192.168.1.1": hashlib.sha256(OLD).hexdigest()}})
+    return seq
+
+
+def test_new_certificate_after_a_settings_save_is_followed(saving):
+    """A filter change: the old certificate, a few seconds of nothing while it restarts its web server, then its new one."""
+    saving += [OLD, OLD, None, None, FRESH]
+    fp = routercert.follow_renewal("192.168.1.1", RESTART, ROUTER)
+    assert fp == hashlib.sha256(FRESH).hexdigest() == routercert.pinned("192.168.1.1")
+
+
+def test_no_new_certificate_after_a_save(saving):
+    saving.append(OLD)
+    assert routercert.follow_renewal("192.168.1.1", RESTART, ROUTER) is None
+    assert routercert.pinned("192.168.1.1") == hashlib.sha256(OLD).hexdigest()
+
+
+@pytest.mark.parametrize("case", ["other hardware", "not Netgear's", "made before the save", "never came back"])
+def test_suspicious_certificate_after_a_save_is_refused(saving, monkeypatch, case):
+    der = FRESH
+    if case == "other hardware":
+        monkeypatch.setattr(routercert, "gateway_mac", lambda host: "02:11:22:33:44:55")
+    elif case == "not Netgear's":
+        der = fake_cert("261008204735Z", issuer=_name(CN="Evil CA"))
+    elif case == "made before the save":
+        der = fake_cert("261008100000Z")
+    else:
+        der = None
+    saving += [OLD, der]
+    with pytest.raises(routercert.CertificateChanged):
+        routercert.follow_renewal("192.168.1.1", RESTART, ROUTER)
+    assert routercert.pinned("192.168.1.1") == hashlib.sha256(OLD).hexdigest()
+
+
+def test_filter_change_records_the_renewed_certificate(client, monitor, monkeypatch):
+    """The filter change trusts the new certificate itself; History says so once, and nothing is left expected."""
+    from orbi import filtering
+    from .test_advanced import wait_job
+    client.post("/api/setup", json={"pin": "246810"})
+    config.save({"router_cert_pins": {"192.168.1.1": A}})
+    monkeypatch.setattr(routercert, "gateway_mac", lambda host: ROUTER)
+    seen = {}
+
+    def apply_provider(host, pw, key):
+        seen["expected"] = monitor.store.get("reboot_requested")
+        routercert.trust(host, B)  # what follow_renewal does inside the router session
+        return {"ok": True, "confirmed": True, "provider": key}
+    monkeypatch.setattr(filtering, "apply_provider", apply_provider)
+    assert client.post("/api/filtering", json={"provider": "adguard_family"}).status_code == 200
+    assert wait_job(client, "filtering")["error"] is None
+    assert seen["expected"] and not monitor.store.get("reboot_requested")
+    ev = monitor.store.q("SELECT detail FROM events WHERE kind='router_cert'")
+    assert len(ev) == 1 and "changed the content filter" in ev[0]["detail"]
+    assert monitor.notes == []

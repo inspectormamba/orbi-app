@@ -3,12 +3,15 @@
 The router logs the address of every device it blocks ([site blocked: tiktok] from source 192.168.1.42,
 [service blocked: Block-DoT-853] from source ...). Addresses change, so each line is matched to a device
 through the router's own DHCP log ([DHCP IP: (192.168.1.42)] to MAC address ...) as of that moment,
-falling back to the device's latest known address.
+falling back to the device's latest known address. A device that set another's address by hand isn't in the
+DHCP log, so while the app saw it on that address (address_sightings, from Monitor._watch_addresses) the
+line is credited to it, not to the device the router gave the address to.
 """
 import re
 from collections import Counter
 
 DHCP = re.compile(r"DHCP IP: \(([\d.]+)\)\] to MAC address ([0-9A-Fa-f:]{17})")
+SIGHTING_SLACK = 10 * 60  # devices are listed every couple of minutes; allow for the gaps either side
 
 
 def build(store, macs: set[str], since: float) -> dict:
@@ -16,6 +19,9 @@ def build(store, macs: set[str], since: float) -> dict:
     macs = {m.upper() for m in macs}
     fallback = {r["last_ip"]: r["mac"] for r in store.q("SELECT mac, last_ip FROM devices WHERE last_ip IS NOT NULL ORDER BY last_seen")}
     owner: dict[str, str] = {}
+    sightings: dict[str, list] = {}
+    for s in store.q("SELECT mac, ip, first, last FROM address_sightings WHERE last > ?", (since - SIGHTING_SLACK,)):
+        sightings.setdefault(s["ip"], []).append(s)
     per: dict[str, dict] = {}
     rows = store.q("SELECT ts, kind, source, text FROM router_log WHERE ts > ? AND (kind LIKE 'site blocked%' OR "
                    "kind LIKE 'service blocked%' OR kind LIKE 'DHCP IP%') ORDER BY ts", (since - 14 * 86400,))
@@ -27,7 +33,9 @@ def build(store, macs: set[str], since: float) -> dict:
             continue
         if r["ts"] <= since:
             continue
-        mac = owner.get(r["source"]) or fallback.get(r["source"])
+        borrowed = [s["mac"] for s in sightings.get(r["source"], [])
+                    if s["first"] - SIGHTING_SLACK <= r["ts"] <= s["last"] + SIGHTING_SLACK]
+        mac = (borrowed[-1] if borrowed else None) or owner.get(r["source"]) or fallback.get(r["source"])
         if mac not in macs:
             continue
         d = per.setdefault(mac, {"sites": Counter(), "bypass": Counter(), "vpn": Counter(), "networks": []})

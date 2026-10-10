@@ -888,7 +888,15 @@ def create_app(monitor: Monitor) -> FastAPI:
         s = config.load()
 
         def apply():
-            res = filtering.apply_provider(s["router_host"], config.router_password(s), body.provider)
+            from . import routercert
+            # Saving the router's Internet settings makes it create a new certificate: expect it, so the monitor
+            # doesn't raise the alarm while this is under way (and trusts it, if the save here didn't).
+            before = (config.load().get("router_cert_pins") or {}).get(s["router_host"])
+            monitor.expect_new_cert(routercert.gateway_mac(s["router_host"]), "when Orbi Control changed the content filter")
+            try:
+                res = filtering.apply_provider(s["router_host"], config.router_password(s), body.provider)
+            finally:
+                monitor.cert_renewed(before)
             monitor.state["wan"] = monitor.router.wan()
             store.event("action", f"Content filter changed to {filtering.PROVIDERS[body.provider]['name']}",
                         detail="verified" if res.get("confirmed") else "applied; waiting for devices' DNS caches")

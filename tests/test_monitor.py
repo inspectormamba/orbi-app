@@ -398,3 +398,22 @@ def test_no_address_alert_for_a_fresh_lease(monitor, fake_router):
     monitor.state["log_ingested"] = _t.time() + 2
     monitor.scan()
     assert not monitor.store.q("SELECT * FROM events WHERE kind='address'")
+
+
+def test_reports_credit_a_borrowed_address_to_the_device_using_it(monitor, fake_router):
+    """The weekly report blamed the real Echo for what a fake one did from its address."""
+    import time as _t
+    from orbi import report
+    now = _t.time()
+    monitor.scan()
+    _lease(monitor.store, "192.168.1.20", "AA:00:00:00:00:01", now - 7200)  # kid-phone's lease
+    fake_router.devs.append(fake_router._dev("AA:00:00:00:00:09", "Echo-Spot", "192.168.1.20", ROUTER_MAC))
+    monitor.scan()
+    monitor.scan()  # the same stay: one sighting, not two
+    assert len(monitor.store.q("SELECT * FROM address_sightings")) == 1
+    for ts in (now - 5400, now - 60):  # before the fake turned up, and while it was there
+        monitor.store.x("INSERT INTO router_log(ts,kind,source,text) VALUES(?,?,?,?)",
+                        (ts, "service blocked: Block-External-DNS-2", "192.168.1.20", f"[service blocked: Block-External-DNS-2] {ts}"))
+    rep = report.build(monitor.store, {"AA:00:00:00:00:01", "AA:00:00:00:00:09"}, now - 86400)["devices"]
+    assert rep["AA:00:00:00:00:09"]["bypass"] == {"Block-External-DNS-2": 1}
+    assert rep["AA:00:00:00:00:01"]["bypass"] == {"Block-External-DNS-2": 1}

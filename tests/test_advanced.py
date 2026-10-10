@@ -172,6 +172,7 @@ def test_advanced_and_siteblock(client):
 
 def test_filtering_endpoints(client, monitor, monkeypatch):
     monkeypatch.setattr(filtering, "apply_provider", lambda host, pw, key: {"ok": True, "confirmed": True, "provider": key})
+    monkeypatch.setattr("orbi.routercert.gateway_mac", lambda host: None)
     monitor.state["wan"] = {"dns": ["185.228.168.10", "185.228.169.11"]}
     assert client.get("/api/filtering").json()["current"] == "cleanbrowsing_adult"
     assert client.post("/api/filtering", json={"provider": "nope"}).status_code == 400

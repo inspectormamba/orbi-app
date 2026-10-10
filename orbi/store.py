@@ -33,6 +33,8 @@ CREATE TABLE IF NOT EXISTS pin_attempts (
   id INTEGER PRIMARY KEY, ts REAL NOT NULL, ip TEXT, mac TEXT, device TEXT, agent TEXT,
   outcome TEXT NOT NULL, guess TEXT, automated INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS pin_attempts_ts ON pin_attempts(ts);
+CREATE TABLE IF NOT EXISTS address_sightings (mac TEXT NOT NULL, ip TEXT NOT NULL, first REAL NOT NULL, last REAL NOT NULL);
+CREATE INDEX IF NOT EXISTS address_sightings_ip ON address_sightings(ip);
 """
 
 

@@ -122,6 +122,7 @@ def local_macs() -> set[str]:
     return {norm_mac(line.split(",")[0].strip('"')) for line in out.splitlines() if line.strip()}
 
 
+SIGHTING_GAP = 30 * 60  # a device seen again on the same borrowed address within this long: the same stay
 REBOOT_CERT_WINDOW = 20 * 60  # a new router certificate seen this soon after a restart the app asked for is trusted
 PIN_ALERT_AFTER = 3  # wrong PINs from one address within an hour before it's reported as guessing
 WIFI_CHECK_DELAY = 120  # after a Wi-Fi change, how long devices get to drop off and rejoin before we look
@@ -592,11 +593,32 @@ class Monitor:
 
     def note_reboot(self, router_mac: str | None):
         """This app just asked the router to restart: it will come back with a new certificate."""
+        self.expect_new_cert(router_mac, "during the restart Orbi Control asked for")
+
+    def expect_new_cert(self, router_mac: str | None, why: str):
+        """This app is about to restart the router or save its Internet settings (a content filter change), after
+        which the Orbi makes itself a new certificate. `why` finishes "this one was created …"."""
         self.store.put("reboot_router_mac", router_mac)
+        self.store.put("reboot_cert_why", why)
         self.store.put("reboot_requested", time.time())
 
+    def cert_renewed(self, before: str | None):
+        """After a filter change: if the router's certificate was renewed and trusted along the way, say so and
+        reconnect with it."""
+        host = config.load()["router_host"]
+        fp = (config.load().get("router_cert_pins") or {}).get(host)
+        expected = self.store.get("reboot_requested")
+        self.store.put("reboot_requested", None)  # the change is over
+        if not fp or fp == before or not expected:  # unchanged, or the monitor already trusted and reported it
+            return
+        self.store.event("router_cert", "Trusted the router's new security certificate", severity="info",
+                         detail=f"The Orbi makes a new one each time its Internet settings are saved; this one was created "
+                                f"when Orbi Control changed the content filter. {fp[:16]}…")
+        self.reload_router()
+
     def _trust_after_reboot(self) -> bool:
-        """Trusts the router's new certificate without asking if it was made during a restart this app asked for."""
+        """Trusts the router's new certificate without asking if it was made during a restart (or Internet settings
+        save) this app asked for."""
         since = self.store.get("reboot_requested")
         if not since or time.time() - since > REBOOT_CERT_WINDOW:
             return False
@@ -614,9 +636,10 @@ class Monitor:
             return False
         routercert.trust(host, fp)
         self.store.put("reboot_requested", None)  # one certificate per restart
+        why = self.store.get("reboot_cert_why") or "during the restart Orbi Control asked for"
         self.store.event("router_cert", "Trusted the router's new security certificate", severity="info",
-                         detail=f"The Orbi makes a new one each time it restarts; this one was created during the restart "
-                                f"Orbi Control asked for at {time.strftime('%I:%M %p', time.localtime(since)).lstrip('0')}. {fp[:16]}…")
+                         detail=f"The Orbi makes a new one each time it restarts or its Internet settings are saved; this one "
+                                f"was created {why} at {time.strftime('%I:%M %p', time.localtime(since)).lstrip('0')}. {fp[:16]}…")
         self.reload_router()
         return True
 
@@ -692,6 +715,7 @@ class Monitor:
                 continue
             key = f"{d['mac']} {d['ip']}"
             seen.add(key)
+            self._sighted(d["mac"], d["ip"], now)
             first = self._address_mismatch.setdefault(key, now)
             if ingested <= first or now - alerted.get(key, 0) < 86400:
                 continue
@@ -704,6 +728,17 @@ class Monitor:
             self.notify("Device using another's address", f"{who} is using {rightful}'s address ({d['ip']})")
         self._address_mismatch = {k: v for k, v in self._address_mismatch.items() if k in seen}
         self.store.put("address_alerted", {k: v for k, v in alerted.items() if now - v < 86400})
+
+    def _sighted(self, mac: str, ip: str, now: float):
+        """Remembers that `mac` was seen on an address DHCP gave someone else, so the reports credit what the router
+        logged from that address to the device that was really there (report.build)."""
+        stay = self.store.one("SELECT rowid FROM address_sightings WHERE mac=? AND ip=? AND last > ? ORDER BY last DESC LIMIT 1",
+                              (mac, ip, now - SIGHTING_GAP))
+        if stay:
+            self.store.x("UPDATE address_sightings SET last=? WHERE rowid=?", (now, stay["rowid"]))
+        else:
+            self.store.x("INSERT INTO address_sightings(mac, ip, first, last) VALUES(?,?,?,?)", (mac, ip, now, now))
+        self.store.x("DELETE FROM address_sightings WHERE last < ?", (now - 60 * 86400,))
 
     def identify(self, ip: str) -> tuple[str, str]:
         """(name, MAC) of whoever is at `ip` right now, for live requests. Goes by the hardware address in this
