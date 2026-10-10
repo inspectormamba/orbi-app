@@ -34,6 +34,7 @@ DEFAULTS = {
 }
 
 _lock = threading.Lock()
+on_save = None  # called with each patch Orbi Control saves itself (tamper.py tells those from outside edits)
 
 
 def load() -> dict:
@@ -56,7 +57,10 @@ def save(patch: dict) -> dict:
         tmp = SETTINGS_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps(current, indent=2), "utf-8")
         os.replace(tmp, SETTINGS_FILE)  # atomic: never leaves a half-written file
-    return {**DEFAULTS, **current}
+        merged = {**DEFAULTS, **current}
+    if on_save:
+        on_save(merged)
+    return merged
 
 
 def router_password(settings: dict) -> str:

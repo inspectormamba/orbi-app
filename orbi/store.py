@@ -1,6 +1,7 @@
 """SQLite storage (WAL mode, one connection per thread)."""
 import contextvars
 import json
+import logging
 import sqlite3
 import threading
 import time
@@ -37,6 +38,19 @@ CREATE TABLE IF NOT EXISTS address_sightings (mac TEXT NOT NULL, ip TEXT NOT NUL
 CREATE INDEX IF NOT EXISTS address_sightings_ip ON address_sightings(ip);
 """
 
+KEEP_DAYS = 90  # history older than this is pruned; anything newer can't be deleted
+
+# History locks. orbi_keep_after() exists only on Orbi Control's own connections, so any other program that
+# tries to delete from these tables (a python one-liner, sqlite3.exe, a DB browser) fails with "no such
+# function"; the app itself can only delete what has aged past KEEP_DAYS. tamper.py notices if they're dropped.
+LOCKS = """
+CREATE TRIGGER IF NOT EXISTS events_keep BEFORE DELETE ON events WHEN OLD.ts >= orbi_keep_after()
+BEGIN SELECT RAISE(ABORT, 'Orbi Control keeps its history'); END;
+CREATE TRIGGER IF NOT EXISTS router_log_keep BEFORE DELETE ON router_log WHEN OLD.ts >= orbi_keep_after()
+BEGIN SELECT RAISE(ABORT, 'Orbi Control keeps its history'); END;
+"""
+LOCK_NAMES = {"events_keep", "router_log_keep"}
+
 
 # Who is making the current change through the web app, e.g. "Kids-iPad (192.168.1.40)".
 # Set per request by web.py; every event recorded while handling it says who did it.
@@ -49,8 +63,9 @@ class Store:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
         self._write_lock = threading.Lock()
+        self.on_event = None  # called with each new event row (tamper.py copies it to the Windows Event Log)
         with self._write_lock:
-            self.db.executescript(SCHEMA)
+            self.db.executescript(SCHEMA + LOCKS)
             self._migrate()
 
     def _migrate(self):
@@ -67,6 +82,7 @@ class Store:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA foreign_keys=ON")
             conn.execute("PRAGMA synchronous=NORMAL")
+            conn.create_function("orbi_keep_after", 0, lambda: time.time() - KEEP_DAYS * 86400)
             self._local.conn = conn
         return conn
 
@@ -94,8 +110,16 @@ class Store:
     def event(self, kind, title, detail="", severity="info", mac="", ts=None, end_ts=None):
         if actor := ACTOR.get():
             detail = f"{detail} · by {actor}" if detail else f"by {actor}"
-        return self.x("INSERT INTO events(ts,end_ts,kind,severity,title,detail,mac) VALUES(?,?,?,?,?,?,?)",
-                      (ts or time.time(), end_ts, kind, severity, title, detail, mac))
+        row = {"ts": ts or time.time(), "end_ts": end_ts, "kind": kind, "severity": severity, "title": title,
+               "detail": detail, "mac": mac}
+        row["id"] = self.x("INSERT INTO events(ts,end_ts,kind,severity,title,detail,mac) VALUES(?,?,?,?,?,?,?)",
+                           (row["ts"], end_ts, kind, severity, title, detail, mac))
+        if self.on_event:
+            try:
+                self.on_event(row)
+            except Exception:
+                logging.getLogger(__name__).exception("copying event %s failed", row["id"])
+        return row["id"]
 
     def close_event(self, event_id, end_ts=None, detail=None):
         if detail is None:
@@ -103,8 +127,8 @@ class Store:
         else:
             self.x("UPDATE events SET end_ts=?, detail=? WHERE id=?", (end_ts or time.time(), detail, event_id))
 
-    def prune(self, days=90):
-        cutoff = time.time() - days * 86400
+    def prune(self, days=KEEP_DAYS):
+        cutoff = time.time() - max(days, KEEP_DAYS) * 86400
         self.x("DELETE FROM checks WHERE ts < ?", (time.time() - 31 * 86400,))
         self.x("DELETE FROM events WHERE ts < ?", (cutoff,))
         self.x("DELETE FROM traffic WHERE ts < ?", (cutoff,))

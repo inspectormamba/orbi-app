@@ -35,6 +35,33 @@ def backhaul_kind(conn_type: str | None) -> str | None:
     return None
 
 
+def _attached_devices_full(ng) -> list[dict] | None:
+    """GetAttachDevice2 with every field the router sends: pynetgear drops the router's own identification of each
+    device (DeviceBrand, DeviceTypeV2) and whether its name was typed in by someone (NameUserSet)."""
+    from pynetgear import const as c, helpers as h
+    ok, resp = ng._make_request(c.SERVICE_DEVICE_INFO, c.GET_ATTACHED_DEVICES_2)
+    if not ok:
+        return None
+    ok, node = h.find_node(resp.text, ".//GetAttachDevice2Response/NewAttachDevice")
+    if not ok:
+        return None
+    return [{f.tag: (f.text or "").strip() for f in d} for d in node.findall("Device")]
+
+
+UNKNOWN_BRANDS = {"", "unknown", "not included in current license"}
+
+
+def router_date(text: str | None) -> float | None:
+    """The router's dates as timestamps: "2026_02.24_02:04:17" (firmware) or "Thursday, 17 Aug 2023 06:30:18"."""
+    from datetime import datetime
+    for fmt in ("%Y_%m.%d_%H:%M:%S", "%A, %d %b %Y %H:%M:%S"):
+        try:
+            return datetime.strptime((text or "").strip(), fmt).timestamp()
+        except ValueError:
+            pass
+    return None
+
+
 def _num(v):
     try:
         return float(v)
@@ -60,6 +87,7 @@ class RouterClient:
         # Every SOAP request (login included) goes over a connection that must present the pinned certificate.
         pinned = routercert.session(self.host)
         ng._post_request = lambda headers, message: pinned.post(ng.soap_url, headers=headers, data=message, timeout=30)
+        ng.attached_devices_full = lambda: _attached_devices_full(ng)
         # HTTPS on 443 only: pynetgear's login_try_port() falls back to plain HTTP (ports 5000/80),
         # which would send the admin password across the LAN unencrypted.
         if not ng.login():
@@ -94,15 +122,24 @@ class RouterClient:
     # ---- reads ----
     def info(self) -> dict:
         i = self.call("get_info")
-        return {"model": i.get("ModelName"), "serial": i.get("SerialNumber"), "firmware": i.get("Firmwareversion")}
+        return {"model": i.get("ModelName"), "serial": i.get("SerialNumber"), "firmware": i.get("Firmwareversion"),
+                # not shown in Netgear's app or pages:
+                "first_use": router_date(i.get("FirstUseDate")), "firmware_installed": router_date(i.get("FirmwareLastUpdate")),
+                "firmware_checked": router_date(i.get("FirmwareLastChecked")), "firmware_auto": (i.get("FirmwareDLmethod") or "").upper() != "MANUAL"
+                if i.get("FirmwareDLmethod") else None}
 
     def devices(self) -> list[dict]:
         out = []
-        for d in self.call("get_attached_devices_2"):
+        for d in self.call("attached_devices_full"):
+            brand = d.get("DeviceBrand", "")
             out.append({
-                "mac": norm_mac(d.mac), "ip": d.ip, "name": d.name or "", "connection": d.type or "",
-                "signal": _num(d.signal), "link_rate": _num(d.link_rate), "blocked": d.allow_or_block == "Block",
-                "model": d.device_model or "", "ssid": d.ssid or "", "ap_mac": norm_mac(d.conn_ap_mac) if d.conn_ap_mac else "",
+                "mac": norm_mac(d.get("MAC", "")), "ip": d.get("IP"), "name": d.get("Name", ""), "connection": d.get("ConnectionType", ""),
+                "signal": _num(d.get("SignalStrength")), "link_rate": _num(d.get("Linkspeed")), "blocked": d.get("AllowOrBlock") == "Block",
+                "model": d.get("DeviceModel", ""), "ssid": d.get("SSID", ""), "ap_mac": norm_mac(d["ConnAPMAC"]) if d.get("ConnAPMAC") else "",
+                # the router's own identification, independent of the name the device gives itself
+                "brand": "" if brand.lower() in UNKNOWN_BRANDS else brand,
+                "category": "" if d.get("DeviceTypeV2", "").upper() in ("", "GENERIC") else d["DeviceTypeV2"].upper(),
+                "name_user_set": d.get("NameUserSet") == "true",
             })
         return out
 
@@ -158,11 +195,16 @@ class RouterClient:
     def traffic(self) -> dict:
         t = self.call("get_traffic_meter")
         first = lambda v: v[0] if isinstance(v, (list, tuple)) else v  # noqa: E731 - week/month are [total, avg]
+        avg = lambda v: v[1] if isinstance(v, (list, tuple)) and len(v) > 1 else None  # noqa: E731
         return {  # megabytes
             "today_down": first(t.get("NewTodayDownload")), "today_up": first(t.get("NewTodayUpload")),
             "yesterday_down": first(t.get("NewYesterdayDownload")), "yesterday_up": first(t.get("NewYesterdayUpload")),
+            "week_down": first(t.get("NewWeekDownload")), "week_up": first(t.get("NewWeekUpload")),
+            "week_avg_down": avg(t.get("NewWeekDownload")), "week_avg_up": avg(t.get("NewWeekUpload")),
             "month_down": first(t.get("NewMonthDownload")), "month_up": first(t.get("NewMonthUpload")),
+            "month_avg_down": avg(t.get("NewMonthDownload")), "month_avg_up": avg(t.get("NewMonthUpload")),
             "last_month_down": first(t.get("NewLastMonthDownload")), "last_month_up": first(t.get("NewLastMonthUpload")),
+            "last_month_avg_down": avg(t.get("NewLastMonthDownload")), "last_month_avg_up": avg(t.get("NewLastMonthUpload")),
         }
 
     def guest_wifi(self) -> dict:

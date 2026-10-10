@@ -160,7 +160,11 @@ class Monitor:
         self._wrong_pins: dict[str, list[float]] = {}  # ip -> times of wrong PINs in the last hour
         self._pin_alerted: dict[str, float] = {}  # ip -> when the last "guessing the PIN" alert went out
         self._address_mismatch: dict[str, float] = {}  # "mac ip" -> first scan that saw it
+        self._room: dict[str, str] = {}  # mac -> the Orbi (router or satellite) a Wi-Fi device settled on
+        self._room_pending: dict[str, tuple[str, int]] = {}  # mac -> (a different Orbi, scans seen on it)
+        self._room_noted: dict[str, float] = {}
         self.protected = local_macs()
+        self.tamper = None  # tamper.Tamper, set by __main__ (the real app only: it writes to the Windows Event Log)
 
     # ---- router ----
     def _default_router(self):
@@ -192,6 +196,8 @@ class Monitor:
                  "traffic": self.traffic_loop, "speedtest": self.speedtest_schedule_loop, "maintenance": self.maintenance_loop,
                  "routerlog": self.routerlog_loop, "updates": self.update_loop, "weekly": self.weekly_loop,
                  "restart": self.restart_loop}
+        if self.tamper:
+            loops["tamper"] = self.tamper.loop
         self._loops = loops
         for name in loops:
             self._spawn(name)
@@ -379,11 +385,15 @@ class Monitor:
         if not self.router:
             return
         try:
-            if not self.state["info"]:
-                self.state["info"] = self.router.info()
+            if not self.state["info"] or time.time() - self.state.get("info_ts", 0) > 3600:  # firmware check dates move
+                self.state["info"], self.state["info_ts"] = self.router.info(), time.time()
             self.state["wan"] = self.router.wan()
             self._watch_filter(self.state["wan"].get("dns"))
             self.state["system"] = self.router.system()
+            cpu = [c for c in (self.state.get("cpu_samples") or []) if c is not None][-29:] + [self.state["system"].get("cpu")]
+            self.state["cpu_samples"] = cpu
+            if any(c is not None for c in cpu):  # one reading jumps around (answering this app is work too)
+                self.state["system"]["cpu_avg"] = round(sum(c for c in cpu if c is not None) / len([c for c in cpu if c is not None]))
             self.state["router_uptime"] = self.router.uptime()
             sats = self.router.satellites()
             devices = self.router.devices()
@@ -396,6 +406,8 @@ class Monitor:
         self._update_satellites(sats, devices)
         self._update_devices(devices)
         self._watch_addresses(devices)
+        self._watch_identities(devices)
+        self._watch_rooms(devices)
         self._watch_networks()
         self._restart_followup(devices)
         self._verify_blocks(devices)
@@ -728,6 +740,55 @@ class Monitor:
             self.notify("Device using another's address", f"{who} is using {rightful}'s address ({d['ip']})")
         self._address_mismatch = {k: v for k, v in self._address_mismatch.items() if k in seen}
         self.store.put("address_alerted", {k: v for k, v in alerted.items() if now - v < 86400})
+
+    def _watch_identities(self, devices):
+        """Alerts when a device's own name doesn't fit what the router identifies it as (identity.mismatch)."""
+        from . import identity
+        alerted = self.store.get("identity_alerted", {})
+        for d in devices:
+            why = identity.mismatch(d.get("name", ""), d.get("brand", ""), d.get("category", ""), d.get("name_user_set", False))
+            if not why or d["mac"] in self.protected_macs() or alerted.get(d["mac"]) == why:
+                continue
+            alerted[d["mac"]] = why
+            who = self.device_label(d["mac"])
+            self.store.event("identity", f"{who} may not be what it says", severity="error", mac=d["mac"],
+                             detail=f"{why[0].upper()}{why[1:]}. Renaming a device is a way to slip into a profile without limits. "
+                                    "If you don't recognize it, block it in Devices.")
+            self.notify("Device may be disguised", f"{who}: {why}")
+        self.store.put("identity_alerted", alerted)
+
+    def _watch_rooms(self, devices):
+        """While a profile's devices are cut off (bedtime, a pause), notes when one of them moves to a different Orbi.
+        Wi-Fi devices connect to the nearest one, so it says roughly where in the house the device is now."""
+        places = {}
+        for s in self.state["satellites"]:
+            places[s["mac"]] = s["name"]
+            if s.get("parent_mac"):
+                places.setdefault(s["parent_mac"], "the router")
+        want, now = None, time.time()
+        for d in devices:
+            mac, ap = d["mac"], d.get("ap_mac")
+            if not ap or d.get("connection") == "wired" or ap not in places:
+                continue
+            if self._room.get(mac) in (None, ap):
+                self._room[mac] = ap
+                self._room_pending.pop(mac, None)
+                continue
+            pending, n = self._room_pending.get(mac, (ap, 0))
+            n = n + 1 if pending == ap else 1
+            if n < 2:  # passing through: wait for it to settle
+                self._room_pending[mac] = (ap, n)
+                continue
+            before, self._room[mac] = self._room[mac], ap
+            self._room_pending.pop(mac, None)
+            want = self.desired() if want is None else want
+            reason = want.get(mac)
+            if not reason or reason == "Blocked manually" or now - self._room_noted.get(mac, 0) < 20 * 60:
+                continue
+            self._room_noted[mac] = now
+            self.store.event("room", f"{self.device_label(mac)} moved to {places[ap]}", mac=mac,
+                             detail=f"During {reason}. Before, it was connected to {places.get(before, 'another Orbi')}. Wi-Fi devices "
+                                    "connect to the nearest Orbi, so this shows roughly where in the house it is.")
 
     def _sighted(self, mac: str, ip: str, now: float):
         """Remembers that `mac` was seen on an address DHCP gave someone else, so the reports credit what the router

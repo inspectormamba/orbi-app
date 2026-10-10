@@ -264,16 +264,30 @@ async function renderHome() {
     sp.error ? h("div", { class: "error-text" }, `Last test failed: ${sp.error}`) : null);
 
   const tr = st.traffic;
-  const usage = tr ? h("section", { class: "card" }, h("h2", {}, "Usage"), h("div", { class: "stats" },
+  const usage = tr ? h("section", { class: "card" }, h("h2", {}, "Usage",
+    h("button", { class: "btn small", onclick: () => usageSheet(tr) }, "Details")), h("div", { class: "stats" },
     stat(fmtMB(tr.today_down), "Down today"), stat(fmtMB(tr.today_up), "Up today"), stat(fmtMB(tr.month_down), "Down this month"))) : null;
 
   const info = h("section", { class: "card" }, h("h2", {}, "Network"), h("dl", { class: "kv" },
     h("dt", {}, "Public IP"), h("dd", {}, st.wan?.ip || "—"),
     h("dt", {}, "DNS filter"), h("dd", {}, st.dns_filter || "None detected"),
-    h("dt", {}, "Router load"), h("dd", {}, st.system?.memory != null ? `Memory ${st.system.memory}%` : "—")));
+    h("dt", {}, "Router load"), h("dd", {}, [st.system?.cpu_avg != null ? `CPU ${st.system.cpu_avg}%` : null,
+      st.system?.memory != null ? `memory ${st.system.memory}%` : null].filter(Boolean).join(", ") || "—")));
 
   setView(hero, mesh, fam, speed, usage, info);
   every(sp.running ? 4000 : 15000, renderHome);
+}
+
+function usageSheet(tr) {
+  const both = (down, up) => `↓ ${fmtMB(down)} · ↑ ${fmtMB(up)}`;
+  const rows = [["Today", both(tr.today_down, tr.today_up)], ["Yesterday", both(tr.yesterday_down, tr.yesterday_up)],
+    ["This week", tr.week_down != null ? both(tr.week_down, tr.week_up) : null], ["  per day", tr.week_avg_down != null ? both(tr.week_avg_down, tr.week_avg_up) : null],
+    ["This month", both(tr.month_down, tr.month_up)], ["  per day", tr.month_avg_down != null ? both(tr.month_avg_down, tr.month_avg_up) : null],
+    ["Last month", both(tr.last_month_down, tr.last_month_up)], ["  per day", tr.last_month_avg_down != null ? both(tr.last_month_avg_down, tr.last_month_avg_up) : null]]
+    .filter(([, v]) => v != null);
+  openSheet(h("h3", {}, "Internet usage"), h("p", { class: "muted small", style: "margin:0" }, "The whole network, as counted by the router. The Orbi doesn't count per device."),
+    h("dl", { class: "kv" }, ...rows.flatMap(([k, v]) => [h("dt", {}, k.trim()), h("dd", {}, v)])),
+    h("div", { class: "btns" }, h("button", { class: "btn", onclick: closeSheet }, "Close")));
 }
 
 function stat(v, l) { return h("div", { class: "stat" }, h("div", { class: "v" }, v), h("div", { class: "l" }, l)); }
@@ -316,7 +330,7 @@ async function renderDevices() {
   const [devices, profiles] = await Promise.all([api("/api/devices"), api("/api/profiles")]);
   cache.devices = devices; cache.profiles = profiles;
   const list = h("div");
-  const search = h("input", { class: "search", type: "search", placeholder: "Search name, IP or MAC", value: devQuery, "aria-label": "Search devices",
+  const search = h("input", { class: "search", type: "search", placeholder: "Search name, type, brand, IP or MAC", value: devQuery, "aria-label": "Search devices",
     oninput: (e) => { devQuery = e.target.value; draw(); } });
   const chips = h("div", { class: "chips" });
   const filters = { online: "Online", all: "All", blocked: "Blocked", unassigned: "No profile", new: "New this week", guest: "Guest Wi-Fi", iot: "IoT Wi-Fi" };
@@ -332,7 +346,7 @@ async function renderDevices() {
       if (devFilter === "unassigned" && d.profile) return false;
       if (devFilter === "new" && d.first_seen < weekAgo) return false;
       if ((devFilter === "guest" || devFilter === "iot") && d.network !== devFilter) return false;
-      return !q || [d.name, d.ip, d.mac, d.model, d.router_name].some((v) => (v || "").toLowerCase().includes(q));
+      return !q || [d.name, d.ip, d.mac, d.model, d.router_name, d.brand, categoryText(d.category)].some((v) => (v || "").toLowerCase().includes(q));
     });
     const groups = {};
     for (const d of shown) (groups[d.online ? d.ap || "Other" : "Offline"] ||= []).push(d);
@@ -350,12 +364,21 @@ function networkLabel(d) {
   return d.network === "main" ? d.ssid : "";
 }
 
+// The router's own category for a device (DeviceTypeV2), e.g. SMART_PLUG -> "Smart plug"
+const CATEGORY_NAMES = { LOUDSPEAKER: "Speaker", VOICE_CONTROL: "Voice assistant", MEDIA_PLAYER: "Streaming box", STB: "TV tuner",
+  NAS_STORAGE: "Network storage", SURVEILLANCE_CAMERA: "Camera", GAME_CONSOLE: "Game console", MOBILE: "Phone", MUSIC: "Speaker",
+  GARAGE: "Garage door opener", INDUSTRIAL: "Appliance module", SMART_HOME: "Smart home device", TELEVISION: "TV", CAR: "Car" };
+function categoryText(c) {
+  if (!c) return "";
+  return CATEGORY_NAMES[c] || (c[0] + c.slice(1).toLowerCase()).replace(/_/g, " ");
+}
+
 function deviceRow(d) {
   const band = d.connection === "wired" ? "Wired" : d.connection.replace(/\s*-\s*IoT$/i, "").replace("GHz", " GHz");
   return h("div", { class: `row tap${d.online ? "" : " offline"}`, role: "button", tabindex: 0, onclick: () => deviceSheet(d), onkeydown: (e) => e.key === "Enter" && deviceSheet(d) },
     ico(d.connection === "wired" ? "wired" : "wifi"),
     h("div", { class: "main" }, h("div", { class: "name" }, d.name),
-      h("div", { class: "meta" }, d.online ? [d.ip, band, networkLabel(d), d.randomized ? "private address" : null].filter(Boolean).join(" · ") : `Last seen ${d.last_seen ? ago(d.last_seen) : "—"}`)),
+      h("div", { class: "meta" }, d.online ? [categoryText(d.category), d.ip, band, networkLabel(d), d.randomized ? "private address" : null].filter(Boolean).join(" · ") : `Last seen ${d.last_seen ? ago(d.last_seen) : "—"}`)),
     d.held ? h("span", { class: "pill warn" }, "Needs approval") : d.blocked ? h("span", { class: "pill bad" }, "Blocked")
       : d.profile ? h("span", { class: "pill accent" }, `${d.profile.emoji || ""} ${d.profile.name}`.trim())
         : d.default_profile ? h("span", { class: "pill", title: "Not in a profile, so it follows the default" }, `↳ ${d.default_profile.name}`) : null,
@@ -389,6 +412,8 @@ function deviceSheet(d) {
       d.network && d.network !== "wired" ? [h("dt", {}, "Wi-Fi network"), h("dd", {}, { main: `${d.ssid} (main)`, guest: `${d.ssid} (guest)`, iot: `${d.ssid} (IoT)` }[d.network] || d.ssid || "—")] : null,
       d.signal != null && d.connection !== "wired" ? [h("dt", {}, "Signal"), h("dd", {}, `${d.signal}%${d.link_rate ? ` · ${d.link_rate} Mbps link` : ""}`)] : null,
       d.model ? [h("dt", {}, "Model"), h("dd", {}, d.model)] : null,
+      d.brand || d.category ? [h("dt", {}, "Router says"), h("dd", {}, [categoryText(d.category), d.brand ? `made by ${d.brand}` : ""].filter(Boolean).join(", "))] : null,
+      d.router_name ? [h("dt", {}, "Its name"), h("dd", {}, `${d.router_name} (${d.name_user_set ? "typed in the Orbi app" : "chosen by the device"})`)] : null,
       h("dt", {}, "First seen"), h("dd", {}, d.first_seen ? fmtWhen(d.first_seen) : "—")),
     h("label", { class: "field" }, "Name", alias),
     h("label", { class: "field" }, "Family profile", profileSel),
@@ -647,11 +672,19 @@ async function renderMore() {
   const certInfo = h("div", {});
   const backupInfo = h("div", {});
   const restartInfo = h("div", {});
-  const routerFacts = [["Model", st.info?.model], ["Firmware", st.info?.firmware], ["Uptime", st.router_uptime],
+  const fwChecked = st.info?.firmware_checked;
+  const fwStale = st.info?.firmware_auto === false && fwChecked && Date.now() / 1000 - fwChecked > 14 * 86400;
+  const routerFacts = [["Model", st.info?.model], ["Firmware", st.info?.firmware],
+    ["Firmware installed", st.info?.firmware_installed ? fmtWhen(st.info.firmware_installed) : null],
+    ["Firmware updates", st.info?.firmware_auto == null ? null : `${st.info.firmware_auto ? "Automatic" : "Manual"}${fwChecked ? ` · last checked ${fmtWhen(fwChecked)}` : ""}`],
+    ["Uptime", st.router_uptime],
+    ["CPU (recent average)", st.system?.cpu_avg != null ? `${st.system.cpu_avg}%` : null],
     ["Memory used", st.system?.memory != null ? `${st.system.memory}%` : null],
+    ["In use since", st.info?.first_use ? fmtWhen(st.info.first_use) : null],
     ["Access Control", st.access_control == null ? null : st.access_control ? "On (needed for device blocking)" : "Off"]].filter(([, v]) => v != null && v !== "");
   const routerCard = h("section", { class: "card form" }, h("h2", {}, "Router"),
     routerFacts.length ? h("dl", { class: "kv" }, ...routerFacts.flatMap(([k, v]) => [h("dt", {}, k), h("dd", {}, v)])) : null,
+    fwStale ? h("div", { class: "note" }, "The router only looks for firmware updates when asked, and hasn't looked in over two weeks. Use Check for firmware update below; security fixes come that way.") : null,
     h("label", { class: "field" }, `Admin password for ${settings.router_host}`, rpw),
     h("button", { class: "btn", onclick: (e) => act(e.currentTarget, () => api("/api/settings/router-password", { body: { password: rpw.value } }), "Router password saved").then(() => (rpw.value = "")) }, "Update password"),
     h("button", { class: "btn", onclick: (e) => act(e.currentTarget, async () => { const f = await api("/api/firmware"); toast(f.available ? `Firmware ${f.available} is available` : `Firmware ${f.current} is up to date`); }) }, "Check for firmware update"),

@@ -414,6 +414,7 @@ def create_app(monitor: Monitor) -> FastAPI:
                 "blocked": d["mac"] in applied or bool(snap.get("blocked")), "block_reason": want.get(d["mac"]) or
                 ("Blocked on the router" if snap.get("blocked") else ""), "protected": d["mac"] in protected,
                 "first_seen": d["first_seen"], "last_seen": d["last_seen"],
+                "brand": snap.get("brand", ""), "category": snap.get("category", ""), "name_user_set": bool(snap.get("name_user_set")),
             })
         return out
 
@@ -1306,6 +1307,8 @@ def create_app(monitor: Monitor) -> FastAPI:
                 raise RuntimeError("You're already on the latest version")
             res = updater.apply(info, config.DATA_DIR, s["port"])
             store.event("update", f"Installing Orbi Control {res['to']}", detail=f"from {res['from']}")
+            if monitor.tamper:
+                monitor.tamper.stopped(f"updating to {res['to']}")
             threading.Timer(3, os._exit, (0,)).start()  # the helper restarts the app on the new code
             return res
         if updater.is_git_checkout():

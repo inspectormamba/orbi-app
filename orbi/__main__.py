@@ -10,7 +10,7 @@ from logging.handlers import RotatingFileHandler
 
 import uvicorn
 
-from . import config, updater
+from . import config, tamper, updater
 from .monitor import Monitor
 from .store import Store
 from .web import create_app
@@ -61,6 +61,7 @@ def main():
     log.info("Orbi Control %s", updater.current_version())
     update_note = updater.record_result(store, config.DATA_DIR)
     monitor = Monitor(store, notify=lambda t, m: tray and tray.notify(t, m))
+    monitor.tamper = tamper.Tamper(monitor)
     monitor.start()
 
     server = uvicorn.Server(uvicorn.Config(create_app(monitor), host="0.0.0.0", port=port, log_level="warning",
@@ -76,6 +77,7 @@ def main():
     from .tray import Tray
 
     def quit_all():
+        monitor.tamper.stopped("Quit from the tray")
         monitor.stop()
         server.should_exit = True
 
