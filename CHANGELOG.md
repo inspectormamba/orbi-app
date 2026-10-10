@@ -2,6 +2,19 @@
 
 What changed in each version, newest first. The same notes appear in the app under More → Updates.
 
+## 1.1.9 (2026-10-10)
+
+### History that can't be quietly erased
+- Other programs on this PC can no longer delete Orbi Control's alerts or router log.
+- Every alert is also copied to the Windows Event Log (Event Viewer > Windows Logs > Application, source "Orbi Control"). Alerts deleted anyway are put back from that copy.
+- New alerts when history is deleted, when alert or protection switches are turned off from outside the app (they're switched back on), when the PIN is changed while the app was stopped, when the app is shut down without Quit, and when the Windows log is cleared.
+### Devices
+- Devices shows what the router itself says each device is (brand and kind), and you get an alert when a device's own name doesn't fit, such as a laptop calling itself an Echo.
+- While a profile's devices are cut off, History notes when one moves to a different Orbi.
+### More
+- More router details: firmware install date, auto-update and last check, first setup date, average CPU.
+- Usage details now include this week, this month and last month, with per-day averages.
+
 ## 1.1.8 (2026-10-09)
 
 ### Break-in detection on the PIN page
