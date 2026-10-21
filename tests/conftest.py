@@ -134,6 +134,9 @@ def monitor(tmp_config, fake_router, monkeypatch):
     monkeypatch.setattr("orbi.lanwatch.local_ip_for", lambda host: None)
     monkeypatch.setattr("orbi.lanwatch.adapter", lambda ip: {})
     monkeypatch.setattr("orbi.lanwatch.dhcp_servers", lambda ip, mac, timeout=4.0: {})
+    monkeypatch.setattr("orbi.vulnscan.upnp_identities", lambda ip: {})
+    monkeypatch.setattr("orbi.vulnscan.kev_ids", lambda path, fetch=None: set())
+    monkeypatch.setattr("orbi.vulnscan.nvd_entries", lambda cpe: [])
     store = Store(tmp_config / "orbi.db")
     notes = []
     m = Monitor(store, notify=lambda t, msg: notes.append((t, msg)), router_factory=lambda: fake_router,

@@ -31,6 +31,7 @@ DEFAULTS = {
     "protected_macs": [],  # never blocked (this PC is added automatically)
     "check_updates": True,  # look for new versions on GitHub twice a day (installing always needs a click)
     "exposure_watch": False,  # once a day, check every device for SSH, Remote Desktop, VNC and the like
+    "vulnscan_watch": False,  # once a day, the device check: unencrypted logins, backdoor ports, firmware vulnerabilities
     "revoked_sessions": {},  # nonce -> expiry of session tokens that were signed out
 }
 

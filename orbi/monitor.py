@@ -207,7 +207,7 @@ class Monitor:
                  "traffic": self.traffic_loop, "speedtest": self.speedtest_schedule_loop, "maintenance": self.maintenance_loop,
                  "routerlog": self.routerlog_loop, "updates": self.update_loop, "weekly": self.weekly_loop,
                  "restart": self.restart_loop, "dnsaccount": self.dns_account_loop,
-                 "exposure": self.exposure_loop, "dhcpwatch": self.dhcp_watch_loop}
+                 "exposure": self.exposure_loop, "dhcpwatch": self.dhcp_watch_loop, "vulnscan": self.vulnscan_loop}
         if self.tamper:
             loops["tamper"] = self.tamper.loop
         self._loops = loops
@@ -1484,6 +1484,80 @@ class Monitor:
             self.store.event("remote_access", f"Remote access closed on {name}", detail=f"{exposure.describe(ports)} at {ip}",
                              mac="" if mac in ("router", "this-pc") else mac)
         return now
+
+    # ---- device check: unencrypted logins, backdoor ports, firmware vulnerabilities (vulnscan) ----
+    def vulnscan_loop(self):
+        self.stop_event.wait(240)
+        self._every(lambda: 3600, self._vulnscan_due)
+
+    def _vulnscan_due(self):
+        if config.load().get("vulnscan_watch") and time.time() - (self.store.get("vulnscan_ts") or 0) >= 24 * 3600:
+            self.check_devices()
+
+    def check_devices(self) -> dict:
+        """Check every online device, the router and its satellites. The first check reports what it found in one
+        summary; after that, each new problem is an alert and each fixed one is noted."""
+        from . import vulnscan
+        s = config.load()
+        targets = {}
+        for r in self.store.q("SELECT mac, alias, router_name, model, last_ip FROM devices WHERE online=1 AND last_ip != ''"):
+            targets[r["last_ip"]] = {"key": r["mac"], "name": r["alias"] or r["router_name"] or r["model"] or r["mac"]}
+        info, extra = self.state.get("info") or {}, {}
+        targets[s["router_host"]] = {"key": "router", "name": "The Orbi router", "orbi": True}
+        if info.get("model") and info.get("firmware"):
+            extra[s["router_host"]] = {"maker": "NETGEAR", "model_number": info["model"], "firmware": info["firmware"]}
+        for sat in self.state["satellites"]:
+            if sat.get("ip"):
+                targets[sat["ip"]] = {"key": sat["mac"], "name": sat.get("name") or "Satellite", "orbi": True}
+                if sat.get("model") and sat.get("firmware"):
+                    extra[sat["ip"]] = {"maker": "NETGEAR", "model_number": sat["model"], "firmware": sat["firmware"]}
+        local_ip = lanwatch.local_ip_for(s["router_host"])
+        if local_ip:
+            targets.setdefault(local_ip, {"key": "this-pc", "name": "This PC"})
+        cache = self.store.get("nvd_cache") or {}
+        kev = vulnscan.kev_ids(config.DATA_DIR / "kev_ids.json")
+        result = vulnscan.check_devices(targets, local_ip, cache, kev, extra_identities=extra)
+        self.store.put("nvd_cache", {k: v for k, v in cache.items() if time.time() - v["ts"] < 30 * 86400})
+
+        prev = self.store.get("vulnscan")
+        first, prev = prev is None, prev or {}
+        for key, entry in prev.items():  # offline now: keep what it had for a month, so coming back isn't "new"
+            if key not in result and time.time() - entry.get("ts", 0) < 30 * 86400:
+                result[key] = entry
+        now = time.time()
+        for entry in result.values():
+            entry.setdefault("ts", now)
+        self.store.put("vulnscan", result)
+        self.store.put("vulnscan_ts", now)
+
+        def mac_of(key):
+            return "" if key in ("router", "this-pc") or ":" not in key else key
+        sev = {"bad": "error", "warn": "warn", "info": "info"}
+        if first:
+            found = [(e, f) for e in result.values() for f in e["findings"] if f["severity"] != "info"]
+            if found:
+                listing = "; ".join(f"{e['name']}: {f['title']}" for e, f in found)
+                worst = "error" if any(f["severity"] == "bad" for _, f in found) else "warn"
+                self.store.event("device_check", f"Device check found {len(found)} problem{'s' if len(found) > 1 else ''}",
+                                 detail=listing, severity=worst)
+                self.notify("Device check", listing[:240])
+            else:
+                self.store.event("device_check", f"Device check: no problems found on {len(result)} devices")
+            return result
+        for key, entry in result.items():
+            before = {f["key"]: f for f in (prev.get(key) or {}).get("findings", [])}
+            after = {f["key"]: f for f in entry["findings"]}
+            for k in after.keys() - before.keys():
+                f = after[k]
+                if f["severity"] == "info":
+                    continue
+                self.store.event("device_check", f"{entry['name']}: {f['title']}", detail=f"{f['fix']} ({entry['ip']})",
+                                 severity=sev[f["severity"]], mac=mac_of(key))
+                self.notify(f"{entry['name']}: security problem", f["title"])
+            for k in before.keys() - after.keys():
+                if before[k]["severity"] != "info" and key in result and entry.get("ts") == now:
+                    self.store.event("device_check", f"{entry['name']}: fixed - {before[k]['title']}", mac=mac_of(key))
+        return result
 
     # ---- NextDNS / OpenDNS Home: they only filter while they know this home's internet address ----
     def dns_account_loop(self):

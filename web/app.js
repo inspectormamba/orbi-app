@@ -728,8 +728,8 @@ async function renderMore() {
   } });
   const advCard = h("section", { class: "card" }, h("h2", {}, "Advanced mode"),
     h("label", { class: "switch" }, "Show the Advanced tab (Wi-Fi networks, DHCP, logs, VPN, firewall rules…)", advToggle));
-  setView(securityChecklistCard(), alertCard, pushCard(), exposureCard(), phone, remoteCard(), advCard, monitoring, routerCard, pinCard, securityCard, updatesCard(settings),
-    h("div", { class: "muted small center" }, "Orbi Control runs on your PC and talks to the Orbi directly — no cloud. Outside connections: the optional update check to GitHub, and internet checks to 1.1.1.1, 8.8.8.8 and 9.9.9.9."));
+  setView(securityChecklistCard(), alertCard, pushCard(), exposureCard(), deviceCheckCard(), phone, remoteCard(), advCard, monitoring, routerCard, pinCard, securityCard, updatesCard(settings),
+    h("div", { class: "muted small center" }, "Orbi Control runs on your PC and talks to the Orbi directly — no cloud. Outside connections: the optional update check to GitHub, internet checks to 1.1.1.1, 8.8.8.8 and 9.9.9.9, and, when the device check is on, CISA's and NIST's vulnerability lists (only product names and firmware versions are sent)."));
 }
 
 // ---------- break-in attempts ----------
@@ -915,6 +915,51 @@ function pushCodeSheet(c, fresh) {
 }
 
 // ---------- remote-access watch ----------
+// ---------- device check (vulnscan): unencrypted logins, backdoor ports, firmware vulnerabilities ----------
+function deviceCheckCard() {
+  const card = h("section", { class: "card" }, h("h2", {}, "Device check"), h("div", { class: "muted small" }, h("span", { class: "spinner" })));
+  const label = { bad: "Fix", warn: "Check", info: "Note" };
+  const render = (x) => {
+    const on = h("input", { type: "checkbox", checked: x.enabled, onchange: (e) => act(null, async () => {
+      render(await api("/api/vulnscan", { method: "PUT", body: { enabled: e.target.checked } }));
+      if (e.target.checked) {
+        await waitJob("vulnscan", "Checking every device (a few minutes)");
+        render(await api("/api/vulnscan"));
+      }
+    }).catch(() => render(x)) });
+    const toggle = h("label", { class: "switch" }, "Check every device once a day", on);
+    const about = "Looks for logins that travel unencrypted (Telnet, FTP, web admin pages on plain http), ports that malware and router backdoors use, and known serious vulnerabilities in the firmware each device reports. No passwords are tried. Firmware versions are looked up in NIST's vulnerability database, and anything attackers are actively using (CISA's list) is marked urgent.";
+    if (!x.enabled) {
+      fill(card, h("h2", {}, "Device check"), toggle, h("div", { class: "muted small", style: "margin-top:8px" }, `Off. ${about}`));
+      return;
+    }
+    const check = h("button", { class: "btn small act", onclick: (e) => act(e.currentTarget, async () => {
+      await api("/api/vulnscan/scan", { body: {} });
+      await waitJob("vulnscan", "Checking every device (a few minutes)");
+      render(await api("/api/vulnscan"));
+      return { note: "Check finished" };
+    }) }, "Check now");
+    const withFindings = x.devices.filter((d) => d.findings.length);
+    const identified = x.devices.filter((d) => d.identity && (d.identity.model || d.identity.model_number));
+    const idList = h("div", { hidden: true }, ...identified.map((d) => h("div", { class: "row" }, h("div", { class: "main" },
+      h("div", { class: "name" }, d.name),
+      h("div", { class: "meta", style: "white-space:normal" }, [d.identity.maker, d.identity.model || d.identity.model_number,
+        d.identity.firmware ? `firmware ${d.identity.firmware}` : null, d.identity.lookup_error].filter(Boolean).join(" · "))))));
+    fill(card, h("h2", {}, "Device check", check), toggle,
+      !x.ts ? h("div", { class: "muted small" }, "Not checked yet. Runs once a day.")
+        : withFindings.length ? withFindings.flatMap((d) => d.findings.map((f) => h("div", { class: "row" }, h("div", { class: "main" },
+          h("div", { class: "name", style: "white-space:normal" }, `${d.name}: ${f.title}`),
+          h("div", { class: "meta", style: "white-space:normal" }, `${f.fix} (${d.ip})`)),
+          h("span", { class: `pill ${f.severity === "info" ? "" : f.severity}` }, label[f.severity]))))
+        : h("div", { class: "muted small" }, "✓ No problems found."),
+      x.ts ? h("div", { class: "muted small", style: "margin-top:8px" }, `Checked ${x.devices.length} devices · ${ago(x.ts)}. `,
+        identified.length ? h("a", { href: "#", onclick: (e) => { e.preventDefault(); idList.hidden = !idList.hidden; } }, `${identified.length} identified by make and firmware`) : null) : null,
+      idList, h("div", { class: "muted small", style: "margin-top:8px" }, about));
+  };
+  api("/api/vulnscan").then(render).catch((e) => fill(card, h("h2", {}, "Device check"), h("div", { class: "error-text" }, e.message)));
+  return card;
+}
+
 function exposureCard() {
   const card = h("section", { class: "card" }, h("h2", {}, "Remote access"), h("div", { class: "muted small" }, h("span", { class: "spinner" })));
   const render = (x) => {
@@ -955,8 +1000,8 @@ function exposureCard() {
 // settings and summarizing them - is just a checklist against data the app already collects.)
 function securityChecklistCard() {
   const card = h("section", { class: "card" }, h("h2", {}, "Security checklist"), h("div", { class: "muted small" }, h("span", { class: "spinner" })));
-  Promise.all([api("/api/status"), api("/api/advanced"), api("/api/filtering"), api("/api/exposure"), api("/api/settings"), api("/api/lanwatch")])
-    .then(([st, adv, filt, exp, settings, lw]) => {
+  Promise.all([api("/api/status"), api("/api/advanced"), api("/api/filtering"), api("/api/exposure"), api("/api/settings"), api("/api/lanwatch"), api("/api/vulnscan")])
+    .then(([st, adv, filt, exp, settings, lw, vs]) => {
       const d = adv.data;
       const items = [];
       const add = (status, title, detail, action) => items.push({ status: status === true ? "ok" : status, title, detail, action });
@@ -986,6 +1031,13 @@ function securityChecklistCard() {
           : dh.pc_server && dh.pc_server !== lw.router_host ? `This PC got its address from ${dh.pc_server}, not the Orbi. Details in History.`
           : Object.keys(dh.servers || {}).length ? `Only the Orbi hands out addresses (checked ${ago(dh.ts)}).`
           : "Nothing answered the check, not even the Orbi. Windows Firewall may be blocking it on this PC.", checkNow);
+
+      const vf = vs.devices.flatMap((d) => d.findings.filter((f) => f.severity !== "info").map((f) => ({ ...f, device: d.name })));
+      add(!vs.enabled || !vs.ts ? "warn" : vf.some((f) => f.severity === "bad") ? "bad" : vf.length ? "warn" : true, "Device check",
+        !vs.enabled ? "Off. Turn it on under Device check below to look for unencrypted logins, backdoor ports and firmware with known vulnerabilities."
+          : !vs.ts ? "Not checked yet."
+          : vf.length ? `${vf.length} problem${vf.length > 1 ? "s" : ""}: ${vf.slice(0, 3).map((f) => `${f.device}: ${f.title}`).join("; ")}. Details under Device check below.`
+          : `No problems on ${vs.devices.length} devices (checked ${ago(vs.ts)}).`);
 
       const up = lw.upload;
       add(up.open ? "warn" : up.history_days < up.learning_days ? "warn" : true, "Unusual-upload alert",

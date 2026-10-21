@@ -1055,6 +1055,32 @@ def create_app(monitor: Monitor) -> FastAPI:
             raise HTTPException(409, "A check is already running")
         return {"ok": True}
 
+    # ---------- device check (vulnscan) ----------
+    @app.get("/api/vulnscan")
+    def vulnscan_status():
+        found = store.get("vulnscan") or {}
+        order = {"bad": 0, "warn": 1, "info": 2}
+        devices = sorted(({"key": k, **v} for k, v in found.items()),
+                         key=lambda d: (min((order[f["severity"]] for f in d["findings"]), default=3), d["name"].lower()))
+        return {"enabled": bool(config.load().get("vulnscan_watch")), "ts": store.get("vulnscan_ts"), "devices": devices,
+                "job": monitor.jobs.get("vulnscan")}
+
+    @app.put("/api/vulnscan")
+    def vulnscan_enable(body: EnabledBody):
+        config.save({"vulnscan_watch": body.enabled})
+        store.event("action", "Device check turned " + ("on" if body.enabled else "off"), severity="info" if body.enabled else "warn")
+        if body.enabled:
+            monitor.run_job("vulnscan", lambda: len(monitor.check_devices()))
+        return vulnscan_status()
+
+    @app.post("/api/vulnscan/scan")
+    def vulnscan_scan():
+        if not config.load().get("vulnscan_watch"):
+            raise HTTPException(400, "Turn on the device check first")
+        if not monitor.run_job("vulnscan", lambda: len(monitor.check_devices())):
+            raise HTTPException(409, "A check is already running")
+        return {"ok": True}
+
     # ---------- fake router and unusual upload (lanwatch) ----------
     @app.get("/api/lanwatch")
     def lanwatch_status():

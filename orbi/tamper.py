@@ -35,14 +35,14 @@ CHECKPOINT_EVERY = 10 * 60
 RESTORE_LIMIT = 20000  # most recent alert copies read back when restoring
 # Switches that only ever make the app quieter or more permissive when turned off: put back if changed outside.
 GUARDED = ("alert_admin_login_failures", "alert_new_devices", "block_pin_attackers", "hold_new_devices", "check_updates",
-           "push_enabled", "exposure_watch")
+           "push_enabled", "exposure_watch", "vulnscan_watch")
 # Changes outside the app are reported. Only fingerprints go in the Event Log (other Windows users can read it).
 WATCHED = ("pin_hash", "extra_pins", "protected_macs", "mute_new_device_macs", "default_profile_id", "router_host",
            "router_user", "router_cert_pins", "push_topic_enc", "push_server")
 LABELS = {"alert_admin_login_failures": "Alert on failed router sign-ins", "alert_new_devices": "Alert on new devices",
           "block_pin_attackers": "Block devices attacking the PIN", "hold_new_devices": "Hold new devices",
           "check_updates": "Check for updates", "push_enabled": "Phone alerts",
-          "exposure_watch": "Remote-access check", "push_topic_enc": "the phone-alert code",
+          "exposure_watch": "Remote-access check", "vulnscan_watch": "Device check", "push_topic_enc": "the phone-alert code",
           "push_server": "the phone-alert server", "pin_hash": "the PIN", "extra_pins": "the spare PINs",
           "protected_macs": "never-blocked devices", "mute_new_device_macs": "muted devices",
           "default_profile_id": "the default profile", "router_host": "the router address",
