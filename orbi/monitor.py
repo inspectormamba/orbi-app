@@ -13,7 +13,7 @@ import threading
 import time
 from datetime import datetime, timedelta
 
-from . import config, parental, vpnlog
+from . import config, lanwatch, parental, vpnlog
 from .router import RouterClient, RouterError, backhaul_kind, norm_mac
 from .store import Store
 
@@ -163,6 +163,8 @@ class Monitor:
         self._room: dict[str, str] = {}  # mac -> the Orbi (router or satellite) a Wi-Fi device settled on
         self._room_pending: dict[str, tuple[str, int]] = {}  # mac -> (a different Orbi, scans seen on it)
         self._room_noted: dict[str, float] = {}
+        self._gateway_odd: tuple[str, int] | None = None  # (hardware address answering for the router, checks in a row)
+        self._spike = {"streak": 0, "event_id": None, "sent": 0.0, "pc_sent": 0.0, "since": None, "peak": 0.0, "last_pc": None}
         self.protected = local_macs()
         self.tamper = None  # tamper.Tamper, set by __main__ (the real app only: it writes to the Windows Event Log)
 
@@ -205,7 +207,7 @@ class Monitor:
                  "traffic": self.traffic_loop, "speedtest": self.speedtest_schedule_loop, "maintenance": self.maintenance_loop,
                  "routerlog": self.routerlog_loop, "updates": self.update_loop, "weekly": self.weekly_loop,
                  "restart": self.restart_loop, "dnsaccount": self.dns_account_loop,
-                 "exposure": self.exposure_loop}
+                 "exposure": self.exposure_loop, "dhcpwatch": self.dhcp_watch_loop}
         if self.tamper:
             loops["tamper"] = self.tamper.loop
         self._loops = loops
@@ -304,9 +306,10 @@ class Monitor:
             self.notify("This PC is back online", f"It was cut off for {fmt_duration(dur)}")
             st["pc_offline_id"] = None
 
-        # Satellites: only meaningful while this PC can reach the router itself.
+        # Satellites and the router's own identity: only meaningful while this PC can reach the router itself.
         if router_ms is not None:
             self.check_satellites()
+            self.check_gateway()
 
     def check_satellites(self):
         """Probes each known satellite directly, so a dropped one is noticed within a couple of
@@ -1007,7 +1010,194 @@ class Monitor:
 
     def record_traffic(self):
         if self.router:
-            self.store.x("INSERT INTO traffic(ts,data) VALUES(?,?)", (time.time(), json.dumps(self.router.traffic())))
+            now = time.time()
+            self.store.x("INSERT INTO traffic(ts,data) VALUES(?,?)", (now, json.dumps(self.router.traffic())))
+            try:
+                self.check_upload_spike(now)
+            except Exception:
+                log.exception("upload check failed")
+
+    # ---- unusual whole-house upload (lanwatch) ----
+    def _online_names(self, limit: int = 10) -> str:
+        rows = self.store.q("SELECT mac, COALESCE(NULLIF(alias,''), NULLIF(router_name,''), NULLIF(model,''), mac) AS n FROM devices "
+                            "WHERE online=1 ORDER BY n COLLATE NOCASE")
+        names = [r["n"] for r in rows if r["mac"] not in self.protected]
+        more = len(names) - limit
+        return ", ".join(names[:limit]) + (f" and {more} more" if more > 0 else "") if names else "none listed"
+
+    def _pc_sent_mb(self) -> float | None:
+        """MB this PC sent on its home-network adapter since the last traffic reading (None if unknown)."""
+        ip = lanwatch.local_ip_for(config.load()["router_host"])
+        now_bytes = (lanwatch.adapter(ip) if ip else {}).get("sent_bytes")
+        last, self._spike["last_pc"] = self._spike["last_pc"], now_bytes
+        if now_bytes is None or last is None or now_bytes < last:
+            return None
+        return (now_bytes - last) / 1e6
+
+    def check_upload_spike(self, now: float):
+        sp = self._spike
+        if sp["event_id"] is None:  # one left open by a restart mid-spike can't be finished: close it as it stood
+            for ev in self.store.q("SELECT id, detail FROM events WHERE kind='upload_spike' AND end_ts IS NULL"):
+                self._close(ev["id"], f"{ev['detail']} (Orbi Control restarted before it ended.)")
+        interval = config.load()["traffic_interval"]
+        rows = [{"ts": r["ts"], **json.loads(r["data"])} for r in
+                self.store.q("SELECT ts, data FROM traffic WHERE ts > ? ORDER BY ts", (now - (lanwatch.BASELINE_DAYS + 1) * 86400,))]
+        pc = self._pc_sent_mb()
+        rates = lanwatch.upload_rates(rows, interval)
+        if not rates or rates[-1][0] < rows[-1]["ts"]:  # this reading came after a gap: no rate to judge
+            self._end_spike(now)
+            return
+        ts, rate = rates[-1]
+        line = lanwatch.spike_line(rates[:-1], now)
+        self.state["upload_watch"] = {"ts": now, "rate": rate, "line": line}
+        if not line or rate <= line["line"]:
+            self._end_spike(now)
+            return
+        sent = rate * (rows[-1]["ts"] - rows[-2]["ts"]) / 3600
+        sp["streak"] += 1
+        sp["sent"] += sent
+        sp["pc_sent"] = sp["pc_sent"] + pc if (pc is not None and sp["pc_sent"] is not None) else None
+        sp["peak"] = max(sp["peak"], rate)
+        sp["since"] = sp["since"] or rows[-2]["ts"]
+        sp["last_high"] = rows[-1]["ts"]
+        if sp["streak"] >= lanwatch.SPIKE_INTERVALS and sp["event_id"] is None:
+            mins = round((now - sp["since"]) / 60)
+            when = datetime.fromtimestamp(now).strftime("%a %I %p").replace(" 0", " ")
+            pc_part = f" This PC sent {lanwatch.fmt_mb(sp['pc_sent'])} of it." if sp["pc_sent"] is not None else ""
+            title = f"Unusual upload from the house: {lanwatch.fmt_mb(sp['sent'])} in {mins} min"
+            detail = (f"About {sp['peak'] / max(line['usual'], 1):.0f}x this house's usual upload for this time of day "
+                      f"({lanwatch.fmt_mb(line['usual'])} an hour around {when}).{pc_part} Online now: {self._online_names()}. "
+                      "The Orbi only counts the whole house, so it can't say which device it is. A backup, a cloud photo sync "
+                      "or a video upload is the usual innocent cause; a device you don't recognise, or one that shouldn't be "
+                      "sending much (a camera, a smart plug), is worth a look.")
+            sp["event_id"] = self.store.event("upload_spike", title, detail=detail, severity="warn", ts=sp["since"])
+            self.notify("Unusual upload", f"{lanwatch.fmt_mb(sp['sent'])} in {mins} min, about "
+                                          f"{sp['peak'] / max(line['usual'], 1):.0f}x normal for this time")
+
+    def _end_spike(self, now: float):
+        sp = self._spike
+        if sp["event_id"] is not None:
+            ev = self.store.one("SELECT detail FROM events WHERE id=?", (sp["event_id"],))
+            pc = f", {lanwatch.fmt_mb(sp['pc_sent'])} of it from this PC" if sp["pc_sent"] is not None else ""
+            end = sp.get("last_high") or now
+            self.store.close_event(sp["event_id"], end_ts=end, detail=f"{ev['detail'] if ev else ''} Ended after "
+                                   f"{fmt_duration(end - sp['since'])}: {lanwatch.fmt_mb(sp['sent'])} uploaded in all{pc}.")
+        sp.update(streak=0, event_id=None, sent=0.0, pc_sent=0.0, since=None, peak=0.0, last_high=None)
+
+    # ---- fake router: ARP spoofing and rogue DHCP servers (lanwatch) ----
+    GATEWAY_CONFIRM = 2  # health checks in a row (about a minute) before a new hardware address for the router counts
+    DHCP_WATCH_EVERY = 30 * 60
+
+    def _name_by_mac(self, mac: str | None) -> str | None:
+        if not mac:
+            return None
+        r = self.store.one("SELECT COALESCE(NULLIF(alias,''), NULLIF(router_name,''), NULLIF(model,'')) AS n FROM devices WHERE mac=?", (mac,))
+        return r["n"] if r and r["n"] else None
+
+    def check_gateway(self):
+        """The router's address (192.168.1.1) should always belong to the same hardware. If another device answers
+        for it (ARP spoofing), this PC's traffic, and usually the whole house's, is going through that device."""
+        from . import routercert
+        seen = routercert.gateway_mac(config.load()["router_host"])
+        if not seen:
+            return
+        # The router names itself: satellites linked straight to it report it as their parent. That comes over the
+        # router's own API, not ARP, so it's the reference when there are satellites; otherwise the first address seen.
+        told = {s["parent_mac"] for s in self.state["satellites"] if s.get("parent_mac") and str(s.get("hop", "0")) in ("0", "")}
+        pinned = self.store.get("gateway_mac")
+        if len(told) == 1 and (reported := next(iter(told))) != pinned:
+            self.store.put("gateway_mac", reported)
+            pinned = reported
+        if not pinned:
+            self.store.put("gateway_mac", seen)
+            return
+        open_id = self.store.get("gateway_alert_id")
+        if seen == pinned:
+            self._gateway_odd = None
+            if open_id:
+                ev = self.store.one("SELECT detail FROM events WHERE id=?", (open_id,))
+                self._close(open_id, f"{ev['detail'] if ev else ''} The real router is answering again.")
+                self.store.put("gateway_alert_id", None)
+            return
+        n = self._gateway_odd[1] + 1 if self._gateway_odd and self._gateway_odd[0] == seen else 1
+        self._gateway_odd = (seen, n)
+        if n < self.GATEWAY_CONFIRM or open_id:
+            return
+        who = self._name_by_mac(seen)
+        host = config.load()["router_host"]
+        title = f"{who} is pretending to be the router" if who else "Another device is answering as the router"
+        detail = (f"The router's address ({host}) now belongs to hardware address {seen}" + (f", which is {who}" if who else "")
+                  + f", instead of the Orbi ({pinned}). Traffic meant for the internet may be going through that device first "
+                    "(ARP spoofing). If you replaced the router, choose \"This is my new router\" in More → Security checklist. "
+                    "Otherwise find and unplug the device" + (f" ({who})" if who else "") + ", then restart the router.")
+        self.store.put("gateway_alert_id", self.store.event("fake_router", title, detail=detail, severity="error",
+                                                            mac=seen if who else ""))
+        self.notify("Fake router on your network", f"{who or 'A device'} is answering as the router. See History.")
+
+    def trust_gateway(self) -> str | None:
+        from . import routercert
+        seen = routercert.gateway_mac(config.load()["router_host"])
+        if seen:
+            before = self.store.get("gateway_mac")
+            self.store.put("gateway_mac", seen)
+            self._gateway_odd = None
+            if open_id := self.store.get("gateway_alert_id"):
+                self._close(open_id, "Marked as the new router.")
+                self.store.put("gateway_alert_id", None)
+            self.store.event("action", "New router hardware address trusted", detail=f"{before or 'none'} → {seen}", severity="warn")
+        return seen
+
+    def dhcp_watch_loop(self):
+        self.stop_event.wait(90)
+        self._every(lambda: self.DHCP_WATCH_EVERY, self.check_dhcp)
+
+    def check_dhcp(self) -> dict:
+        """Asks the network for an address (never taking one) and lists every DHCP server that answers. Only the Orbi
+        should; another one can hand devices an address that names itself as the router."""
+        import ipaddress
+        host = config.load()["router_host"]
+        ip = lanwatch.local_ip_for(host)
+        result = {"ts": time.time(), "local_ip": ip, "pc_server": None, "servers": {}, "error": None}
+        if not ip or ipaddress.ip_address(ip) not in ipaddress.ip_network(f"{host}/24", strict=False):
+            result["error"] = "This PC isn't on the home network"
+            self.store.put("dhcp_watch", result)
+            return result
+        a = lanwatch.adapter(ip)
+        result["pc_server"] = a.get("dhcp_server") if a.get("dhcp_enabled") else None
+        if a.get("mac"):
+            try:
+                result["servers"] = lanwatch.dhcp_servers(ip, a["mac"])
+                rogue = [s for s in result["servers"] if s != host]
+                if rogue:  # ask again before alerting: a second answer from it rules out a stray packet
+                    again = lanwatch.dhcp_servers(ip, a["mac"])
+                    result["servers"] = {**result["servers"], **again}
+                    result["confirmed"] = [s for s in rogue if s in again]
+            except OSError as e:
+                result["error"] = f"Couldn't send the check: {e}"
+        else:
+            result["error"] = "Couldn't find this PC's network adapter"
+        self.store.put("dhcp_watch", result)
+
+        offenders = {s: o for s, o in result["servers"].items() if s in result.get("confirmed", [])}
+        pc_server = result["pc_server"]
+        if pc_server and pc_server != host and re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", pc_server) and not pc_server.startswith("255."):
+            offenders.setdefault(pc_server, {"offered": ip, "gateway": None, "pc": True})
+        for src, offer in offenders.items():
+            if self._recent_alert("rogue_dhcp", src, 86400):
+                continue
+            mac = arp_mac(src)
+            who = self._name_by_mac(mac) or self.device_by_ip(src)
+            if offer.get("pc"):
+                what = f"This PC got its address ({ip}) from {who} ({src}), not from the Orbi ({host})."
+            else:
+                what = (f"{who} ({src}) answered this PC's request for an address, offering {offer.get('offered')}"
+                        + (f" with {offer['gateway']} as the router" if offer.get("gateway") else "") + f". Only the Orbi ({host}) should.")
+            detail = (f"{what} A device handing out addresses can make others send their traffic through it. If it's a second "
+                      "router, a travel router or a mesh point plugged in, turn off its DHCP server (or set it to access-point "
+                      "mode). If you don't know what it is, unplug it.")
+            self.store.event("rogue_dhcp", f"Another device is handing out addresses: {who}", detail=detail, severity="error", mac=mac or "")
+            self.notify("Second DHCP server on your network", f"{who} ({src}) is handing out addresses. See History.")
+        return result
 
     # ---- speed tests ----
     def start_speedtest(self, trigger="manual") -> bool:

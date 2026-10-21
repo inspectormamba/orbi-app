@@ -472,7 +472,7 @@ async function renderFamily() {
   const ac = status.enforce_error ? h("div", { class: "note" }, `Some blocks couldn't be applied: ${status.enforce_error}`) : null;
   setView(ac, intro, profiles.some((p) => p.rules.some((r) => r.enabled)) ? lateCard(profiles) : null, ...cards, profiles.length ? defaultCard(profiles) : null,
     h("button", { class: "btn primary block", onclick: () => profileSheet(null) }, "+ New profile"),
-    h("div", { class: "group-label", style: "margin-top:8px" }, "Whole house"), dns, blocking, vpnAttemptsCard());
+    h("div", { class: "group-label", style: "margin-top:8px" }, "Whole house"), dns, blocking);
   every(30000, async () => { if ($("#sheet").hidden) await renderFamily(); });
 }
 
@@ -576,7 +576,7 @@ async function renderHistory() {
     ...events.filter((e) => e.kind !== "outage").slice(0, 60).map((e) => h("div", { class: "row" },
       h("div", { class: "main" }, h("div", { class: "name", style: "white-space:normal" }, e.title), h("div", { class: "meta" }, [fmtWhen(e.ts), e.detail].filter(Boolean).join(" · "))),
       e.severity !== "info" ? h("span", { class: `pill ${e.severity === "error" ? "bad" : "warn"}` }, e.severity === "error" ? "Alert" : "Notice") : null)));
-  setView(chips, uptimeCard, outageCard, speedCard, trafficCard, log, routerLogCard());
+  setView(chips, uptimeCard, outageCard, speedCard, trafficCard, log, vpnAttemptsCard(), routerLogCard());
 }
 
 function routerLogCard() {
@@ -728,7 +728,7 @@ async function renderMore() {
   } });
   const advCard = h("section", { class: "card" }, h("h2", {}, "Advanced mode"),
     h("label", { class: "switch" }, "Show the Advanced tab (Wi-Fi networks, DHCP, logs, VPN, firewall rules…)", advToggle));
-  setView(alertCard, pushCard(), exposureCard(), phone, remoteCard(), advCard, monitoring, routerCard, pinCard, securityCard, updatesCard(settings),
+  setView(securityChecklistCard(), alertCard, pushCard(), exposureCard(), phone, remoteCard(), advCard, monitoring, routerCard, pinCard, securityCard, updatesCard(settings),
     h("div", { class: "muted small center" }, "Orbi Control runs on your PC and talks to the Orbi directly — no cloud. Outside connections: the optional update check to GitHub, and internet checks to 1.1.1.1, 8.8.8.8 and 9.9.9.9."));
 }
 
@@ -946,6 +946,101 @@ function exposureCard() {
       x.ts ? h("div", { class: "muted small", style: "margin-top:8px" }, `Checked ${x.devices.length} devices, including this PC and the router · ${ago(x.ts)}. You're alerted when any device starts accepting SSH, Remote Desktop, VNC, TeamViewer, AnyDesk or PowerShell remoting.`) : null);
   };
   api("/api/exposure").then(render).catch((e) => fill(card, h("h2", {}, "Remote access"), h("div", { class: "error-text" }, e.message)));
+  return card;
+}
+
+// ---------- security checklist: a free, local stand-in for a subscription's "vulnerability scan" ----------
+// (Netgear Armor's actual exploit/IPS/anomaly detection needs a licensed malware engine and deep packet
+// inspection on the router, which this app can't do. Its other headline feature - checking for weak/default
+// settings and summarizing them - is just a checklist against data the app already collects.)
+function securityChecklistCard() {
+  const card = h("section", { class: "card" }, h("h2", {}, "Security checklist"), h("div", { class: "muted small" }, h("span", { class: "spinner" })));
+  Promise.all([api("/api/status"), api("/api/advanced"), api("/api/filtering"), api("/api/exposure"), api("/api/settings"), api("/api/lanwatch")])
+    .then(([st, adv, filt, exp, settings, lw]) => {
+      const d = adv.data;
+      const items = [];
+      const add = (status, title, detail, action) => items.push({ status: status === true ? "ok" : status, title, detail, action });
+      const fmtMB = (mb) => mb >= 1000 ? `${(mb / 1000).toFixed(1)} GB` : `${Math.round(mb)} MB`;
+
+      const gw = lw.gateway;
+      const trust = h("button", { class: "btn small", onclick: (e) => {
+        if (!confirm("Only do this if you replaced the router. Is the device now answering as the router your new Orbi?")) return;
+        act(e.currentTarget, () => api("/api/lanwatch/trust-router", { body: {} }), "Now trusting the new router").then(() => renderMore());
+      } }, "This is my new router");
+      add(gw.alert ? "bad" : gw.expected ? true : "warn", "Fake router",
+        gw.alert ? `${gw.alert.title} (since ${fmtWhen(gw.alert.ts)}). Details in History.`
+          : gw.expected ? `Only the Orbi (${gw.expected}) answers as the router. Checked every ${settings.health_interval} s.`
+          : "Not checked yet.", gw.alert ? trust : null);
+
+      const dh = lw.dhcp;
+      const rogue = dh ? Object.keys(dh.servers || {}).filter((s) => s !== lw.router_host) : [];
+      const checkNow = h("button", { class: "btn small", onclick: (e) => act(e.currentTarget, async () => {
+        await api("/api/lanwatch/dhcp-check", { body: {} }); await waitJob("dhcpwatch", "Asking the network for DHCP servers");
+        renderMore().catch(() => {});
+      }) }, "Check now");
+      add(!dh ? "warn" : dh.error ? "warn" : rogue.length || (dh.pc_server && dh.pc_server !== lw.router_host) ? "bad"
+          : Object.keys(dh.servers || {}).length ? true : "warn", "Second DHCP server",
+        !dh ? "Not checked yet. Runs every 30 minutes."
+          : dh.error ? dh.error
+          : rogue.length ? `Besides the Orbi, ${rogue.join(", ")} handed out addresses (${ago(dh.ts)}). Details in History.`
+          : dh.pc_server && dh.pc_server !== lw.router_host ? `This PC got its address from ${dh.pc_server}, not the Orbi. Details in History.`
+          : Object.keys(dh.servers || {}).length ? `Only the Orbi hands out addresses (checked ${ago(dh.ts)}).`
+          : "Nothing answered the check, not even the Orbi. Windows Firewall may be blocking it on this PC.", checkNow);
+
+      const up = lw.upload;
+      add(up.open ? "warn" : up.history_days < up.learning_days ? "warn" : true, "Unusual-upload alert",
+        up.open ? `${up.open.title} (since ${fmtWhen(up.open.ts)}). Details in History.`
+          : up.history_days < up.learning_days ? `Learning this house's normal upload: ${Math.floor(up.history_days)} of ${up.learning_days} days.`
+          : up.line ? `Watching. Usual for this time of day: ${fmtMB(up.line.usual)} an hour; alerts above ${fmtMB(up.line.line)} an hour for 45 min. The Orbi only counts the whole house, so alerts can't name the device.`
+          : "Watching; the first reading comes within 15 minutes.");
+
+      add(filt.current ? true : "bad", "Malicious-site DNS protection",
+        filt.current ? `${filt.providers[filt.current]?.name || "A filter"} is active for every device.`
+          : "Your devices use your ISP's plain DNS, with no block on known-malicious sites. Add Quad9 (free) or another option in Family → Content filtering.");
+
+      if (d) {
+        const ports = [53, 853, 1194, 51820];
+        const covered = ports.filter((p) => (d.block_services.rules || []).some((r) => Number(r.port) === p && String(r.ips).toLowerCase() === "all")).length;
+        add(covered === ports.length ? true : "warn", "DNS & VPN bypass rules",
+          covered === ports.length ? "All 4 rules are in place for every device."
+            : `${covered} of ${ports.length} in place. Family → Whole house → "Add rules that block DNS & VPN workarounds…".`);
+
+        if (d.wps) {
+          add(!d.wps.enabled ? true : d.wps.adjustable ? "bad" : "warn", "WPS",
+            !d.wps.enabled ? "Off."
+              : d.wps.adjustable ? "On - lets a device join the Wi-Fi without the password for 2 minutes. Turn it off in Advanced → Wi-Fi networks."
+              : "On, and this firmware can't turn it off. Keep \"Hold new devices\" on so a device that joins this way stays blocked until approved.");
+        }
+
+        const openBand = (d.wifi || []).find((w) => w.enabled && /^(open|none|wep)\b/i.test(w.security || ""));
+        add(openBand ? "bad" : true, "Main Wi-Fi encryption",
+          openBand ? `${openBand.band} is "${openBand.security}" - essentially unprotected. Set WPA2/WPA3 in Advanced → Wi-Fi networks.` : "WPA2/WPA3 on every active band.");
+      }
+
+      const exposed = (exp.devices || []).filter((dv) => dv.services?.length);
+      add(!exp.enabled ? "warn" : exposed.length ? "bad" : exp.ts ? true : "warn", "Remote-access exposure",
+        !exp.enabled ? "The watch is off. Turn it on in More → Remote access."
+          : exposed.length ? `${exposed.length} device${exposed.length > 1 ? "s" : ""} on your network accept remote-control connections (SSH, Remote Desktop, VNC…).`
+          : exp.ts ? "Nothing in the house accepts remote control." : "Not checked yet - runs once a day once turned on.");
+
+      const fwChecked = st.info?.firmware_checked;
+      const fwStale = st.info?.firmware_auto === false && fwChecked && Date.now() / 1000 - fwChecked > 14 * 86400;
+      add(fwStale ? "warn" : true, "Router firmware checks",
+        fwStale ? "Hasn't looked for an update in over two weeks. Check in More → Router; security fixes come that way." : "Automatic, or checked recently.");
+
+      add(settings.alert_admin_login_failures ? true : "warn", "Failed admin-login alerts",
+        settings.alert_admin_login_failures ? "On." : "Off. A guessed router password would go unnoticed. Turn on in More → Settings.");
+
+      const okCount = items.filter((i) => i.status === "ok").length;
+      const headerClass = items.some((i) => i.status === "bad") ? "bad" : okCount === items.length ? "ok" : "warn";
+      const label = { ok: "Good", warn: "Check", bad: "Fix" };
+      fill(card, h("h2", {}, "Security checklist", h("span", { class: `pill ${headerClass}` }, `${okCount}/${items.length}`)),
+        h("div", { class: "muted small", style: "margin-bottom:6px" }, "What a security subscription's \"vulnerability scan\" mostly checks for - built free from data this app already collects."),
+        ...items.map((i) => h("div", { class: "row" }, h("div", { class: "main" }, h("div", { class: "name" }, i.title),
+          h("div", { class: "meta", style: "white-space:normal" }, i.detail),
+          i.action ? h("div", { style: "margin-top:6px" }, i.action) : null),
+          h("span", { class: `pill ${i.status}` }, label[i.status]))));
+    }).catch((e) => fill(card, h("h2", {}, "Security checklist"), h("div", { class: "error-text" }, e.message)));
   return card;
 }
 
@@ -1554,7 +1649,7 @@ function reportSheet(p) {
   load();
 }
 
-// ---------- blocked VPN attempts (Family → Whole house) ----------
+// ---------- blocked VPN attempts (History) ----------
 function vpnAttemptsCard() {
   const card = h("section", { class: "card" }, h("h2", {}, "VPN attempts"), h("div", { class: "muted small" }, h("span", { class: "spinner" })));
   api("/api/events?kind=vpn_attempt&limit=20").then((list) => fill(card, h("h2", {}, "VPN attempts"),

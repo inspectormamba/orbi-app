@@ -1055,6 +1055,35 @@ def create_app(monitor: Monitor) -> FastAPI:
             raise HTTPException(409, "A check is already running")
         return {"ok": True}
 
+    # ---------- fake router and unusual upload (lanwatch) ----------
+    @app.get("/api/lanwatch")
+    def lanwatch_status():
+        from . import lanwatch
+        alert_id = store.get("gateway_alert_id")
+        first = store.one("SELECT MIN(ts) AS t FROM traffic")["t"]
+        up = monitor.state.get("upload_watch") or {}
+        return {
+            "gateway": {"expected": store.get("gateway_mac"),
+                        "alert": store.one("SELECT title, detail, ts FROM events WHERE id=?", (alert_id,)) if alert_id else None},
+            "dhcp": store.get("dhcp_watch"), "dhcp_job": monitor.jobs.get("dhcpwatch"),
+            "upload": {"history_days": round((time.time() - first) / 86400, 1) if first else 0, "learning_days": lanwatch.MIN_HISTORY_DAYS,
+                       "line": up.get("line"), "rate": up.get("rate"), "ts": up.get("ts"),
+                       "open": store.one("SELECT title, ts FROM events WHERE kind='upload_spike' AND end_ts IS NULL ORDER BY ts DESC LIMIT 1")},
+            "router_host": config.load()["router_host"],
+        }
+
+    @app.post("/api/lanwatch/trust-router")
+    def lanwatch_trust_router():
+        if not monitor.trust_gateway():
+            raise HTTPException(409, "Couldn't read the router's hardware address from this PC")
+        return lanwatch_status()
+
+    @app.post("/api/lanwatch/dhcp-check")
+    def lanwatch_dhcp_check():
+        if not monitor.run_job("dhcpwatch", lambda: len(monitor.check_dhcp()["servers"])):
+            raise HTTPException(409, "A check is already running")
+        return {"ok": True}
+
     @app.post("/api/filtering/protect")
     def add_protection_rules():
         """Router rules that stop devices from getting around the filter (their own DNS, DNS-over-TLS, VPNs)."""
