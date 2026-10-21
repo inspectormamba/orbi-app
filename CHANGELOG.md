@@ -2,6 +2,15 @@
 
 What changed in each version, newest first. The same notes appear in the app under More → Updates.
 
+## 1.1.16 (2026-10-20)
+
+### Security
+- New: a Security checklist at the top of More. It checks the things a paid "network security" subscription's scan looks for (malicious-site filtering, the rules that stop DNS and VPN workarounds, WPS, Wi-Fi encryption, devices open to remote control, firmware checks, failed-login alerts) and says where to fix each one.
+- New: fake-router alert. You're told if another device starts answering as the router, or starts handing out addresses on your network, which can send the house's traffic through that device. It names the device when it can.
+- New: unusual-upload alert. You're told when the house uploads far more than it normally does at that time of day for 45 minutes. The Orbi only counts the whole house, so the alert lists what was online and how much this PC sent rather than naming one device. It learns your normal for 5 days first.
+### Family and History
+- Blocked VPN attempts are now listed in History instead of on the Family page.
+
 ## 1.1.15 (2026-10-15)
 
 - New: every pop-up has an X in the top corner to close it, and it stays in view when you scroll a long list.
