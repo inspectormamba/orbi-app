@@ -2,6 +2,12 @@
 
 What changed in each version, newest first. The same notes appear in the app under More → Updates.
 
+## 1.1.17 (2026-10-20)
+
+### Security
+- New: Device check (More → Device check, off until you turn it on). Once a day it checks every device in the house, the router and its satellites for logins that travel unencrypted (Telnet, FTP, admin pages on plain http), ports that malware and router backdoors use, and known serious vulnerabilities in the firmware each device reports, with the version that fixes them. Anything attackers are actively using is marked urgent. It never tries passwords, and only product names and versions are looked up online (in NIST's and CISA's public vulnerability lists).
+- The Security checklist now includes the Device check's results.
+
 ## 1.1.16 (2026-10-20)
 
 ### Security
