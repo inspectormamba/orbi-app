@@ -2,6 +2,20 @@
 
 What changed in each version, newest first. The same notes appear in the app under More → Updates.
 
+## 1.1.18 (2026-10-23)
+
+### Router watch
+- New: an alert when Orbi Control can't work with the router for 10 minutes, whatever the reason (unreachable, a new security certificate, a rejected password), with a reminder every 2 hours until it's back. On reconnecting it re-checks the firewall rules and block list straight away.
+- If the router restarts without the app asking (unplugged, a power cut, a crash), the app reconnects by itself when it's clearly the same router, and alerts "Router restarted". Unplugging the router no longer switches schedules off until a parent notices.
+- The firewall rules and the block list are re-read every 15 minutes, so changes made on the router itself are caught. New alerts when rules are limited to a schedule, moved to other ports or narrowed to fewer devices, and when an address is given a pass through the block list.
+- New: Outside check-in (More). The app checks in with a free healthchecks.io check every 5 minutes, so you're alerted when this PC goes offline or is turned off.
+
+### Block apps & sites
+- AI chatbots (ChatGPT, Claude, Gemini, Copilot, Grok, Character.AI and more) and social media (Instagram, Snapchat, X, Reddit, Discord, WhatsApp and more) can be blocked, in groups with All and None buttons.
+- The router keeps only a keyword's main name and blocks every address containing it, so keywords whose main name is shorter than 4 letters are refused (api.x.ai would have blocked everything with an "x", Netflix included).
+- Fixed: saving a long list failed partway through.
+- Fixed: the card spun forever when the router couldn't be read; it now says why and offers Try again.
+
 ## 1.1.17 (2026-10-20)
 
 ### Security
