@@ -1280,15 +1280,14 @@ function accountSheet(key, f) {
 // ---------- whole-house app & site blocking ----------
 // The Orbi blocks any web address that CONTAINS a keyword's main name, and for a keyword with dots it keeps only the
 // part before the ending: "api.x.ai" became "x" and blocked Netflix and Dropbox, "meta.ai" blocked every "meta"
-// address. So these are plain, distinctive names; services whose name is short or common (Meta AI, Poe, Kik, Kick,
-// Sora, Nomi…) are left out because they can't be blocked without breaking other sites.
+// address. So these are plain, distinctive names; services whose name is short or common (X and Grok, Meta AI, Poe,
+// Kik, Kick, Sora, Nomi…) are left out because they can't be blocked without breaking other sites.
 const BLOCK_GROUPS = [
   ["AI chatbots", [
     ["ChatGPT / OpenAI", ["chatgpt", "openai", "oaistatic", "oaiusercontent"]],
     ["Claude", ["claude"]],  // not anthropic: api.anthropic.com is what Claude Code on the PC needs
     ["Google Gemini", ["gemini", "aistudio", "notebooklm", "generativelanguage"]],
     ["Microsoft Copilot", ["copilot"]],
-    ["Grok", ["grok"]],
     ["Perplexity", ["perplexity", "pplx"]],
     ["DeepSeek", ["deepseek"]],
     ["Mistral Le Chat", ["mistral"]],
@@ -1305,7 +1304,6 @@ const BLOCK_GROUPS = [
     ["Facebook & Messenger", ["facebook", "fbcdn", "fbsbx", "messenger"]],
     ["Threads", ["threads"]],
     ["Snapchat", ["snapchat", "sc-cdn", "snapkit"]],
-    ["X / Twitter", ["twitter", "twimg"]],
     ["Reddit", ["reddit"]],
     ["Discord", ["discord"]],
     ["Pinterest", ["pinterest", "pinimg"]],
