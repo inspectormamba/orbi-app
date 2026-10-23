@@ -179,9 +179,7 @@ class RouterUI:
                       "dhcp_enabled": f.get("dhcp_server") == "dhcp_server", "dhcp_start": f.get("dhcp_start"), "dhcp_end": f.get("dhcp_end"),
                       "reservations": reservations}
         out["block_services"] = self.read_block_services()
-        f = self.form("BKS_keyword.htm")
-        out["block_sites"] = {"mode": f.get("skeyword"), "keywords": f.get("cfKeyWord_DomainList") or [],
-                              "trusted_ip": f.get("bs_trustedip") if f.get("bs_trustedip_enable") == "1" else None}
+        out["block_sites"] = self.read_block_sites()
         f = self.form("FW_schedule.htm")
         out["schedule"] = parse_schedule(f)
         out["vpn"] = self.read_vpn()
@@ -503,25 +501,44 @@ return out;"""
         f = self.form("BKS_service.htm")
         return {"mode": f.get("skeyword"), "rules": parse_rule_rows(self.rows())}
 
+    def read_block_sites(self) -> dict:
+        f = self.form("BKS_keyword.htm")
+        return {"mode": f.get("skeyword"), "keywords": f.get("cfKeyWord_DomainList") or [],
+                "trusted_ip": f.get("bs_trustedip") if f.get("bs_trustedip_enable") == "1" else None}
+
     def set_block_sites(self, mode: str, keywords: list[str]):
         """mode: never | always | perschedule. Replaces the keyword list."""
         self.open("BKS_keyword.htm")
         current = self.form().get("cfKeyWord_DomainList") or []
+        # Add Keyword and Clear List each submit the whole page to keyword.cgi, which reloads it; the next step has to
+        # wait for the reloaded form, and the router takes longer as the list grows.
         if current:
             self.d.execute_script("document.getElementById('keyword_clearlist').click()")
-            time.sleep(0.5)
-            self._accept_alerts()
+            self._wait_keywords(lambda kws: not kws, "clearing the list")
         for kw in keywords:
             self._set("keyword_domain", kw)
             self.d.execute_script("document.getElementById('keyword_addkeyword').click()")
-            time.sleep(0.4)
-            self._accept_alerts()
+            self._wait_keywords(lambda kws, kw=kw: kw in kws, f"adding {kw}")
         self.d.execute_script("document.getElementById(arguments[0]).click()", {"never": "skeyword_never", "always": "skeyword_always",
                                                                                    "perschedule": "skeyword_sched"}[mode])
         self._click("apply", wait=5)
         f = self.form("BKS_keyword.htm")
         if f.get("skeyword") != mode or sorted(f.get("cfKeyWord_DomainList") or []) != sorted(keywords):
             raise RouterUIError("Block Sites change didn't stick")
+
+    def _wait_keywords(self, done, what: str, timeout: float = 30):
+        """Waits for the reloaded Block Sites form to show a keyword list that satisfies done(list)."""
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            time.sleep(0.3)
+            self._accept_alerts()
+            try:
+                f = self.form()
+                if "cfKeyWord_Domain" in f and done(f.get("cfKeyWord_DomainList") or []):
+                    return
+            except Exception:  # mid-reload: no form yet
+                pass
+        raise RouterUIError(f"The router's Block Sites page stopped responding while {what}")
 
     def set_schedule(self, days: str, start: str, end: str):
         """days: Mon=0..Sun=6 digits; start/end HH:MM, or both "00:00" for all day."""

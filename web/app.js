@@ -728,7 +728,7 @@ async function renderMore() {
   } });
   const advCard = h("section", { class: "card" }, h("h2", {}, "Advanced mode"),
     h("label", { class: "switch" }, "Show the Advanced tab (Wi-Fi networks, DHCP, logs, VPN, firewall rules…)", advToggle));
-  setView(securityChecklistCard(), alertCard, pushCard(), exposureCard(), deviceCheckCard(), phone, remoteCard(), advCard, monitoring, routerCard, pinCard, securityCard, updatesCard(settings),
+  setView(securityChecklistCard(), alertCard, pushCard(), heartbeatCard(), exposureCard(), deviceCheckCard(), phone, remoteCard(), advCard, monitoring, routerCard, pinCard, securityCard, updatesCard(settings),
     h("div", { class: "muted small center" }, "Orbi Control runs on your PC and talks to the Orbi directly — no cloud. Outside connections: the optional update check to GitHub, internet checks to 1.1.1.1, 8.8.8.8 and 9.9.9.9, and, when the device check is on, CISA's and NIST's vulnerability lists (only product names and firmware versions are sent)."));
 }
 
@@ -882,6 +882,49 @@ function pushCard() {
   };
   api("/api/push").then(render).catch((e) => fill(card, h("h2", {}, "Phone alerts"), h("div", { class: "error-text" }, e.message)));
   return card;
+}
+
+function heartbeatCard() {
+  const title = "Outside check-in";
+  const card = h("section", { class: "card" }, h("h2", {}, title), h("div", { class: "muted small" }, h("span", { class: "spinner" })));
+  const render = (s) => {
+    const why = h("p", { class: "muted small", style: "margin:0 0 8px" }, "Everything here, phone alerts included, runs on this PC. If its network "
+      + "cable is pulled or it's turned off, schedules stop and nothing can tell you. With this on, the app checks in with a free outside "
+      + "service every 5 minutes, and that service alerts your phone when the check-ins stop.");
+    if (!s.configured) {
+      fill(card, h("h2", {}, title), why, h("button", { class: "btn primary", onclick: () => heartbeatSheet(render) }, "Set up outside check-in"));
+      return;
+    }
+    const last = s.last;
+    fill(card, h("h2", {}, title, h("span", { class: last && last.ok ? "pill ok" : "pill bad", style: "margin-left:8px" }, last && last.ok ? "On" : "Not checking in")),
+      last ? h("div", { class: last.ok ? "muted small" : "error-text small" }, `Last check-in ${last.ok ? "worked" : "failed: " + last.detail} · ${ago(last.ts)}`) : null,
+      h("div", { class: "btns", style: "margin-top:8px" },
+        h("button", { class: "btn small", onclick: () => heartbeatSheet(render) }, "Change address"),
+        h("button", { class: "btn small", onclick: (e) => act(e.currentTarget, async () => {
+          if (!confirm("Turn off the outside check-in? Your phone is told, and the service raises its alarm now.")) return;
+          render(await api("/api/heartbeat", { method: "DELETE" }));
+        }) }, "Turn off")),
+      h("div", { class: "muted small", style: "margin-top:8px" }, "The address is kept encrypted and never shown again: with it, someone could check in for a PC that's off."));
+  };
+  api("/api/heartbeat").then(render).catch((e) => fill(card, h("h2", {}, title), h("div", { class: "error-text" }, e.message)));
+  return card;
+}
+
+function heartbeatSheet(render) {
+  const url = h("input", { placeholder: "https://hc-ping.com/…", autocapitalize: "off", spellcheck: "false", inputmode: "url" });
+  openSheet(h("h3", {}, "Outside check-in"),
+    h("ol", { class: "small", style: "padding-left:18px;margin:0 0 8px" },
+      h("li", {}, "Make a free account at healthchecks.io."),
+      h("li", {}, "Add a check. Set its Period to 5 minutes and Grace Time to 10 minutes."),
+      h("li", {}, "Under Integrations, add ntfy with the same server and code as your phone alerts (More → Phone alerts → Show code), so its alarm lands in the same app."),
+      h("li", {}, "Copy the check's ping address and paste it here.")),
+    h("label", { class: "field" }, "Ping address", url),
+    h("div", { class: "btns" }, h("button", { class: "btn", onclick: closeSheet }, "Cancel"),
+      h("button", { class: "btn primary", onclick: (e) => act(e.currentTarget, async () => {
+        render(await api("/api/heartbeat", { method: "PUT", body: { url: url.value } }));
+        closeSheet();
+        return { note: "Checked in. It'll keep doing so every 5 minutes" };
+      }) }, "Save & check in")));
 }
 
 function pushSetupSheet(p, render) {
@@ -1235,21 +1278,66 @@ function accountSheet(key, f) {
 }
 
 // ---------- whole-house app & site blocking ----------
-const BLOCK_PRESETS = [
-  ["TikTok", ["tiktok", "musical.ly", "byteoversea", "ibytedtos"]],
-  ["Instagram", ["instagram", "cdninstagram"]],
-  ["Snapchat", ["snapchat", "sc-cdn.net", "snapkit"]],
-  ["Roblox", ["roblox", "rbxcdn"]],
-  ["Fortnite / Epic", ["fortnite", "epicgames"]],
-  ["Minecraft", ["minecraft", "mojang"]],
-  ["Discord", ["discord"]],
-  ["Twitch", ["twitch", "ttvnw", "jtvnw"]],
-  ["Facebook", ["facebook", "fbcdn"]],
-  ["Netflix", ["netflix", "nflxvideo", "nflximg", "nflxext"]],
-  ["YouTube (all of it)", ["youtube", "googlevideo", "ytimg"]],
+// The Orbi blocks any web address that CONTAINS a keyword's main name, and for a keyword with dots it keeps only the
+// part before the ending: "api.x.ai" became "x" and blocked Netflix and Dropbox, "meta.ai" blocked every "meta"
+// address. So these are plain, distinctive names; services whose name is short or common (Meta AI, Poe, Kik, Kick,
+// Sora, Nomi…) are left out because they can't be blocked without breaking other sites.
+const BLOCK_GROUPS = [
+  ["AI chatbots", [
+    ["ChatGPT / OpenAI", ["chatgpt", "openai", "oaistatic", "oaiusercontent"]],
+    ["Claude", ["claude"]],  // not anthropic: api.anthropic.com is what Claude Code on the PC needs
+    ["Google Gemini", ["gemini", "aistudio", "notebooklm", "generativelanguage"]],
+    ["Microsoft Copilot", ["copilot"]],
+    ["Grok", ["grok"]],
+    ["Perplexity", ["perplexity", "pplx"]],
+    ["DeepSeek", ["deepseek"]],
+    ["Mistral Le Chat", ["mistral"]],
+    ["Character.AI", ["characterai", "character"]],
+    ["Pi", ["heypi", "inflection"]],
+    ["Qwen / Kimi / Doubao", ["qwen", "moonshot", "doubao"]],
+    ["Hugging Face", ["huggingface"]],
+    ["AI companions (Replika, Janitor AI…)", ["replika", "janitorai", "crushon", "spicychat"]],
+    ["AI images (Midjourney, Civitai…)", ["midjourney", "civitai", "ideogram", "runwayml"]],
+  ]],
+  ["Social media", [
+    ["TikTok", ["tiktok", "byteoversea", "ibytedtos"]],
+    ["Instagram", ["instagram", "cdninstagram"]],
+    ["Facebook & Messenger", ["facebook", "fbcdn", "fbsbx", "messenger"]],
+    ["Threads", ["threads"]],
+    ["Snapchat", ["snapchat", "sc-cdn", "snapkit"]],
+    ["X / Twitter", ["twitter", "twimg"]],
+    ["Reddit", ["reddit"]],
+    ["Discord", ["discord"]],
+    ["Pinterest", ["pinterest", "pinimg"]],
+    ["Tumblr", ["tumblr"]],
+    ["LinkedIn", ["linkedin", "licdn"]],
+    ["Bluesky", ["bsky", "bluesky"]],
+    ["Mastodon", ["mastodon"]],
+    ["BeReal", ["bereal"]],
+    ["Lemon8", ["lemon8"]],
+    ["Yubo", ["yubo"]],
+    ["WhatsApp", ["whatsapp"]],
+    ["Telegram", ["telegram"]],
+    ["WeChat", ["wechat", "weixin"]],
+    ["Truth Social", ["truthsocial"]],
+  ]],
+  ["Games & video", [
+    ["Roblox", ["roblox", "rbxcdn"]],
+    ["Fortnite / Epic", ["fortnite", "epicgames"]],
+    ["Minecraft", ["minecraft", "mojang"]],
+    ["Twitch", ["twitch", "ttvnw", "jtvnw"]],
+    ["Netflix", ["netflix", "nflxvideo", "nflximg", "nflxext"]],
+    ["YouTube (all of it)", ["youtube", "googlevideo", "ytimg"]],
+  ]],
 ];
+const BLOCK_PRESETS = BLOCK_GROUPS.flatMap(([, presets]) => presets);
 const DAY_SHORT = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const isPresetKeyword = (k) => BLOCK_PRESETS.some(([, kws]) => kws.includes(k));
+// Names for the card: "All AI chatbots" when a whole group is on, otherwise each preset.
+function blockedNames(keywords) {
+  const on = ([, kws]) => kws.every((k) => keywords.includes(k));
+  return BLOCK_GROUPS.flatMap(([group, presets]) => presets.every(on) ? [`All ${group.toLowerCase()}`] : presets.filter(on).map(([n]) => n));
+}
 function scheduleText(sch) {
   if (!sch) return "";
   return `${daysText(sch.days)}${sch.all_day ? ", all day" : `, ${fmtHM(sch.start)} – ${fmtHM(sch.end)}`}`;
@@ -1257,15 +1345,23 @@ function scheduleText(sch) {
 
 function siteBlockCard() {
   const card = h("section", { class: "card" }, h("h2", {}, "Block apps & sites"), h("div", { class: "muted small" }, h("span", { class: "spinner" }), " Reading the router…"));
+  let asked = false;  // started a router read already; if it fails, say so instead of retrying forever
   const load = async () => {
     const r = await api("/api/siteblock");
     if (!r.block_sites) {
-      if (!(r.job && r.job.running)) await api("/api/advanced/refresh", { body: {} });
+      const j = await api("/api/jobs/advanced");
+      if (!j.running && asked && j.error) {
+        fill(card, h("h2", {}, "Block apps & sites"), h("div", { class: "error-text" }, `Couldn't read the router: ${j.error.split("\n")[0]}`),
+          h("button", { class: "btn small", style: "margin-top:8px", onclick: () => { asked = false; fill(card, h("h2", {}, "Block apps & sites"),
+            h("div", { class: "muted small" }, h("span", { class: "spinner" }), " Reading the router…")); load().catch(() => {}); } }, "Try again"));
+        return;
+      }
+      if (!j.running && !asked) { asked = true; await api("/api/advanced/refresh", { body: {} }); }
       setTimeout(() => card.isConnected && load().catch(() => {}), 4000);
       return;
     }
     const bs = r.block_sites;
-    const groups = BLOCK_PRESETS.filter(([, kws]) => kws.every((k) => bs.keywords.includes(k))).map(([n]) => n);
+    const groups = blockedNames(bs.keywords);
     const others = bs.keywords.filter((k) => !isPresetKeyword(k));
     const state = bs.mode === "never" || !bs.keywords.length ? h("span", { class: "pill" }, "Off")
       : bs.mode === "always" ? h("span", { class: "pill bad" }, "Blocking all the time")
@@ -1281,10 +1377,20 @@ function siteBlockCard() {
 
 function siteBlockSheet(bs, sch) {
   const chosen = new Set(bs.keywords.filter(isPresetKeyword));
-  const presetBoxes = BLOCK_PRESETS.map(([name, kws]) => {
+  const presetBox = ([name, kws]) => {
     const cb = h("input", { type: "checkbox", checked: kws.every((k) => chosen.has(k)),
       onchange: (e) => kws.forEach((k) => (e.target.checked ? chosen.add(k) : chosen.delete(k))) });
     return h("label", { class: "row tap" }, cb, h("div", { class: "main" }, h("div", { class: "name" }, name), h("div", { class: "meta" }, kws.join(", "))));
+  };
+  const presetBoxes = BLOCK_GROUPS.flatMap(([group, presets]) => {
+    const boxes = presets.map(presetBox);
+    const setAll = (on) => boxes.forEach((row) => {
+      const cb = row.querySelector("input");
+      if (cb.checked !== on) { cb.checked = on; cb.dispatchEvent(new Event("change")); }
+    });
+    return [h("h4", { class: "inline", style: "align-items:center;margin:12px 0 0" }, h("span", {}, group),
+      h("span", { style: "flex:0;white-space:nowrap" }, h("button", { class: "btn small", type: "button", onclick: () => setAll(true) }, "All"), " ",
+        h("button", { class: "btn small", type: "button", onclick: () => setAll(false) }, "None"))), ...boxes];
   });
   const custom = h("input", { type: "text", placeholder: "e.g. hulu.com, pinterest", value: bs.keywords.filter((k) => !isPresetKeyword(k)).join(", ") });
   const mode = h("select", {},
@@ -1319,7 +1425,7 @@ function siteBlockSheet(bs, sch) {
   openSheet(h("h3", {}, "Block apps & sites"),
     h("p", { class: "muted small", style: "margin:0" }, "Blocks these for every device in the house (the Orbi can't block apps per person). Takes effect within a few minutes as devices refresh."),
     ...presetBoxes,
-    h("label", { class: "field" }, "Other sites or keywords (comma-separated; any web address containing one is blocked)", custom),
+    h("label", { class: "field" }, "Other sites or keywords (comma-separated). The router keeps only the main name and blocks every address containing it: hulu.com blocks anything with \"hulu\"", custom),
     h("label", { class: "field" }, "Block", mode), schedBox,
     h("p", { class: "muted small", style: "margin:0" }, "The Orbi has one blocking schedule, shared with its Block Services rules. Those are set to \"always\", so they're unaffected."),
     save);

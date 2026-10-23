@@ -83,6 +83,12 @@ class FakeUI:
                 "iot": {"enabled": True, "ssid": "Home-IoT", "band": "2.4", "security": "WPA2-PSK"},
                 "wps": {"enabled": True, "adjustable": False}}
 
+    def read_block_services(self):
+        return self.read_all()["block_services"]
+
+    def read_block_sites(self):
+        return self.read_all()["block_sites"]
+
     def set_schedule(self, days, start, end):
         FakeUI.calls.append(("schedule", days, start, end))
 
@@ -163,6 +169,9 @@ def test_advanced_and_siteblock(client):
     assert adv["data"]["vpn"]["port"] == "12973" and adv["data"]["uptime"] is not None
     assert client.put("/api/siteblock", json={"mode": "always", "keywords": []}).status_code == 400
     assert client.put("/api/siteblock", json={"mode": "always", "keywords": ["tik tok!"]}).status_code == 400
+    assert client.put("/api/siteblock", json={"mode": "always", "keywords": [f"site{i}" for i in range(256)]}).status_code == 400
+    r = client.put("/api/siteblock", json={"mode": "always", "keywords": ["api.x.ai", "meta.ai", "tiktok"]})  # "x" blocked Netflix
+    assert r.status_code == 400 and '"x" (api.x.ai)' in r.json()["detail"] and "meta" not in r.json()["detail"]
     assert client.put("/api/siteblock", json={"mode": "perschedule", "keywords": ["tiktok"], "days": "", "start": "08:00", "end": "15:00"}).status_code == 400
     r = client.put("/api/siteblock", json={"mode": "perschedule", "keywords": ["TikTok", "roblox", "tiktok"], "days": "40123", "start": "08:00", "end": "15:00"})
     assert r.status_code == 200
@@ -212,6 +221,64 @@ def test_loosened_blocking_alerts(monitor):
     assert monitor.notes[-1] == ("Blocked sites were unblocked", "No longer blocked: roblox, tiktok")
     ev = monitor.store.q("SELECT * FROM events WHERE kind='block_loosened'")
     assert len(ev) == 2 and all(e["severity"] == "warn" for e in ev)
+
+
+def test_weakened_firewall_rules_alert(monitor):
+    rules = [{"name": "Block External DNS", "port": "53", "ips": "192.168.1.2 - 192.168.1.254"},
+             {"name": "Block-VPN-OpenVPN", "port": "1194", "ips": "all"}]
+    monitor._watch_block_services({"mode": "always", "rules": rules})
+    monitor._watch_block_services({"mode": "always", "rules": rules + [{"name": "Block-Mail", "port": "25", "ips": "all"}]})
+    assert monitor.notes == []  # a new rule only blocks more
+    monitor._watch_block_services({"mode": "perschedule", "rules": [
+        {"name": "Block External DNS", "port": "53", "ips": "192.168.1.2 - 192.168.1.15"},
+        {"name": "Block-VPN-OpenVPN", "port": "1195", "ips": "all"}]})
+    assert monitor.notes[-1][0] == "Firewall rules loosened"
+    what = monitor.notes[-1][1]
+    assert "only apply on a schedule" in what and "Block-VPN-OpenVPN moved from port 1194 to 1195" in what
+    assert "Block External DNS now only applies to 192.168.1.2 - 192.168.1.15 (was 192.168.1.2 - 192.168.1.254)" in what
+    assert "Removed: Block-Mail (port 25)" in what
+
+
+def test_trusted_ip_on_block_list_alerts(monitor):
+    monitor._watch_block_sites({"mode": "always", "keywords": ["tiktok"], "trusted_ip": None})
+    monitor._watch_block_sites({"mode": "always", "keywords": ["tiktok"], "trusted_ip": "192.168.1.76"})
+    assert monitor.notes == [("Blocked sites were unblocked", "192.168.1.76 may now visit every blocked site")]
+
+
+def test_lost_router_connection_alerts_reminds_and_rechecks(monitor, fake_router):
+    from orbi import monitor as mon
+    monitor.scan()
+    monitor.ui_factory = FakeUI
+    fake_router.fail = True
+    monitor.scan()
+    assert monitor.notes == [] and monitor.state["link_id"] is None  # a blip isn't an alert
+    monitor._link_since -= mon.LINK_LOST_AFTER
+    monitor.scan()
+    ev = monitor.store.q("SELECT * FROM events WHERE kind='router_link'")
+    assert len(ev) == 1 and ev[0]["end_ts"] is None and monitor.notes[-1][0] == "Lost connection to the router"
+    assert "router offline" in monitor.notes[-1][1]
+    monitor.scan()
+    assert len(monitor.notes) == 1  # no repeat until the reminder is due
+    monitor.state["link_reminded"] -= mon.LINK_REMIND_EVERY
+    monitor.scan()
+    assert monitor.notes[-1][0] == "Still cut off from the router"
+
+    # restarted mid-outage: the open event carries on
+    again = mon.Monitor(monitor.store, router_factory=lambda: fake_router)
+    again.recover_open_events()
+    assert again.state["link_id"] == ev[0]["id"]
+
+    monitor.store.put("block_services_last", {"mode": "always", "rules": [{"name": "Block-VPN-OpenVPN", "port": "1194", "ips": "all"},
+                                                                          {"name": "Block-VPN-WireGuard", "port": "51820", "ips": "all"}]})
+    fake_router.fail = False
+    monitor.scan()
+    assert monitor.notes[-1][0] == "Reconnected to the router"
+    for _ in range(100):
+        if not monitor.jobs["settingswatch"]["running"]:
+            break
+        time.sleep(0.05)
+    assert monitor.store.one("SELECT end_ts FROM events WHERE kind='router_link'")["end_ts"] is not None
+    assert ("Firewall rules loosened", "Removed: Block-VPN-WireGuard (port 51820)") in monitor.notes  # caught on reconnecting
 
 
 def test_filter_turned_off_alerts(monitor):

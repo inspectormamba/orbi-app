@@ -38,7 +38,7 @@ GUARDED = ("alert_admin_login_failures", "alert_new_devices", "block_pin_attacke
            "push_enabled", "exposure_watch", "vulnscan_watch")
 # Changes outside the app are reported. Only fingerprints go in the Event Log (other Windows users can read it).
 WATCHED = ("pin_hash", "extra_pins", "protected_macs", "mute_new_device_macs", "default_profile_id", "router_host",
-           "router_user", "router_cert_pins", "push_topic_enc", "push_server")
+           "router_user", "router_cert_pins", "push_topic_enc", "push_server", "heartbeat_url_enc")
 LABELS = {"alert_admin_login_failures": "Alert on failed router sign-ins", "alert_new_devices": "Alert on new devices",
           "block_pin_attackers": "Block devices attacking the PIN", "hold_new_devices": "Hold new devices",
           "check_updates": "Check for updates", "push_enabled": "Phone alerts",
@@ -46,7 +46,8 @@ LABELS = {"alert_admin_login_failures": "Alert on failed router sign-ins", "aler
           "push_server": "the phone-alert server", "pin_hash": "the PIN", "extra_pins": "the spare PINs",
           "protected_macs": "never-blocked devices", "mute_new_device_macs": "muted devices",
           "default_profile_id": "the default profile", "router_host": "the router address",
-          "router_user": "the router user name", "router_cert_pins": "the trusted router certificate"}
+          "router_user": "the router user name", "router_cert_pins": "the trusted router certificate",
+          "heartbeat_url_enc": "the outside check-in address"}
 
 
 def fingerprint(settings: dict) -> dict:

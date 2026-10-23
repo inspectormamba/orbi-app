@@ -129,6 +129,9 @@ WIFI_CHECK_DELAY = 120  # after a Wi-Fi change, how long devices get to drop off
 RESTART_FOLLOWUP_AFTER = 6 * 60  # after a restart, how long devices get to rejoin before we report who did
 SCHEDULED_RESTART_HOUR = 3  # "Restart tonight" means 3 AM
 NET_LABELS = {"iot": "IoT Wi-Fi", "guest": "Guest Wi-Fi", "main": "main Wi-Fi"}
+LINK_LOST_AFTER = 10 * 60  # this long without a good scan: the app has lost the router (alert)
+LINK_REMIND_EVERY = 2 * 3600  # and reminds this often until it's back
+SETTINGS_WATCH_EVERY = 15 * 60  # firewall rules and block list re-read this often
 
 
 class Monitor:
@@ -149,8 +152,10 @@ class Monitor:
             "internet": None, "router": None, "latency_ms": None, "last_check": None, "outage_id": None, "pc_offline_id": None,
             "router_down_id": None, "last_scan": None, "scan_error": None, "satellites": [], "wan": {},
             "system": {}, "info": {}, "speedtest": {"running": False, "error": None}, "enforce_error": None,
-            "access_control": None,
+            "access_control": None, "link_id": None, "link_reminded": None,
         }
+        self._link_since: float | None = None  # first failed scan of the current loss of contact with the router
+        self._router_dropped = False  # the router stopped answering at some point since the last good scan
         self._fails = 0
         self._router_fails = 0
         self._pc_fails = 0
@@ -207,7 +212,8 @@ class Monitor:
                  "traffic": self.traffic_loop, "speedtest": self.speedtest_schedule_loop, "maintenance": self.maintenance_loop,
                  "routerlog": self.routerlog_loop, "updates": self.update_loop, "weekly": self.weekly_loop,
                  "restart": self.restart_loop, "dnsaccount": self.dns_account_loop,
-                 "exposure": self.exposure_loop, "dhcpwatch": self.dhcp_watch_loop, "vulnscan": self.vulnscan_loop}
+                 "exposure": self.exposure_loop, "dhcpwatch": self.dhcp_watch_loop, "vulnscan": self.vulnscan_loop,
+                 "settingswatch": self.settings_watch_loop, "heartbeat": self.heartbeat_loop}
         if self.tamper:
             loops["tamper"] = self.tamper.loop
         self._loops = loops
@@ -267,6 +273,8 @@ class Monitor:
 
         # Router reachability from this PC (2 misses in a row before declaring it down).
         self._router_fails = 0 if router_ms is not None else self._router_fails + 1
+        if router_ms is None:
+            self._router_dropped = True  # since the last good scan; see _trust_unasked_restart
         if self._router_fails >= 2 and not st["router_down_id"]:
             st["router_down_id"] = self.store.event("router_down", "Router unreachable from this PC", severity="error",
                                                     detail="Check the router's power, or this PC's network cable/adapter.")
@@ -409,6 +417,10 @@ class Monitor:
                     continue
                 self.store.close_event(ev["id"], end_ts=back, detail=f"{ev['detail']} Back after {fmt_duration(back - ev['ts'])} "
                                                                     "(Orbi Control was restarted during it).")
+        # Still cut off from the router when this run stopped: carry it on, and the next good scan closes it.
+        lost = self.store.one("SELECT * FROM events WHERE kind='router_link' AND end_ts IS NULL ORDER BY ts DESC LIMIT 1")
+        if lost:
+            self.state["link_id"], self._link_since = lost["id"], lost["ts"]
 
     # ---- device & satellite scans ----
     def scan_loop(self):
@@ -434,8 +446,11 @@ class Monitor:
         except RouterError as e:
             self.state["scan_error"] = str(e)
             self._cert_alert(str(e))
+            self.check_link(str(e))
             return
         self.state.update(scan_error=None, last_scan=time.time())
+        self._router_dropped = False
+        self.check_link(None)
         self._update_satellites(sats, devices)
         self._update_devices(devices)
         self._watch_addresses(devices)
@@ -688,11 +703,57 @@ class Monitor:
         self.reload_router()
         return True
 
+    def _trust_unasked_restart(self) -> bool:
+        """The router restarted without this app asking (unplugged, power cut, crash, or someone restarting it), so it
+        made a new certificate. Waiting for a parent to trust it leaves schedules unenforced meanwhile, which makes
+        unplugging the router a way around them; so trust it when everything points to the same router having
+        restarted, and say so loudly:
+        - the router stopped answering since the last good scan (a restart, not just a settings save);
+        - the new certificate is a Netgear router's own;
+        - the same hardware address answers for the router as before (the fake-router watch pins it).
+        Its date proves little: on 10-23 the Orbi made one before its clock was set, dated three months back."""
+        last_ok = self.state["last_scan"]
+        if not self._router_dropped or not last_ok:
+            return False
+        import hashlib
+        from . import routercert
+        host = config.load()["router_host"]
+        try:
+            der = routercert.presented_der(host)
+            info = routercert.describe(der)
+        except Exception:  # unreachable, or something we can't read: not the router's certificate
+            return False
+        if not routercert.looks_like_router_cert(info) or info["not_before"] > time.time() + 120:
+            return False
+        fp = hashlib.sha256(der).hexdigest()
+        want, seen = self.store.get("gateway_mac"), routercert.gateway_mac(host)
+        if not want or seen != want:
+            log.warning("new certificate from %s not trusted automatically: hardware address %s, expected %s", host, seen, want)
+            return False
+        routercert.trust(host, fp)
+        self.reload_router()
+        try:  # now that it's trusted: did it really restart, or were its Internet settings saved?
+            up = uptime_seconds(self.router.uptime())
+        except Exception:
+            up = None
+        restarted = up is None or up < time.time() - last_ok + 5 * 60
+        when = time.time() - up if up is not None and restarted else info["not_before"] if not restarted else last_ok
+        made = time.strftime("%I:%M %p", time.localtime(when)).lstrip("0")
+        what = (f"The router restarted around {made}, and Orbi Control didn't ask it to: unplugged, a power cut, a crash, "
+                f"or someone restarting it." if restarted else
+                f"The router made a new certificate at {made} without restarting, which happens when someone saves its "
+                f"Internet settings. Orbi Control didn't.")
+        self.store.event("router_cert", "The router restarted on its own" if restarted else "Someone changed the router's Internet settings",
+                         severity="warn", detail=f"{what} It's the same router (same hardware address), so its new security "
+                                                 f"certificate was trusted automatically and schedules keep running. {fp[:16]}…")
+        self.notify("Router restarted" if restarted else "Router settings changed", f"{what} Orbi Control reconnected by itself.")
+        return True
+
     def _cert_alert(self, error: str):
         """One alert per new certificate when the router stops presenting the pinned one."""
         if "security certificate changed" not in error:
             return
-        if self._trust_after_reboot():
+        if self._trust_after_reboot() or self._trust_unasked_restart():
             return
         try:
             from .routercert import presented
@@ -1350,6 +1411,65 @@ class Monitor:
         threading.Thread(target=ctx.run, args=(work,), name=f"job-{name}", daemon=True).start()
         return True
 
+    def settings_watch_loop(self):
+        self.stop_event.wait(120)  # after the first scans and log read
+        self._every(lambda: SETTINGS_WATCH_EVERY, self.check_router_settings)
+
+    def check_router_settings(self):
+        """Re-reads the firewall rules and the block list, so a change made on the router itself (its web page or
+        the Orbi app) is noticed within minutes, not only when someone opens those screens here."""
+        if not self.router or self.state["link_id"]:
+            return
+        with self.ui_factory() as ui:
+            services, sites = ui.read_block_services(), ui.read_block_sites()
+        if self.advanced["data"]:
+            self.advanced["data"].update(block_services=services, block_sites=sites)
+        self._watch_block_sites(sites)
+        self._watch_block_services(services)
+
+    # ---- connection to the router ----
+    def check_link(self, error: str | None):
+        """Called after every scan. Alerts when this app can't work with the router for LINK_LOST_AFTER, whatever the
+        reason (unreachable, a new certificate, a rejected password), reminds while it lasts, and on reconnecting
+        re-checks the settings that could have changed unseen."""
+        st, now = self.state, time.time()
+        if error is None:
+            self._link_since = None
+            if st["link_id"]:
+                ev = self.store.one("SELECT * FROM events WHERE id=?", (st["link_id"],))
+                dur = fmt_duration(now - ev["ts"]) if ev else "a while"
+                if ev:
+                    self._close(st["link_id"], f"{ev['detail']} Reconnected after {dur}.")
+                st["link_id"] = None
+                self.notify("Reconnected to the router", f"Orbi Control was cut off for {dur}. Checking the firewall rules "
+                                                         "and block list for changes made meanwhile.")
+                self.run_job("settingswatch", self.check_router_settings)
+            return
+        if self._link_since is None:
+            self._link_since = now
+        down = now - self._link_since
+        reason = self._link_reason(error)
+        if not st["link_id"]:
+            if down < LINK_LOST_AFTER:
+                return
+            st["link_id"] = self.store.event("router_link", "Orbi Control lost its connection to the router", severity="error", ts=self._link_since,
+                                             detail=f"{reason} Until it's back, changes made on the router go unnoticed and blocks aren't enforced.")
+            st["link_reminded"] = now
+            self.notify("Lost connection to the router", reason)
+        elif now - (st.get("link_reminded") or 0) >= LINK_REMIND_EVERY:
+            st["link_reminded"] = now
+            self.notify("Still cut off from the router", f"For {fmt_duration(down)}. {reason}")
+
+    def _link_reason(self, error: str) -> str:
+        if self.state["router"] is False:
+            return "This PC can't reach the router (check its power and this PC's network cable)."
+        if "security certificate changed" in error:
+            return ("The router's security certificate changed, so Orbi Control stopped sending it the admin password. "
+                    "If you didn't restart or update the router, someone may have changed its settings: check More → Router.")
+        if "password" in error.lower() or "401" in error:
+            return "The router rejected the admin password. If you didn't change it, someone else may have."
+        return f"The router isn't answering Orbi Control ({error[:150]})."
+
     def refresh_advanced(self):
         with self.ui_factory() as ui:
             data = ui.read_all()
@@ -1366,8 +1486,8 @@ class Monitor:
         return data
 
     def _watch_block_services(self, now):
-        """Alert when the router's firewall rules get weaker: a rule removed, narrowed to fewer devices, or all
-        rules turned off."""
+        """Alert when the router's firewall rules get weaker: a rule removed, moved to other ports, narrowed to fewer
+        devices, or all rules turned off or limited to a schedule."""
         if not now:
             return
         before = self.store.get("block_services_last")
@@ -1377,13 +1497,19 @@ class Monitor:
         found = []
         if before.get("mode") != "never" and now.get("mode") == "never":
             found.append("Firewall rules turned off (Never)")
+        elif before.get("mode") == "always" and now.get("mode") == "perschedule":
+            found.append("Firewall rules now only apply on a schedule")
         rules = {r["name"]: r for r in now.get("rules") or []}
         for r in before.get("rules") or []:
             new = rules.get(r["name"])
             if not new:
                 found.append(f"Removed: {r['name']} (port {r['port']})")
-            elif r["ips"].lower() == "all" and new["ips"].lower() != "all":
-                found.append(f"{r['name']} now only applies to {new['ips']}")
+                continue
+            if new["port"] != r["port"]:
+                found.append(f"{r['name']} moved from port {r['port']} to {new['port']}")
+            if new["ips"].lower() != r["ips"].lower() and new["ips"].lower() != "all":
+                was = "" if r["ips"].lower() == "all" else f" (was {r['ips']})"
+                found.append(f"{r['name']} now only applies to {new['ips']}{was}")
         if found:
             what = "; ".join(found)
             self.store.event("block_loosened", "Firewall rules were loosened", detail=what, severity="warn")
@@ -1394,9 +1520,15 @@ class Monitor:
         if not now:
             return
         before = self.store.get("block_sites_last")
-        self.store.put("block_sites_last", {"mode": now.get("mode"), "keywords": sorted(now.get("keywords") or [])})
+        self.store.put("block_sites_last", {"mode": now.get("mode"), "keywords": sorted(now.get("keywords") or []),
+                                            "trusted_ip": now.get("trusted_ip")})
         if not before or before.get("mode") == "never":
             return
+        trusted = now.get("trusted_ip")
+        if trusted and trusted != before.get("trusted_ip", trusted):  # rows saved before this was recorded have no key
+            what = f"{trusted} may now visit every blocked site"
+            self.store.event("block_loosened", "Whole-house blocking was loosened", detail=what, severity="warn")
+            self.notify("Blocked sites were unblocked", what)
         was = set(before.get("keywords") or [])
         removed = sorted(was if now.get("mode") == "never" else was - set(now.get("keywords") or []))
         weaker = removed or (before.get("mode") == "always" and now.get("mode") == "perschedule")
@@ -1425,6 +1557,10 @@ class Monitor:
                             f"The router switched from {PROVIDERS[before]['name']} to {name}, which doesn't block adult sites")
 
     # ---- remote-access watch: SSH, Remote Desktop, VNC and the like on any device in the house ----
+    def heartbeat_loop(self):
+        from . import heartbeat
+        self._every(lambda: heartbeat.EVERY, heartbeat.beat)
+
     def exposure_loop(self):
         self.stop_event.wait(180)
         self._every(lambda: 3600, self._exposure_due)

@@ -121,6 +121,10 @@ class PushSetupBody(BaseModel):
     server: str | None = None  # None: ntfy.sh
 
 
+class HeartbeatBody(BaseModel):
+    url: str
+
+
 class SiteBlockBody(BaseModel):
     mode: str  # never | always | perschedule
     keywords: list[str] = []
@@ -1016,6 +1020,47 @@ def create_app(monitor: Monitor) -> FastAPI:
         from . import push
         return push.send_now("Test from Orbi Control", "If you can read this, phone alerts work.", priority=3)
 
+    # ---------- outside check-in (healthchecks.io) ----------
+    def _heartbeat_status():
+        from . import heartbeat
+        s = config.load()
+        return {"configured": heartbeat.configured(s), "last": s.get("heartbeat_last"), "every": heartbeat.EVERY}
+
+    @app.get("/api/heartbeat")
+    def heartbeat_status():
+        return _heartbeat_status()
+
+    @app.put("/api/heartbeat")
+    def heartbeat_set(body: HeartbeatBody):
+        """Saved only once a check-in to it works, so a typo can't leave the PC unwatched."""
+        from . import dpapi, heartbeat, push
+        try:
+            url = heartbeat.check_url(body.url)
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from None
+        res = heartbeat.ping(url)
+        if not res["ok"]:
+            raise HTTPException(400, f"That address didn't work: {res['detail']}")
+        replaced = heartbeat.configured()
+        config.save({"heartbeat_url_enc": dpapi.protect(url), "heartbeat_last": {**res, "ts": time.time()}})
+        store.event("action", "Outside check-in " + ("address changed" if replaced else "set up"), severity="warn" if replaced else "info")
+        if replaced:
+            push.send("Outside check-in address changed", f"By {ACTOR.get() or 'Orbi Control'}. If that wasn't you, someone may be "
+                      "trying to hide this PC going offline: check History.")
+        return _heartbeat_status()
+
+    @app.delete("/api/heartbeat")
+    def heartbeat_remove():
+        from . import heartbeat, push
+        if not heartbeat.configured():
+            return _heartbeat_status()
+        heartbeat.ping(suffix="/fail")  # the service alerts now, rather than after the grace time
+        push.send_now("Outside check-in turned off", f"By {ACTOR.get() or 'Orbi Control'}. If the PC goes offline now, nothing "
+                      "outside the house will notice.")
+        config.save({"heartbeat_url_enc": None, "heartbeat_last": None})
+        store.event("action", "Outside check-in turned off", severity="warn")
+        return _heartbeat_status()
+
     @app.put("/api/push")
     def push_enable(body: EnabledBody):
         from . import push
@@ -1141,6 +1186,13 @@ def create_app(monitor: Monitor) -> FastAPI:
         bad = [k for k in keywords if not re.fullmatch(r"[a-z0-9.\-]{3,60}", k)]
         if bad:
             raise HTTPException(400, f"Use letters, numbers, dots or dashes (3+ characters): {', '.join(bad)}")
+        # The Orbi keeps only a keyword's main name (api.x.ai -> "x") and blocks every address containing it.
+        short = [k for k in keywords if len(k.split(".")[-2] if "." in k else k) < 4]
+        if short:
+            raise HTTPException(400, "The router would block every address containing " + ", ".join(
+                f"\"{k.split('.')[-2] if '.' in k else k}\" ({k})" for k in short) + ". Use a longer, more distinctive name")
+        if len(keywords) > 255:
+            raise HTTPException(400, f"The Orbi holds at most 255 keywords ({len(keywords)} chosen)")
         if body.mode != "never" and not keywords:
             raise HTTPException(400, "Add at least one app or keyword to block")
         if body.mode == "perschedule":

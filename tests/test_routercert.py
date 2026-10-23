@@ -197,6 +197,67 @@ def test_new_certificate_without_an_app_restart_still_alerts(restarted_router):
     assert [n[0] for n in monitor.notes] == ["Router certificate changed"]
 
 
+def test_router_restarting_on_its_own_is_followed_and_reported(restarted_router, fake_router, monkeypatch):
+    """Unplugging the router used to leave the app locked out (and schedules unenforced) until a parent trusted the
+    new certificate; now the same router coming back is trusted at once, with an alert."""
+    monitor = restarted_router
+    monitor.store.put("gateway_mac", "C8:9E:43:00:00:01")
+    monkeypatch.setattr(routercert, "gateway_mac", lambda host: "C8:9E:43:00:00:01")
+    monitor.state["last_scan"] = RESTART - 60
+    monitor._router_dropped = True
+    monkeypatch.setattr(fake_router, "uptime", lambda: "00:02:41")
+    monitor._cert_alert(str(routercert.CertificateChanged("192.168.1.1")))
+    assert config.load()["router_cert_pins"]["192.168.1.1"] == hashlib.sha256(FRESH).hexdigest()
+    assert [n[0] for n in monitor.notes] == ["Router restarted"] and "didn't ask it to" in monitor.notes[0][1]
+    ev = monitor.store.one("SELECT severity, title FROM events WHERE kind='router_cert'")
+    assert ev == {"severity": "warn", "title": "The router restarted on its own"}
+
+
+def test_new_certificate_without_a_restart_is_a_settings_change(restarted_router, fake_router, monkeypatch):
+    monitor = restarted_router
+    monitor.store.put("gateway_mac", "C8:9E:43:00:00:01")
+    monkeypatch.setattr(routercert, "gateway_mac", lambda host: "C8:9E:43:00:00:01")
+    monitor.state["last_scan"], monitor._router_dropped = RESTART - 60, True
+    monitor._cert_alert(str(routercert.CertificateChanged("192.168.1.1")))  # uptime says 2 days
+    assert monitor.notes[0][0] == "Router settings changed"
+
+
+def test_unasked_new_certificate_is_not_trusted_without_proof(restarted_router, monkeypatch):
+    monitor = restarted_router
+    monitor.store.put("gateway_mac", "C8:9E:43:00:00:01")
+    monitor.state["last_scan"] = RESTART - 60
+    monkeypatch.setattr(routercert, "gateway_mac", lambda host: "C8:9E:43:00:00:01")
+    monitor._cert_alert(str(routercert.CertificateChanged("192.168.1.1")))  # never stopped answering
+    assert config.load()["router_cert_pins"]["192.168.1.1"] == A
+    monitor._router_dropped = True
+    monitor.store.put("cert_alerted", None)
+    monkeypatch.setattr(routercert, "gateway_mac", lambda host: "02:11:22:33:44:55")  # something else answers for it
+    monitor._cert_alert(str(routercert.CertificateChanged("192.168.1.1")))
+    assert config.load()["router_cert_pins"]["192.168.1.1"] == A
+    monitor.store.put("cert_alerted", None)
+    monkeypatch.setattr(routercert, "gateway_mac", lambda host: "C8:9E:43:00:00:01")
+    other = fake_cert("261008204735Z", issuer=_name(CN="Evil CA"))  # not a Netgear router's own
+    monkeypatch.setattr(routercert, "presented_der", lambda host, port=443, timeout=10: other)
+    monkeypatch.setattr(routercert, "presented", lambda host, port=443, timeout=10: hashlib.sha256(other).hexdigest())
+    monitor._cert_alert(str(routercert.CertificateChanged("192.168.1.1")))
+    assert config.load()["router_cert_pins"]["192.168.1.1"] == A
+    assert [n[0] for n in monitor.notes] == ["Router certificate changed"] * 3
+
+
+def test_restart_before_the_router_clock_is_set_is_followed(restarted_router, fake_router, monkeypatch):
+    """10-23: the Orbi made its new certificate before setting its clock, so it was dated months back."""
+    monitor = restarted_router
+    early = fake_cert("260716130519Z")
+    monkeypatch.setattr(routercert, "presented_der", lambda host, port=443, timeout=10: early)
+    monitor.store.put("gateway_mac", "C8:9E:43:00:00:01")
+    monkeypatch.setattr(routercert, "gateway_mac", lambda host: "C8:9E:43:00:00:01")
+    monitor.state["last_scan"], monitor._router_dropped = RESTART - 600, True
+    monkeypatch.setattr(fake_router, "uptime", lambda: "00:03:10")
+    monitor._cert_alert(str(routercert.CertificateChanged("192.168.1.1")))
+    assert config.load()["router_cert_pins"]["192.168.1.1"] == hashlib.sha256(early).hexdigest()
+    assert [n[0] for n in monitor.notes] == ["Router restarted"]
+
+
 def test_restart_too_long_ago_still_alerts(restarted_router):
     monitor = restarted_router
     monitor.store.put("reboot_requested", RESTART - 3600)
