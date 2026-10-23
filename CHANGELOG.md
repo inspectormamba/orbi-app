@@ -2,6 +2,11 @@
 
 What changed in each version, newest first. The same notes appear in the app under More → Updates.
 
+## 1.1.19 (2026-10-23)
+
+### Block apps & sites
+- Removed the X / Twitter and Grok options: the router can't block X without blocking every web address that contains an "x".
+
 ## 1.1.18 (2026-10-23)
 
 ### Router watch
