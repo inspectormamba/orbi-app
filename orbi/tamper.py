@@ -13,20 +13,23 @@ administrator, and Windows notes that it happened.
 
 The database locks themselves are in store.py (LOCKS).
 """
-import ctypes
 import hashlib
-import html
 import json
 import logging
 import os
-import re
-import subprocess
 import threading
 import time
 
-from . import config, store as store_mod
+from . import config, osdep, store as store_mod
 
 log = logging.getLogger(__name__)
+
+# The tamper-evidence log's user-facing name differs by OS; Windows wording is kept verbatim.
+OS_NAME = "Windows" if osdep.IS_WINDOWS else "macOS"
+LOG_NAME = osdep.SYSTEM_LOG_NAME  # "the Windows Event Log" / "the macOS system log"
+LOG_TITLE = "Windows Event Log" if osdep.IS_WINDOWS else "System log"
+KILL_TOOLS = ("Task Manager, PowerShell or the scheduler" if osdep.IS_WINDOWS
+              else "Activity Monitor, the terminal or launchd")
 
 SOURCE = "Orbi Control"
 MIRROR, CHECKPOINT, TAMPER, STOPPED = 1, 2, 3, 4  # Event Log event IDs
@@ -58,48 +61,14 @@ def fingerprint(settings: dict) -> dict:
 
 
 def boot_time() -> float:
-    return time.time() - ctypes.windll.kernel32.GetTickCount64() / 1000
-
-
-class WinLog:
-    """The Application event log, through advapi32 (write) and wevtutil (read)."""
-
-    def __init__(self):
-        self._handle = None
-
-    def write(self, event_id: int, text: str, warn: bool = False) -> bool:
-        adv = ctypes.windll.advapi32
-        if not self._handle:
-            adv.RegisterEventSourceW.restype = ctypes.c_void_p
-            self._handle = adv.RegisterEventSourceW(None, SOURCE)
-            if not self._handle:
-                return False
-        adv.ReportEventW.argtypes = [ctypes.c_void_p, ctypes.c_ushort, ctypes.c_ushort, ctypes.c_ulong, ctypes.c_void_p,
-                                     ctypes.c_ushort, ctypes.c_ulong, ctypes.POINTER(ctypes.c_wchar_p), ctypes.c_void_p]
-        strings = (ctypes.c_wchar_p * 1)(text[:30000])
-        return bool(adv.ReportEventW(self._handle, 0x2 if warn else 0x4, 0, event_id, None, 1, 0, strings, None))
-
-    def read(self, event_ids: tuple[int, ...], count: int = 1) -> list[tuple[int, str]]:
-        """Newest first: [(event id, text)]."""
-        ids = " or ".join(f"EventID={i}" for i in event_ids)
-        query = f"*[System[Provider[@Name='{SOURCE}'] and ({ids})]]"
-        out = subprocess.run(["wevtutil", "qe", "Application", f"/q:{query}", f"/c:{count}", "/rd:true", "/f:xml"],
-                             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
-                             creationflags=subprocess.CREATE_NO_WINDOW)
-        found = []
-        for block in re.findall(r"<Event .*?</Event>", out.stdout, re.S):
-            eid = re.search(r"<EventID[^>]*>(\d+)</EventID>", block)
-            data = re.search(r"<Data>(.*?)</Data>", block, re.S)
-            if eid and data:
-                found.append((int(eid.group(1)), html.unescape(data.group(1))))
-        return found
+    return osdep.boot_time()
 
 
 class Tamper:
     def __init__(self, monitor, winlog=None):
         self.monitor = monitor
         self.store = monitor.store
-        self.log = winlog or WinLog()
+        self.log = winlog or osdep.SysLog()
         self._lock = threading.Lock()
         self._expected = None  # the protective settings as the app itself last saved them
         self._last = None  # the last checkpoint written
@@ -153,8 +122,8 @@ class Tamper:
         if recent and recent[0][0] == CHECKPOINT and boot_time() < off_since:
             self.alert("Orbi Control was shut down without Quit",
                        f"It stopped at about {time.strftime('%I:%M %p on %a %b %d', time.localtime(off_since))} and was off "
-                       f"for {fmt_gap(time.time() - off_since)}. Windows didn't restart, so something ended it from "
-                       "Task Manager, PowerShell or the scheduler. If that wasn't you, look at what changed meanwhile.")
+                       f"for {fmt_gap(time.time() - off_since)}. {OS_NAME} didn't restart, so something ended it from "
+                       f"{KILL_TOOLS}. If that wasn't you, look at what changed meanwhile.")
         self._compare(cp, stopped=True)
         self.checkpoint(force=True)
 
@@ -171,8 +140,8 @@ class Tamper:
                 self._log_checked = time.time()
                 newest = self.log.read((CHECKPOINT,), count=1)
                 if not newest or json.loads(newest[0][1].rsplit("\n", 1)[-1])["t"] < self._last_written - 1:
-                    self.alert("Windows Event Log was cleared", "Orbi Control's copies of its alerts in the Windows "
-                               "Application log are gone. Clearing that log needs an administrator.")
+                    self.alert(f"{LOG_TITLE} was cleared", f"Orbi Control's copies of its alerts in {LOG_NAME} "
+                               "are gone. Clearing it needs an administrator.")
             self._compare(self._last, stopped=False)
         self.checkpoint()
 
@@ -187,8 +156,8 @@ class Tamper:
                 lost = cp["events"] - ev
                 back = self.restore(cp)
                 self.alert("Alert history was deleted", f"{lost} alerts were deleted {when}. "
-                           + (f"{back} were put back from the Windows Event Log." if back else
-                              "Copies weren't found in the Windows Event Log."))
+                           + (f"{back} were put back from {LOG_NAME}." if back else
+                              f"Copies weren't found in {LOG_NAME}."))
             if now["router_log"] < cp["router_log"]:
                 self.alert("Router log history was deleted",
                            f"{cp['router_log'] - now['router_log']} router log lines were deleted {when}. "
@@ -211,7 +180,7 @@ class Tamper:
             self._expected = fingerprint(config.load())
 
     def restore(self, cp: dict) -> int:
-        """Put back alerts that are gone from the app but still in the Event Log copy."""
+        """Put back alerts that are gone from the app but still in the system-log copy."""
         since = cp["t"] - WINDOW
         have = {(r["id"], round(r["ts"], 3)) for r in self.store.q("SELECT id, ts FROM events WHERE ts >= ?", (since,))}
         taken = {i for i, _ in have}
@@ -223,7 +192,7 @@ class Tamper:
                 continue
             if e["ts"] < since or e["id"] > cp["top"] or (e["id"], round(e["ts"], 3)) in have:
                 continue
-            detail = f"{e['detail']} · restored from the Windows Event Log".lstrip(" ·")
+            detail = f"{e['detail']} · restored from {LOG_NAME}".lstrip(" ·")
             row = (e["ts"], e["end_ts"], e["kind"], e["severity"], e["title"], detail, e["mac"])
             if e["id"] in taken:
                 self.store.x("INSERT INTO events(ts,end_ts,kind,severity,title,detail,mac,seen) VALUES(?,?,?,?,?,?,?,1)", row)

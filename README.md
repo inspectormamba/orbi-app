@@ -1,6 +1,8 @@
 # Orbi Control
 
-A local replacement for the Netgear Orbi app. It runs on a Windows PC, talks to the Orbi directly over its local admin API (no Netgear cloud), and serves a web app you can use from the PC or install on your phone's home screen. Tested against an RBR750 + two RBS750 satellites on firmware V7.2.8.8.
+A local replacement for the Netgear Orbi app. It runs on a Windows PC or a Mac, talks to the Orbi directly over its local admin API (no Netgear cloud), and serves a web app you can use from that machine or install on your phone's home screen. Tested against an RBR750 + two RBS750 satellites on firmware V7.2.8.8.
+
+> **Windows and macOS.** The same code runs on both; the OS-specific parts (secret storage, the tamper-evidence log, auto-start, notifications) live behind `orbi/osdep/`. This README is written for Windows; see **[Running on macOS](#running-on-macos)** for the differences and the Mac install steps.
 
 ## What it does
 
@@ -85,6 +87,32 @@ A local replacement for the Netgear Orbi app. It runs on a Windows PC, talks to 
 .\uninstall.ps1            # stop and remove auto-start; also undoes allow-phone-access (firewall rule + network category)
 ```
 
+## Running on macOS
+
+The same codebase runs on macOS (built for Apple Silicon; the Mac mini it's intended for). The platform-specific services are swapped automatically by `orbi/osdep/`:
+
+| Service | Windows | macOS |
+|---|---|---|
+| Secret storage | DPAPI, ciphertext in `settings.json` | **login Keychain** (service `OrbiControl`); `settings.json` holds only a `keychain:<id>` reference |
+| Tamper-evidence log | Application event log | **unified log** (`logger` to write, `log show` to read) |
+| Auto-start + watchdog | Scheduled Task | **launchd LaunchAgent** `com.orbicontrol.agent` with `KeepAlive` |
+| Notifications | tray toast | tray + `osascript` fallback |
+| Browser automation | `C:\Program Files\Mozilla Firefox` | `/Applications/Firefox.app` |
+| Update helper | PowerShell | bash + `launchctl` |
+| Data folder | `%LOCALAPPDATA%\OrbiControl` | `~/Library/Application Support/OrbiControl` |
+
+Install / uninstall:
+
+```bash
+./install-macos.sh               # venv + deps, LaunchAgent (start at login, restart if it stops), starts it now
+./allow-phone-access-macos.sh    # only if the macOS firewall is on (otherwise phones already work on your Wi-Fi)
+./uninstall-macos.sh [--purge]   # stop + remove auto-start; --purge also removes data and Keychain secrets
+```
+
+Everything else — the dashboard at http://localhost:8470, the PIN, profiles, schedules, filtering, History — works the same. Firefox must be installed for the router-admin-page settings (DNS, Block Sites, schedules, VPN, firewall), exactly as on Windows.
+
+**One honest difference in the anti-tamper guarantee.** On Windows the second copy of every alert goes in the Application event log, which holds it for the full 90 days and needs an administrator to clear. macOS's unified log is the closest equivalent — erasing it needs `sudo log erase` and leaves the machine's own trace — but it is **size-bounded and rotates**, so on a busy machine older entries can age out before 90 days rather than being kept the whole time. Records are split into chunks and reassembled on read so a truncated message can't corrupt a restored alert, and the app writes a canary at startup to catch a log it can't read back. The in-app history (with its database locks) is unchanged; only the off-app backstop is weaker on macOS. Lock the Mac (Ctrl+Cmd+Q) when you step away.
+
 ## Updating
 
 Download the zip from GitHub (Code → Download ZIP) and the app can update itself. Clone with git instead if you'd rather review every change yourself; a git copy never updates itself.
@@ -105,7 +133,9 @@ orbi/router.py     Orbi SOAP access (pynetgear) — serialized, retried, normali
 orbi/monitor.py    health checks, outage tracking, scans, speed tests, block enforcement
 orbi/parental.py   pure schedule/pause logic
 orbi/web.py        FastAPI API + serves web/
-orbi/tray.py       Windows tray icon and notifications
+orbi/tray.py       menu-bar / tray icon and notifications (cross-platform via pystray)
+orbi/osdep/        platform layer: windows.py / macos.py behind one interface (secrets, tamper log,
+                   boot time, single-instance, notifications, geckodriver pin, update helper)
 orbi/routerui.py   router admin pages via headless Firefox (reads/writes), router log via plain HTTPS
 orbi/filtering.py  family-DNS providers, live verification, safe apply with rollback
 orbi/updater.py    update check against GitHub tags, signature check, download, swap with backup, restart helper with rollback

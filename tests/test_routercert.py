@@ -94,11 +94,11 @@ def _zip(exe: bytes) -> bytes:
 def test_geckodriver_is_hash_checked(tmp_config, monkeypatch, tamper):
     exe = b"MZ pretend geckodriver"
     good_zip = _zip(exe)
-    monkeypatch.setattr(geckodriver, "ZIP_SHA256", hashlib.sha256(good_zip).hexdigest())
-    monkeypatch.setattr(geckodriver, "EXE_SHA256", hashlib.sha256(exe).hexdigest())
+    monkeypatch.setitem(geckodriver.SPEC, "archive_sha256", hashlib.sha256(good_zip).hexdigest())
+    monkeypatch.setitem(geckodriver.SPEC, "binary_sha256", hashlib.sha256(exe).hexdigest())
     served = {None: good_zip, "zip": good_zip + b"x", "exe": _zip(exe + b"x")}[tamper]
     if tamper == "exe":  # a zip that matches its pin but carries a different program
-        monkeypatch.setattr(geckodriver, "ZIP_SHA256", hashlib.sha256(served).hexdigest())
+        monkeypatch.setitem(geckodriver.SPEC, "archive_sha256", hashlib.sha256(served).hexdigest())
 
     class Resp(io.BytesIO):
         def __enter__(self):
@@ -110,7 +110,7 @@ def test_geckodriver_is_hash_checked(tmp_config, monkeypatch, tamper):
     if tamper:
         with pytest.raises(geckodriver.GeckodriverError):
             geckodriver.path()
-        assert not (tmp_config / "geckodriver" / geckodriver.VERSION / "geckodriver.exe").exists()
+        assert not (tmp_config / "geckodriver" / geckodriver.VERSION / geckodriver.SPEC["exe_name"]).exists()
     else:
         p = geckodriver.path()
         assert p.read_bytes() == exe

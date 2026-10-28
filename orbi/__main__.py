@@ -1,6 +1,5 @@
 """Entry point: `pythonw -m orbi` (tray + server) or `python -m orbi --no-tray` (server only)."""
 import argparse
-import ctypes
 import logging
 import os
 import sys
@@ -10,7 +9,7 @@ from logging.handlers import RotatingFileHandler
 
 import uvicorn
 
-from . import config, tamper, updater
+from . import config, osdep, tamper, updater
 from .monitor import Monitor
 from .store import Store
 from .web import create_app
@@ -33,10 +32,7 @@ def setup_logging():
 
 def single_instance() -> bool:
     """One instance per data folder (so a test copy with its own folder can run alongside)."""
-    import hashlib
-    tag = hashlib.sha1(str(config.DATA_DIR).lower().encode()).hexdigest()[:12]
-    ctypes.windll.kernel32.CreateMutexW(None, False, f"Local\\OrbiControl-{tag}")
-    return ctypes.windll.kernel32.GetLastError() != 183  # ERROR_ALREADY_EXISTS
+    return osdep.single_instance(config.DATA_DIR)
 
 
 def main():

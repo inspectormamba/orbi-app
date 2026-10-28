@@ -4,9 +4,9 @@ import os
 import threading
 from pathlib import Path
 
-from . import dpapi
+from . import dpapi, osdep
 
-DATA_DIR = Path(os.environ.get("ORBI_DATA_DIR") or Path(os.environ.get("LOCALAPPDATA", Path.home())) / "OrbiControl")
+DATA_DIR = Path(os.environ.get("ORBI_DATA_DIR") or osdep.default_data_dir())
 SETTINGS_FILE = DATA_DIR / "settings.json"
 
 DEFAULTS = {

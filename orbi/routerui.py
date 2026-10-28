@@ -12,8 +12,9 @@ import threading
 import time
 from contextlib import contextmanager
 
+from . import osdep
+
 log = logging.getLogger("orbi.routerui")
-FIREFOX = r"C:\Program Files\Mozilla Firefox\firefox.exe"
 _lock = threading.Lock()
 
 FORM_STATE_JS = """
@@ -66,7 +67,7 @@ class RouterUI:
             raise RouterUIError(str(e)) from e
         opts = Options()
         opts.add_argument("-headless")
-        opts.binary_location = FIREFOX
+        opts.binary_location = osdep.firefox_binary()
         # The router's certificate is self-signed. Rather than accept any certificate, the profile trusts
         # exactly the pinned one; Firefox refuses an impostor before the password is ever sent.
         opts.accept_insecure_certs = False
@@ -76,7 +77,7 @@ class RouterUI:
         shutil.rmtree(profile_dir, ignore_errors=True)  # Selenium has copied it
         opts.enable_bidi = True
         service = Service(executable_path=str(geckodriver.path()))  # pinned and hash-checked
-        service.creation_flags = 0x08000000  # CREATE_NO_WINDOW: no console flash under pythonw
+        service.creation_flags = osdep.SERVICE_CREATION_FLAGS  # Windows: CREATE_NO_WINDOW; POSIX: 0
         self.d = webdriver.Firefox(options=opts, service=service)
         self.d.set_page_load_timeout(40)
         self.d.network.add_auth_handler(self.user, self.password)

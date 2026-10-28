@@ -5,6 +5,8 @@ import webbrowser
 import pystray
 from PIL import Image, ImageDraw
 
+from . import osdep
+
 COLORS = {"ok": (46, 160, 67), "warn": (219, 154, 4), "down": (218, 54, 51), "unknown": (130, 130, 130)}
 
 
@@ -59,10 +61,15 @@ class Tray:
         self.icon.title = f"Orbi Control — {text}"[:120]
 
     def notify(self, title, message):
-        try:
-            self.icon.notify(message, title)
-        except Exception:
-            pass
+        # pystray's toast is reliable on Windows; on macOS its backend often can't post from an
+        # unbundled process, so fall back to osascript there (and if the toast ever fails anywhere).
+        if not osdep.IS_MAC:
+            try:
+                self.icon.notify(message, title)
+                return
+            except Exception:
+                pass
+        osdep.notify(title, message)
 
     def _open(self, *_):
         webbrowser.open(self.url)

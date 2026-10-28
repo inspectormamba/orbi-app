@@ -26,7 +26,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-from . import ed25519
+from . import ed25519, osdep
 
 log = logging.getLogger("orbi.updater")
 
@@ -247,66 +247,11 @@ def current_version_of(folder: Path) -> str:
         return "0.0.0"
 
 
-HELPER = r'''
-param([int]$AppPid, [string]$Root, [string]$Backup, [int]$Port, [string]$DataDir, [string]$Version, [int]$ReqChanged)
-$ErrorActionPreference = "Continue"
-$result = Join-Path $DataDir "update-result.json"
-Remove-Item $result -ErrorAction SilentlyContinue
-function Start-App {
-    # Use the scheduled task only if it runs *this* copy; otherwise start it directly.
-    $task = Get-ScheduledTask -TaskName "%TASK%" -ErrorAction SilentlyContinue
-    if ($task -and ($task.Actions | Where-Object { $_.WorkingDirectory -eq $Root })) { Start-ScheduledTask -TaskName "%TASK%" }
-    else { Start-Process -FilePath (Join-Path $Root ".venv\Scripts\pythonw.exe") -ArgumentList "-m orbi --background" -WorkingDirectory $Root }
-}
-function Stop-App {
-    # Only this copy: the process listening on its port, plus the venv launcher that started it.
-    foreach ($c in @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)) {
-        $p = Get-CimInstance Win32_Process -Filter "ProcessId = $($c.OwningProcess)"
-        if ($p -and $p.CommandLine -like "*-m orbi*") {
-            $parent = Get-CimInstance Win32_Process -Filter "ProcessId = $($p.ParentProcessId)"
-            Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
-            if ($parent -and $parent.CommandLine -like "*-m orbi*") { Stop-Process -Id $parent.ProcessId -Force -ErrorAction SilentlyContinue }
-        }
-    }
-}
-function Test-App {
-    try {
-        $r = Invoke-WebRequest "http://127.0.0.1:$Port/api/session" -UseBasicParsing -TimeoutSec 5
-        return (($r.Content | ConvertFrom-Json).version -eq $Version)
-    } catch { return $false }
-}
-Wait-Process -Id $AppPid -Timeout 30 -ErrorAction SilentlyContinue
-Stop-Process -Id $AppPid -Force -ErrorAction SilentlyContinue
-Start-Sleep -Seconds 2
-Start-App
-$deadline = (Get-Date).AddSeconds(120)
-while ((Get-Date) -lt $deadline) {
-    if (Test-App) { @{ ok = $true; version = $Version } | ConvertTo-Json | Set-Content $result -Encoding utf8; exit 0 }
-    Start-Sleep -Seconds 3
-}
-# The new version didn't come up: put the old one back.
-Stop-App
-Start-Sleep -Seconds 2
-Get-ChildItem $Backup -Directory | ForEach-Object { robocopy $_.FullName (Join-Path $Root $_.Name) /MIR /NFL /NDL /NJH /NJS /NP | Out-Null }
-Get-ChildItem $Backup -File | Copy-Item -Destination $Root -Force
-if ($ReqChanged -eq 1) {
-    & (Join-Path $Root ".venv\Scripts\python.exe") -m pip install --quiet --disable-pip-version-check -r (Join-Path $Root "requirements.txt")
-}
-@{ ok = $false; version = $Version; rolled_back = $true } | ConvertTo-Json | Set-Content $result -Encoding utf8
-Start-App
-'''
-
-
 def _launch_helper(data_dir: Path, bak: Path, port: int, req_changed: bool):
-    script = data_dir / "update-helper.ps1"
-    script.write_text(HELPER.replace("%TASK%", TASK), "utf-8")
+    """Start the detached watch-and-rollback helper (PowerShell on Windows, bash on macOS)."""
     version = json.loads((data_dir / "update-pending.json").read_text("utf-8"))["to"]
-    # No console window, own process group so it outlives this app. Not DETACHED_PROCESS: PowerShell won't run without a console.
-    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-    subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", str(script),
-                      "-AppPid", str(os.getpid()), "-Root", str(ROOT), "-Backup", str(bak), "-Port", str(port),
-                      "-DataDir", str(data_dir), "-Version", version, "-ReqChanged", "1" if req_changed else "0"],
-                     creationflags=flags, close_fds=True, cwd=str(ROOT))
+    osdep.launch_update_helper(root=ROOT, task=TASK, data_dir=data_dir, bak=bak, port=port,
+                               req_changed=req_changed, version=version)
 
 
 def record_result(store, data_dir: Path) -> tuple[str, str] | None:
