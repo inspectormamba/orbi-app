@@ -1295,6 +1295,7 @@ const BLOCK_GROUPS = [
     ["Pi", ["heypi", "inflection"]],
     ["Qwen / Kimi / Doubao", ["qwen", "moonshot", "doubao"]],
     ["Hugging Face", ["huggingface"]],
+    ["OpenCode & AI gateways (OpenRouter, Groq…)", ["opencode", "openrouter", "groq", "cerebras", "deepinfra", "ollama"]],
     ["AI companions (Replika, Janitor AI…)", ["replika", "janitorai", "crushon", "spicychat"]],
     ["AI images (Midjourney, Civitai…)", ["midjourney", "civitai", "ideogram", "runwayml"]],
   ]],
