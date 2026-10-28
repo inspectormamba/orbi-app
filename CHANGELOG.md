@@ -2,6 +2,13 @@
 
 What changed in each version, newest first. The same notes appear in the app under More → Updates.
 
+## 1.2.0 (2026-10-27)
+
+Orbi Control now runs on macOS (Apple Silicon) as well as Windows, from the same app.
+- Install on a Mac with install-macos.sh: it starts at login and restarts itself if it ever stops.
+- On a Mac, secrets are kept in the login Keychain, the tamper-evidence copy of every alert goes to the system log, and alerts use the Mac's notification centre.
+- New block preset for OpenCode and AI API gateways (OpenRouter, Groq, Cerebras and similar).
+
 ## 1.1.19 (2026-10-23)
 
 ### Block apps & sites
