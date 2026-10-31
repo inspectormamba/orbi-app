@@ -62,6 +62,24 @@ def test_log_ingestion_alerts_once(monitor):
     assert monitor.store.one("SELECT COUNT(*) c FROM router_log")["c"] == 7
 
 
+def test_late_log_alerts_name_the_device_and_the_time(monitor):
+    from orbi.monitor import when_logged
+    t = time.mktime((2026, 10, 30, 16, 56, 6, 0, 0, -1))
+    assert when_logged(t, now=t + 30) == ""
+    assert when_logged(t, now=t + 8 * 60 + 1) == " at 4:56 PM (8 min ago)"
+    monitor.scan()  # kid-phone is 192.168.1.20
+    monitor.log_fetcher = lambda: parse_log(LOG)
+    monitor.ingest_router_log()  # first run: backlog only
+    now = time.time()
+    stamp = time.strftime("%A, %b %d,%Y %H:%M:%S", time.localtime(now - 8 * 60))
+    monitor.log_fetcher = lambda: parse_log(f"[Admin login failure] from source 192.168.1.20, {stamp}\n"
+                                            f"[Admin login failure] from source 192.168.1.99, {stamp}\n")
+    monitor.ingest_router_log()
+    bodies = [n[1] for n in monitor.notes if n[0] == "Router login failed"]
+    assert any(b.startswith("kid-phone (192.168.1.20) tried to log in") and "min ago)" in b for b in bodies)
+    assert any(b.startswith("Device at 192.168.1.99 tried to log in") for b in bodies)
+
+
 class FakeUI:
     calls = []
 
@@ -341,6 +359,24 @@ def test_loosened_firewall_rules_alert(monitor):
     assert monitor.notes[-1] == ("Firewall rules loosened", "Block-VPN-WireGuard now only applies to 192.168.1.58; Removed: New (port 1)")
     monitor._watch_block_services({"mode": "never", "rules": [rules[0]]})
     assert "Firewall rules turned off (Never)" in monitor.notes[-1][1]
+
+
+def test_all_firewall_rules_gone_needs_a_second_read(monitor, monkeypatch):
+    import types
+    from orbi import monitor as mon
+    rechecks = []
+    monkeypatch.setattr(mon.threading, "Timer", lambda delay, fn: types.SimpleNamespace(start=lambda: rechecks.append(delay)))
+    rules = [{"name": "Block-DoT-853", "port": "853", "ips": "all"}, {"name": "Block-VPN-WireGuard", "port": "51820", "ips": "all"}]
+    monitor._watch_block_services({"mode": "always", "rules": rules})
+    monitor._watch_block_services({"mode": "always", "rules": []})  # a half-loaded page
+    assert monitor.notes == [] and rechecks == [mon.BLOCK_SERVICES_RECHECK]
+    monitor._watch_block_services({"mode": "always", "rules": rules})  # the second read: all still there
+    assert monitor.notes == []
+    monitor._watch_block_services({"mode": None, "rules": []})  # the page didn't load at all
+    assert monitor.notes == [] and monitor.store.get("block_services_last")["rules"] == rules
+    monitor._watch_block_services({"mode": "always", "rules": []})
+    monitor._watch_block_services({"mode": "always", "rules": []})  # really gone
+    assert monitor.notes[-1][0] == "Firewall rules loosened" and "Removed: Block-DoT-853 (port 853)" in monitor.notes[-1][1]
 
 
 def test_protection_rules_widen_ours_and_leave_partial_user_rules(monkeypatch):

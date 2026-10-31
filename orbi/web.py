@@ -727,8 +727,9 @@ def create_app(monitor: Monitor) -> FastAPI:
 
     @app.get("/api/firmware")
     def firmware():
+        router()
         try:
-            return router().firmware_update()
+            return monitor.check_firmware()  # recorded as a check, and alerts like the twice-daily one
         except RouterError as e:
             raise HTTPException(502, str(e))
 

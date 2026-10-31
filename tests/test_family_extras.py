@@ -145,6 +145,19 @@ def test_firmware_alert_once_per_version(monitor, fake_router):
     assert [n[0] for n in monitor.notes].count("Router firmware update") == 1
 
 
+def test_app_firmware_check_counts_as_checked(monitor, fake_router):
+    import time
+    fake_router.info = lambda: {"model": "RBR750", "firmware": "V7.2.8.8", "firmware_auto": False, "firmware_checked": 1000.0}
+    monitor.scan()
+    assert monitor.state["info"]["firmware_checked"] == 1000.0  # the router's own date
+    monitor.check_firmware()  # asking over the API doesn't move the router's date
+    checked = monitor.state["info"]["firmware_checked"]
+    assert checked > time.time() - 5
+    monitor.state["info"] = {}  # the hourly re-read keeps the newer of the two
+    monitor.scan()
+    assert monitor.state["info"]["firmware_checked"] == checked
+
+
 # ---------- settings backup ----------
 def test_backup_keeps_the_last_eight(monitor, monkeypatch, tmp_config):
     import orbi.routerui as rui

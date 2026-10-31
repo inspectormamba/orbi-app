@@ -499,8 +499,15 @@ return out;"""
         return got
 
     def read_block_services(self) -> dict:
-        f = self.form("BKS_service.htm")
-        return {"mode": f.get("skeyword"), "rules": parse_rule_rows(self.rows())}
+        # A page whose scripts haven't finished reads as no rules at all: load it again before believing that.
+        for attempt in range(3):
+            if attempt:
+                time.sleep(2)
+            f = self.form("BKS_service.htm")
+            out = {"mode": f.get("skeyword"), "rules": parse_rule_rows(self.rows())}
+            if out["mode"] and out["rules"]:
+                break
+        return out
 
     def read_block_sites(self) -> dict:
         f = self.form("BKS_keyword.htm")

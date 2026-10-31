@@ -22,6 +22,14 @@ log = logging.getLogger("orbi.monitor")
 INTERNET_TARGETS = [("1.1.1.1", 443), ("8.8.8.8", 443), ("9.9.9.9", 443)]
 
 
+def when_logged(ts, now=None):
+    """' at 4:56 PM (8 min ago)' for a router-log entry that's only reaching us now; '' if it just happened."""
+    mins = int(((now or time.time()) - ts) // 60)
+    if mins < 2:
+        return ""
+    return f" at {time.strftime('%I:%M %p', time.localtime(ts)).lstrip('0')} ({mins} min ago)"
+
+
 def tcp_ok(host, port, timeout=3.0):
     t = time.perf_counter()
     try:
@@ -132,6 +140,7 @@ NET_LABELS = {"iot": "IoT Wi-Fi", "guest": "Guest Wi-Fi", "main": "main Wi-Fi"}
 LINK_LOST_AFTER = 10 * 60  # this long without a good scan: the app has lost the router (alert)
 LINK_REMIND_EVERY = 2 * 3600  # and reminds this often until it's back
 SETTINGS_WATCH_EVERY = 15 * 60  # firewall rules and block list re-read this often
+BLOCK_SERVICES_RECHECK = 60  # every firewall rule gone at once is read again this soon before it's believed
 
 
 class Monitor:
@@ -165,6 +174,7 @@ class Monitor:
         self._wrong_pins: dict[str, list[float]] = {}  # ip -> times of wrong PINs in the last hour
         self._pin_alerted: dict[str, float] = {}  # ip -> when the last "guessing the PIN" alert went out
         self._address_mismatch: dict[str, float] = {}  # "mac ip" -> first scan that saw it
+        self._rules_vanished = False  # the last firewall read showed no rules at all, waiting on a second read
         self._room: dict[str, str] = {}  # mac -> the Orbi (router or satellite) a Wi-Fi device settled on
         self._room_pending: dict[str, tuple[str, int]] = {}  # mac -> (a different Orbi, scans seen on it)
         self._room_noted: dict[str, float] = {}
@@ -431,7 +441,10 @@ class Monitor:
             return
         try:
             if not self.state["info"] or time.time() - self.state.get("info_ts", 0) > 3600:  # firmware check dates move
-                self.state["info"], self.state["info_ts"] = self.router.info(), time.time()
+                info = self.router.info()
+                info["firmware_checked"] = max(filter(None, (info.get("firmware_checked"), self.store.get("firmware_checked"))),
+                                               default=None)
+                self.state["info"], self.state["info_ts"] = info, time.time()
             self.state["wan"] = self.router.wan()
             self._watch_filter(self.state["wan"].get("dns"))
             self.state["system"] = self.router.system()
@@ -1342,7 +1355,7 @@ class Monitor:
                 alerted.add(key)
                 self.store.event("vpn_attempt", f"{who} tried to use a VPN", detail=f"Blocked by the router ({kind.split(': ', 1)[1]}) · {e['source']}",
                                  severity="warn", mac=self.mac_by_ip(e["source"]), ts=e["ts"])
-                self.notify("VPN attempt blocked", f"{who} tried to connect to a VPN")
+                self.notify("VPN attempt blocked", f"{who} tried to connect to a VPN{when_logged(e['ts'])}")
             elif kind.startswith(vpnlog.KIND_PREFIX):
                 self._vpn_server_event(e)
             elif kind == "Admin login failure" and e["source"] not in mine:
@@ -1350,9 +1363,11 @@ class Monitor:
                     continue  # failed-login logging disabled: no event, no notification
                 if self._recent_alert("admin_fail", e["source"], 3600):
                     continue
-                self.store.event("admin_fail", "Failed login to the router's admin page", detail=f"From {self.device_by_ip(e['source'])} ({e['source']})",
+                who = self.device_by_ip(e["source"])
+                self.store.event("admin_fail", "Failed login to the router's admin page", detail=f"From {who} ({e['source']})",
                                  severity="error", mac=self.mac_by_ip(e["source"]), ts=e["ts"])
-                self.notify("Router login failed", f"Someone at {e['source']} tried to log in to the Orbi admin page")
+                named = who if who.startswith("Device at") else f"{who} ({e['source']})"
+                self.notify("Router login failed", f"{named} tried to log in to the Orbi admin page{when_logged(e['ts'])}")
 
     def _vpn_server_event(self, e):
         """Someone connected to, disconnected from, or failed to connect to the Orbi's own VPN server."""
@@ -1488,9 +1503,19 @@ class Monitor:
     def _watch_block_services(self, now):
         """Alert when the router's firewall rules get weaker: a rule removed, moved to other ports, narrowed to fewer
         devices, or all rules turned off or limited to a schedule."""
-        if not now:
-            return
+        if not now or not now.get("mode"):
+            return  # the page didn't load: no reading, not a change
         before = self.store.get("block_services_last")
+        if before and before.get("rules") and not now.get("rules") and now["mode"] == before.get("mode"):
+            # Every rule gone at once with nothing else changed is also how a half-loaded page reads (2026-10-30):
+            # believe it only when a second read agrees.
+            if not self._rules_vanished:
+                self._rules_vanished = True
+                t = threading.Timer(BLOCK_SERVICES_RECHECK, lambda: self.run_job("settingswatch", self.check_router_settings))
+                t.daemon = True
+                t.start()
+                return
+        self._rules_vanished = False
         self.store.put("block_services_last", now)
         if not before:
             return
@@ -1742,7 +1767,12 @@ class Monitor:
         if not self.router:
             return {}
         fw = self.router.firmware_update()
-        self.state["firmware"] = {**fw, "checked": time.time()}
+        checked = time.time()
+        self.state["firmware"] = {**fw, "checked": checked}
+        # The router's own "last checked" date only moves when it looks by itself, not when asked over its API.
+        self.store.put("firmware_checked", checked)
+        if self.state["info"]:
+            self.state["info"]["firmware_checked"] = checked
         new = fw.get("available")
         if new and self.store.get("firmware_notified") != new:
             self.store.put("firmware_notified", new)

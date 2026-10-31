@@ -689,7 +689,7 @@ async function renderMore() {
     fwStale ? h("div", { class: "note" }, "The router only looks for firmware updates when asked, and hasn't looked in over two weeks. Use Check for firmware update below; security fixes come that way.") : null,
     h("label", { class: "field" }, `Admin password for ${settings.router_host}`, rpw),
     h("button", { class: "btn", onclick: (e) => act(e.currentTarget, () => api("/api/settings/router-password", { body: { password: rpw.value } }), "Router password saved").then(() => (rpw.value = "")) }, "Update password"),
-    h("button", { class: "btn", onclick: (e) => act(e.currentTarget, async () => { const f = await api("/api/firmware"); toast(f.available ? `Firmware ${f.available} is available` : `Firmware ${f.current} is up to date`); }) }, "Check for firmware update"),
+    h("button", { class: "btn", onclick: (e) => act(e.currentTarget, async () => { const f = await api("/api/firmware"); toast(f.available ? `Firmware ${f.available} is available` : `Firmware ${f.current} is up to date`); renderMore().catch(() => {}); }) }, "Check for firmware update"),
     h("button", { class: "btn danger", onclick: rebootSheet }, "Reboot router…"), restartInfo, certInfo, backupInfo);
   api("/api/router/reboot").then((r) => r.scheduled_at && fill(restartInfo, h("div", { class: "note" }, `Router restart scheduled for ${fmtAt(r.scheduled_at)}. `,
     h("button", { class: "btn small", onclick: (e) => act(e.currentTarget, () => api("/api/router/reboot", { method: "DELETE" }), "Scheduled restart cancelled").then(() => restartInfo.replaceChildren()) }, "Cancel")))).catch(() => {});
@@ -1121,7 +1121,8 @@ function securityChecklistCard() {
       const fwChecked = st.info?.firmware_checked;
       const fwStale = st.info?.firmware_auto === false && fwChecked && Date.now() / 1000 - fwChecked > 14 * 86400;
       add(fwStale ? "warn" : true, "Router firmware checks",
-        fwStale ? "Hasn't looked for an update in over two weeks. Check in More → Router; security fixes come that way." : "Automatic, or checked recently.");
+        fwStale ? "Hasn't looked for an update in over two weeks. Check in More → Router; security fixes come that way."
+          : st.info?.firmware_auto ? "Automatic." : fwChecked ? `Checked ${ago(fwChecked)}. Orbi Control checks twice a day.` : "Automatic, or checked recently.");
 
       add(settings.alert_admin_login_failures ? true : "warn", "Failed admin-login alerts",
         settings.alert_admin_login_failures ? "On." : "Off. A guessed router password would go unnoticed. Turn on in More → Settings.");
