@@ -2,6 +2,12 @@
 
 What changed in each version, newest first. The same notes appear in the app under More → Updates.
 
+## 1.2.1 (2026-10-30)
+
+- No more false "Firewall rules were loosened" alerts. When the router's firewall page hadn't finished loading it looked like every rule was gone; now a second look a minute later has to agree before you're alerted.
+- The Security checklist's firmware item now changes when you or Orbi Control check for an update. The router's own "last checked" date only moves when the router checks by itself.
+- Failed router logins and VPN attempts now name the device in the phone alert (for example "James Desktop (192.168.1.48) tried to log in"), and say when it happened if the alert arrives late.
+
 ## 1.2.0 (2026-10-27)
 
 Orbi Control now runs on macOS (Apple Silicon) as well as Windows, from the same app.
