@@ -2,6 +2,12 @@
 
 What changed in each version, newest first. The same notes appear in the app under More → Updates.
 
+## 1.2.2 (2026-11-02)
+
+- Blocks Cloudflare WARP (the 1.1.1.1 app): "Add rules that block DNS & VPN workarounds" now also blocks WARP's ports, and a device that tries them sends a VPN-attempt alert.
+- More → Break-in attempts now also lists failed logins to the router's own settings page (routerlogin.net), with the device they came from. The router doesn't record what was typed there.
+- The "Router admin login failed" alert now says it was the router's settings page, not Orbi Control.
+
 ## 1.2.1 (2026-10-30)
 
 - No more false "Firewall rules were loosened" alerts. When the router's firewall page hadn't finished loading it looked like every rule was gone; now a second look a minute later has to agree before you're alerted.
