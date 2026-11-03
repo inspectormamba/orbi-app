@@ -1369,6 +1369,20 @@ class Monitor:
                 named = who if who.startswith("Device at") else f"{who} ({e['source']})"
                 self.notify("Router admin login failed",
                             f"{named} tried to log in to the router's own settings page (not Orbi Control){when_logged(e['ts'])}")
+            elif kind == "Admin login" and e["source"] not in mine:
+                # Someone with the router password got in (2026-11-02: James, who then narrowed the WARP rules). A session
+                # logs a login every half minute or so, so one alert per device per hour.
+                if ("admin_login", e["source"]) in alerted or self._recent_alert("admin_login", e["source"], 3600):
+                    continue
+                alerted.add(("admin_login", e["source"]))
+                who = self.device_by_ip(e["source"])
+                self.store.event("admin_login", f"{who} logged in to the router's admin page", severity="error",
+                                 detail=f"From {who} ({e['source']}). Whoever has the router password can change its firewall rules, "
+                                        "filtering and Wi-Fi. If it wasn't you, change the router password, then enter it in More → Router.",
+                                 mac=self.mac_by_ip(e["source"]), ts=e["ts"])
+                named = who if who.startswith("Device at") else f"{who} ({e['source']})"
+                self.notify("Someone logged in to the router",
+                            f"{named} signed in to the router's own settings page{when_logged(e['ts'])}. If it wasn't you, change the router password.")
 
     def _vpn_server_event(self, e):
         """Someone connected to, disconnected from, or failed to connect to the Orbi's own VPN server."""

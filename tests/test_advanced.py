@@ -80,6 +80,24 @@ def test_late_log_alerts_name_the_device_and_the_time(monitor):
     assert any(b.startswith("Device at 192.168.1.99 tried to log in") for b in bodies)
 
 
+def test_successful_router_login_from_another_device_alerts_once(monitor):
+    monitor.scan()  # kid-phone is 192.168.1.20
+    monitor.log_fetcher = lambda: parse_log(LOG)
+    monitor.ingest_router_log()  # first run: backlog only (its 192.168.1.58 login is history)
+    now = time.time()
+    stamp = lambda t: time.strftime("%A, %b %d,%Y %H:%M:%S", time.localtime(t))
+    lines = "".join(f"[Admin login] from source 192.168.1.20, {stamp(now - 120 + i * 30)}\n" for i in range(3))
+    monitor.log_fetcher = lambda: parse_log(lines + LOG)
+    monitor.ingest_router_log()
+    ev = monitor.store.q("SELECT * FROM events WHERE kind='admin_login'")
+    assert len(ev) == 1 and ev[0]["title"] == "kid-phone logged in to the router's admin page" and ev[0]["mac"] == "AA:00:00:00:00:01"
+    assert [n[0] for n in monitor.notes].count("Someone logged in to the router") == 1
+    monitor.protected = {"AA:00:00:00:00:02"}  # this PC's own logins (kid-tablet here) never alert
+    monitor.log_fetcher = lambda: parse_log(f"[Admin login] from source 192.168.1.21, {stamp(now)}\n" + lines + LOG)
+    monitor.ingest_router_log()
+    assert len(monitor.store.q("SELECT * FROM events WHERE kind='admin_login'")) == 1
+
+
 def test_break_in_list_includes_router_admin_failures(client, monitor):
     monitor.scan()  # kid-phone is 192.168.1.20
     now = time.time()
