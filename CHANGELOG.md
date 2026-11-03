@@ -2,6 +2,10 @@
 
 What changed in each version, newest first. The same notes appear in the app under More → Updates.
 
+## 1.2.3 (2026-11-02)
+
+- New alert: "Someone logged in to the router". If any device other than the PC running Orbi Control signs in to the router's own settings page, you get a phone alert and a History entry naming the device. Whoever has the router password can change its rules, so if it wasn't you, change that password.
+
 ## 1.2.2 (2026-11-02)
 
 - Blocks Cloudflare WARP (the 1.1.1.1 app): "Add rules that block DNS & VPN workarounds" now also blocks WARP's ports, and a device that tries them sends a VPN-attempt alert.
