@@ -56,7 +56,7 @@ def test_log_ingestion_alerts_once(monitor):
     vpn = monitor.store.q("SELECT * FROM events WHERE kind='vpn_attempt'")
     assert len(vpn) == 1 and vpn[0]["title"] == "kid-phone tried to use a VPN" and vpn[0]["mac"] == "AA:00:00:00:00:01"
     assert len(monitor.store.q("SELECT * FROM events WHERE kind='admin_fail'")) == 1
-    assert {n[0] for n in monitor.notes} >= {"VPN attempt blocked", "Router login failed"}
+    assert {n[0] for n in monitor.notes} >= {"VPN attempt blocked", "Router admin login failed"}
     monitor.ingest_router_log()  # same log again: nothing new
     assert len(monitor.store.q("SELECT * FROM events WHERE kind='vpn_attempt'")) == 1
     assert monitor.store.one("SELECT COUNT(*) c FROM router_log")["c"] == 7
@@ -75,9 +75,19 @@ def test_late_log_alerts_name_the_device_and_the_time(monitor):
     monitor.log_fetcher = lambda: parse_log(f"[Admin login failure] from source 192.168.1.20, {stamp}\n"
                                             f"[Admin login failure] from source 192.168.1.99, {stamp}\n")
     monitor.ingest_router_log()
-    bodies = [n[1] for n in monitor.notes if n[0] == "Router login failed"]
-    assert any(b.startswith("kid-phone (192.168.1.20) tried to log in") and "min ago)" in b for b in bodies)
+    bodies = [n[1] for n in monitor.notes if n[0] == "Router admin login failed"]
+    assert any(b.startswith("kid-phone (192.168.1.20) tried to log in") and "(not Orbi Control)" in b and "min ago)" in b for b in bodies)
     assert any(b.startswith("Device at 192.168.1.99 tried to log in") for b in bodies)
+
+
+def test_break_in_list_includes_router_admin_failures(client, monitor):
+    monitor.scan()  # kid-phone is 192.168.1.20
+    now = time.time()
+    monitor.store.x("INSERT INTO router_log(ts,kind,source,text) VALUES(?,?,?,?)", (now - 60, "Admin login failure", "192.168.1.20", "x"))
+    monitor.store.x("INSERT INTO router_log(ts,kind,source,text) VALUES(?,?,?,?)", (now - 50, "Admin login", "192.168.1.20", "y"))
+    monitor.store.x("INSERT INTO router_log(ts,kind,source,text) VALUES(?,?,?,?)", (now - 40 * 86400, "Admin login failure", "192.168.1.20", "z"))
+    fails = client.get("/api/security").json()["router_failures"]
+    assert [(f["device"], f["ip"]) for f in fails] == [("kid-phone", "192.168.1.20")]
 
 
 class FakeUI:
@@ -385,7 +395,9 @@ def test_protection_rules_widen_ours_and_leave_partial_user_rules(monkeypatch):
              {"name": "Block External DNS 2", "port": "53", "ips": "192.168.1.17 - 192.168.1.254"},
              {"name": "Block-DoT-853", "port": "853", "ips": "all"},
              {"name": "Block-VPN-OpenVPN", "port": "1194", "ips": "all"},
-             {"name": "Block-VPN-WireGuard", "port": "51820", "ips": "192.168.1.58"}]
+             {"name": "Block-VPN-WireGuard", "port": "51820", "ips": "192.168.1.58"},
+             {"name": "Block-VPN-WARP", "port": "2408", "ips": "all"},
+             {"name": "Block-VPN-WARP-1701", "port": "1701", "ips": "all"}]
     ui = RouterUI.__new__(RouterUI)
     calls = []
     monkeypatch.setattr(ui, "read_block_services", lambda: {"mode": "always", "rules": [dict(r) for r in rules]}, raising=False)

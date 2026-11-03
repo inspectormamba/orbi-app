@@ -1367,7 +1367,8 @@ class Monitor:
                 self.store.event("admin_fail", "Failed login to the router's admin page", detail=f"From {who} ({e['source']})",
                                  severity="error", mac=self.mac_by_ip(e["source"]), ts=e["ts"])
                 named = who if who.startswith("Device at") else f"{who} ({e['source']})"
-                self.notify("Router login failed", f"{named} tried to log in to the Orbi admin page{when_logged(e['ts'])}")
+                self.notify("Router admin login failed",
+                            f"{named} tried to log in to the router's own settings page (not Orbi Control){when_logged(e['ts'])}")
 
     def _vpn_server_event(self, e):
         """Someone connected to, disconnected from, or failed to connect to the Orbi's own VPN server."""

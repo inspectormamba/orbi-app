@@ -747,6 +747,13 @@ async function renderSecurity(card) {
     a.automated || !/Mozilla/.test(a.agent || "") ? h("div", { class: "meta", style: wrap }, `Sent by: ${a.agent || "no program name"}`) : null)))
     : [h("div", { class: "muted small" }, "No wrong PINs in the last 30 days.")];
   const list = h("div", {}, ...rows());
+  const routerFails = s.router_failures || [];
+  const routerList = [h("div", { class: "group-label", style: "margin-top:12px" }, "Router admin page (routerlogin.net)"),
+    h("div", { class: "muted small" }, "Failed logins to the Orbi's own settings page, which has its own password. The router only records who tried, not what they typed."),
+    ...(routerFails.length ? routerFails.map((a) => h("div", { class: "row" }, h("div", { class: "main" },
+      h("div", { class: "name", style: "white-space:normal" }, a.device || a.ip),
+      h("div", { class: "meta", style: wrap }, [fmtWhen(a.ts), "Wrong router password", a.ip].join(" · ")))))
+      : [h("div", { class: "muted small" }, "None in the last 30 days.")])];
   const block = h("input", { type: "checkbox", checked: s.block_pin_attackers, onchange: (e) =>
     act(null, () => api("/api/settings", { method: "PATCH", body: { block_pin_attackers: e.target.checked } }), "Saved").catch(() => {}) });
   fill(card, h("h2", {}, "Break-in attempts"),
@@ -755,8 +762,10 @@ async function renderSecurity(card) {
       h("button", { class: "btn small", onclick: (e) => act(e.currentTarget, () => api(`/api/security/bans/${encodeURIComponent(b.ip)}`, { method: "DELETE" }), "It can use the app again").then(() => renderSecurity(card)) }, "Let it back in"))),
     h("label", { class: "switch" }, "Also block the device at the router", block),
     h("label", { class: "switch" }, "Show what was typed", reveal),
+    h("div", { class: "group-label" }, "Orbi Control PIN"),
     list,
-    s.attempts.length ? h("button", { class: "btn small", onclick: (e) => act(e.currentTarget, () => api("/api/security/attempts", { method: "DELETE" }), "Cleared").then(() => renderSecurity(card)) }, "Clear the list") : null);
+    s.attempts.length ? h("button", { class: "btn small", onclick: (e) => act(e.currentTarget, () => api("/api/security/attempts", { method: "DELETE" }), "Cleared").then(() => renderSecurity(card)) }, "Clear the list") : null,
+    ...routerList);
 }
 
 // ---------- app updates ----------

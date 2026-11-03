@@ -313,6 +313,8 @@ class RouterUI:
         ("Block-DoT-853", "TCP/UDP", 853),  # DNS-over-TLS
         ("Block-VPN-OpenVPN", "TCP/UDP", 1194),
         ("Block-VPN-WireGuard", "UDP", 51820),
+        ("Block-VPN-WARP", "UDP", 2408),  # Cloudflare WARP (1.1.1.1 app) WireGuard tunnel
+        ("Block-VPN-WARP-1701", "UDP", 1701),  # WARP's fallback port (also L2TP VPNs)
     ]
 
     def ensure_protection_rules(self) -> list[str]:

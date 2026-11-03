@@ -18,7 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import auth, config, parental, updater
-from .guard import PinGuard
+from .guard import KEEP_DAYS as PIN_KEEP_DAYS, PinGuard
 from .monitor import Monitor, fmt_duration, network_of as monitor_network_of
 from .store import ACTOR
 from .router import RouterClient, RouterError, norm_mac
@@ -322,7 +322,13 @@ def create_app(monitor: Monitor) -> FastAPI:
     @app.get("/api/security")
     def security():
         bans = [{"ip": ip, **b} for ip, b in guard.bans().items()]
-        return {"attempts": guard.recent(), "bans": sorted(bans, key=lambda b: -b["since"]),
+        # The router's own admin page (routerlogin.net) has a separate password; its log says who failed, never what was typed.
+        mine = {d["last_ip"] for d in store.q("SELECT last_ip FROM devices WHERE mac IN (%s)" % ",".join("?" * len(monitor.protected)),
+                                              tuple(monitor.protected))} if monitor.protected else set()
+        router_fails = [{"ts": r["ts"], "ip": r["source"], "device": monitor.device_by_ip(r["source"])}
+                        for r in store.q("SELECT ts, source FROM router_log WHERE kind='Admin login failure' AND ts > ? ORDER BY ts DESC LIMIT 40",
+                                         (time.time() - PIN_KEEP_DAYS * 86400,)) if r["source"] not in mine]
+        return {"attempts": guard.recent(), "router_failures": router_fails, "bans": sorted(bans, key=lambda b: -b["since"]),
                 "block_pin_attackers": config.load().get("block_pin_attackers", True)}
 
     @app.delete("/api/security/attempts")
