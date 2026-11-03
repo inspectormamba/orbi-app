@@ -2,6 +2,12 @@
 
 What changed in each version, newest first. The same notes appear in the app under More → Updates.
 
+## 1.2.4 (2026-11-02)
+
+- New alert: "Device may be using a copied address". Fires when a device you know suddenly connects differently (always Wi-Fi, now on a cable, or the reverse) or the router identifies it as a different maker or type. Copying a device's hardware address is a way to take over its rules.
+- New alert: "Traffic being intercepted". Fires when one device puts itself in the middle of another's connection (ARP spoofing), which would let it read the Orbi Control PIN. Don't sign in while that alert is open.
+- After any other device logs in to the router, Orbi Control checks the router's log, firewall rules and block list every 2 minutes for the next half hour, so a quick change and undo is still caught.
+
 ## 1.2.3 (2026-11-02)
 
 - New alert: "Someone logged in to the router". If any device other than the PC running Orbi Control signs in to the router's own settings page, you get a phone alert and a History entry naming the device. Whoever has the router password can change its rules, so if it wasn't you, change that password.
