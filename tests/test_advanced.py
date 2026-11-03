@@ -98,6 +98,55 @@ def test_successful_router_login_from_another_device_alerts_once(monitor):
     assert len(monitor.store.q("SELECT * FROM events WHERE kind='admin_login'")) == 1
 
 
+def test_outside_router_login_starts_close_watch(monitor, monkeypatch):
+    import orbi.monitor as mon
+    started = []
+    monkeypatch.setattr(mon.threading, "Thread", lambda target, name, daemon: type("T", (), {"start": lambda self: started.append(name)})())
+    monitor.scan()
+    monitor.log_fetcher = lambda: parse_log(LOG)
+    monitor.ingest_router_log()
+    stamp = time.strftime("%A, %b %d,%Y %H:%M:%S", time.localtime(time.time() - 30))
+    monitor.log_fetcher = lambda: parse_log(f"[Admin login] from source 192.168.1.20, {stamp}\n" + LOG)
+    monitor.ingest_router_log()
+    assert started == ["outside-session"] and monitor._outside_until > time.time() + 25 * 60
+    monitor._watch_closely()  # another login during the watch extends it without a second watcher
+    assert started == ["outside-session"]
+
+
+def test_interception_needs_one_device_answering_for_two_addresses(monitor):
+    monitor.scan()  # kid-phone .20 (AA..01), kid-tablet .21 (AA..02), tv .22 (AA..03)
+    arp = {"192.168.1.20": "AA:00:00:00:00:02", "192.168.1.21": "AA:00:00:00:00:02", "192.168.1.22": "AA:00:00:00:00:03"}
+    monitor.arp_reader = lambda: arp
+    monitor.check_interception()
+    assert monitor.store.q("SELECT * FROM events WHERE kind='intercept'") == []  # one check isn't enough
+    monitor.check_interception()
+    monitor.check_interception()
+    ev = monitor.store.q("SELECT * FROM events WHERE kind='intercept'")
+    assert len(ev) == 1 and ev[0]["title"] == "kid-tablet is intercepting kid-phone's traffic"
+    assert ("Traffic being intercepted", "kid-tablet is in the middle of kid-phone's connection. Don't type the PIN.") in monitor.notes
+    # a phone that just changed to a new private address isn't anyone else: no alert
+    monitor.arp_reader = lambda: {"192.168.1.22": "DE:AD:00:00:00:01"}
+    monitor.check_interception()
+    monitor.check_interception()
+    assert len(monitor.store.q("SELECT * FROM events WHERE kind='intercept'")) == 1
+
+
+def test_copied_address_shows_as_a_device_unlike_itself(monitor):
+    from orbi.monitor import CLONE_LEARN_SCANS
+    imac = {"mac": "AA:00:00:00:00:07", "ip": "192.168.1.46", "name": "Kristines-iMac", "connection": "5GHz", "brand": "Apple", "category": "DESKTOP"}
+    for _ in range(CLONE_LEARN_SCANS):
+        monitor._watch_clones([imac])
+    monitor._watch_clones([{**imac, "connection": "2.4GHz"}])  # another band is still Wi-Fi
+    clone = {**imac, "connection": "wired", "brand": "Microsoft"}
+    monitor._watch_clones([clone])
+    assert monitor.store.q("SELECT * FROM events WHERE kind='clone'") == []  # one odd scan isn't enough
+    monitor._watch_clones([clone])
+    ev = monitor.store.q("SELECT * FROM events WHERE kind='clone'")
+    assert len(ev) == 1 and "always been on Wi-Fi and is now plugged in by cable" in ev[0]["detail"] and "now says Microsoft" in ev[0]["detail"]
+    monitor._watch_clones([clone])
+    assert len(monitor.store.q("SELECT * FROM events WHERE kind='clone'")) == 1
+
+
 def test_break_in_list_includes_router_admin_failures(client, monitor):
     monitor.scan()  # kid-phone is 192.168.1.20
     now = time.time()

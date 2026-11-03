@@ -119,6 +119,22 @@ def arp_mac(ip: str) -> str | None:
     return routercert.gateway_mac(ip)
 
 
+def arp_table() -> dict[str, str]:
+    """ip -> hardware address for every learned (dynamic) entry in this PC's ARP table."""
+    import subprocess
+    try:
+        out = subprocess.run(["arp", "-a"], capture_output=True, text=True, timeout=10,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    table = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[2].lower() == "dynamic" and re.fullmatch(r"([0-9A-Fa-f]{2}[-:]){5}[0-9A-Fa-f]{2}", parts[1]):
+            table[parts[0]] = parts[1].replace("-", ":").upper()
+    return table
+
+
 def local_macs() -> set[str]:
     """MACs of this PC's adapters, so the app never blocks the machine it runs on."""
     import subprocess
@@ -141,6 +157,10 @@ LINK_LOST_AFTER = 10 * 60  # this long without a good scan: the app has lost the
 LINK_REMIND_EVERY = 2 * 3600  # and reminds this often until it's back
 SETTINGS_WATCH_EVERY = 15 * 60  # firewall rules and block list re-read this often
 BLOCK_SERVICES_RECHECK = 60  # every firewall rule gone at once is read again this soon before it's believed
+OUTSIDE_SESSION_WATCH = 30 * 60  # after another device logs in to the router, watch it closely this long
+OUTSIDE_SESSION_EVERY = 2 * 60  # re-reading its log, rules and block list this often meanwhile
+CLONE_LEARN_SCANS = 30  # scans a device must be seen in one way (cable or Wi-Fi) before the other way is odd
+CLONE_CONFIRM = 2  # scans in a row a device must look different before it's reported
 
 
 class Monitor:
@@ -179,6 +199,10 @@ class Monitor:
         self._room_pending: dict[str, tuple[str, int]] = {}  # mac -> (a different Orbi, scans seen on it)
         self._room_noted: dict[str, float] = {}
         self._gateway_odd: tuple[str, int] | None = None  # (hardware address answering for the router, checks in a row)
+        self._intercept_odd: dict[str, tuple[str, int]] = {}  # ip -> (hardware address answering for it, checks in a row)
+        self._clone_odd: dict[str, int] = {}  # mac -> scans in a row it has looked unlike itself
+        self._outside_until = 0.0  # another device logged in to the router: watch closely until then
+        self.arp_reader = arp_table
         self._spike = {"streak": 0, "event_id": None, "sent": 0.0, "pc_sent": 0.0, "since": None, "peak": 0.0, "last_pc": None}
         self.protected = local_macs()
         self.tamper = None  # tamper.Tamper, set by __main__ (the real app only: it writes to the Windows Event Log)
@@ -328,6 +352,7 @@ class Monitor:
         if router_ms is not None:
             self.check_satellites()
             self.check_gateway()
+            self.check_interception()
 
     def check_satellites(self):
         """Probes each known satellite directly, so a dropped one is noticed within a couple of
@@ -468,6 +493,7 @@ class Monitor:
         self._update_devices(devices)
         self._watch_addresses(devices)
         self._watch_identities(devices)
+        self._watch_clones(devices)
         self._watch_rooms(devices)
         self._watch_networks()
         self._restart_followup(devices)
@@ -864,6 +890,50 @@ class Monitor:
             self.notify("Device may be disguised", f"{who}: {why}")
         self.store.put("identity_alerted", alerted)
 
+    def _watch_clones(self, devices):
+        """Alerts when a known device suddenly connects or identifies unlike itself: a Wi-Fi-only Mac now on a cable,
+        or a "Mac" the router now fingerprints as a Windows PC. Copying a device's hardware address takes over its
+        profile without any address or name changing, so this is how a borrowed identity shows."""
+        traits = self.store.get("device_traits", {})
+        alerted = self.store.get("clone_alerted", {})
+        now, protected = time.time(), self.protected_macs()
+        for d in devices:
+            mac, conn = d["mac"], (d.get("connection") or "").lower()
+            if mac in protected or not conn:
+                continue
+            t = traits.setdefault(mac, {"wired": 0, "wifi": 0, "brand": [], "category": []})
+            medium = "wired" if conn == "wired" else "wifi"
+            other = "wifi" if medium == "wired" else "wired"
+            odd = []
+            if t[medium] == 0 and t[other] >= CLONE_LEARN_SCANS:
+                odd.append("it has always been on Wi-Fi and is now plugged in by cable" if medium == "wired"
+                           else "it has always been plugged in by cable and is now on Wi-Fi")
+            for key, what in (("brand", "maker"), ("category", "type")):
+                v = d.get(key) or ""
+                if v and t[key] and v not in t[key] and t[other] + t[medium] >= CLONE_LEARN_SCANS:
+                    odd.append(f"the router used to identify its {what} as {' / '.join(t[key])} and now says {v}")
+            if odd:
+                n = self._clone_odd[mac] = self._clone_odd.get(mac, 0) + 1
+                if n < CLONE_CONFIRM:
+                    continue  # one odd scan isn't learned from either, so the next one can confirm it
+                why = "; ".join(odd)
+                if alerted.get(mac, {}).get("why") != why or now - alerted[mac]["ts"] > 86400:
+                    alerted[mac] = {"why": why, "ts": now}
+                    who = self.device_label(mac)
+                    p = self.store.one("SELECT p.name FROM devices d JOIN profiles p ON p.id=d.profile_id WHERE d.mac=?", (mac,))
+                    self.store.event("clone", f"{who} may be another device using its address", severity="error", mac=mac,
+                                     detail=f"{why[0].upper()}{why[1:]}. A device that copies {who}'s hardware address gets "
+                                            f"{who}'s rules{' (' + p['name'] + ')' if p else ''}. If {who} really did change, "
+                                            "ignore this. Otherwise find what's connected as it, and block it in Devices.")
+                    self.notify("Device may be using a copied address", f"{who}: {odd[0]}")
+            self._clone_odd.pop(mac, None)
+            t[medium] = min(t[medium] + 1, 100000)
+            for key in ("brand", "category"):
+                if (v := d.get(key)) and v not in t[key]:
+                    t[key] = (t[key] + [v])[-4:]
+        self.store.put("device_traits", traits)
+        self.store.put("clone_alerted", {m: a for m, a in alerted.items() if now - a["ts"] < 7 * 86400})
+
     def _watch_rooms(self, devices):
         """While a profile's devices are cut off (bedtime, a pause), notes when one of them moves to a different Orbi.
         Wi-Fi devices connect to the nearest one, so it says roughly where in the house the device is now."""
@@ -1208,6 +1278,36 @@ class Monitor:
                                                             mac=seen if who else ""))
         self.notify("Fake router on your network", f"{who or 'A device'} is answering as the router. See History.")
 
+    def check_interception(self):
+        """A device answering for another device's address in this PC's ARP table (ARP spoofing aimed at a phone,
+        say) has put itself in the middle: what that phone sends this PC, like the Orbi Control PIN, passes through
+        it. The tell is one piece of hardware answering for two addresses: its own, which the router lists, and
+        the other device's. The router itself is check_gateway's job."""
+        host = config.load()["router_host"]
+        online = {d["last_ip"]: d["mac"] for d in self.store.q("SELECT mac, last_ip FROM devices WHERE online=1 AND last_ip != ''")}
+        home = {}  # mac -> the address the router lists it on
+        for ip, mac in online.items():
+            home.setdefault(mac, ip)
+        skip = self.protected_macs() | {s["mac"] for s in self.state["satellites"]}
+        seen = set()
+        for ip, mac in self.arp_reader().items():
+            owner = online.get(ip)
+            if ip == host or not owner or owner == mac or mac in skip or home.get(mac) in (None, ip):
+                continue
+            seen.add(ip)
+            n = self._intercept_odd[ip][1] + 1 if self._intercept_odd.get(ip, ("", 0))[0] == mac else 1
+            self._intercept_odd[ip] = (mac, n)
+            if n != self.GATEWAY_CONFIRM:  # reported once, when it's confirmed
+                continue
+            who, victim = self.device_label(mac), self.device_label(owner)
+            self.store.event("intercept", f"{who} is intercepting {victim}'s traffic", severity="error", mac=mac,
+                             detail=f"This PC's traffic for {victim} ({ip}) is going to {who} ({mac}, normally at {home[mac]}) "
+                                    f"instead of {victim} ({owner}). That's ARP spoofing: {who} can read what {victim} sends "
+                                    "over plain HTTP, including the Orbi Control PIN. Don't sign in until it's gone; block "
+                                    f"{who} in Devices and restart the router.")
+            self.notify("Traffic being intercepted", f"{who} is in the middle of {victim}'s connection. Don't type the PIN.")
+        self._intercept_odd = {ip: v for ip, v in self._intercept_odd.items() if ip in seen}
+
     def trust_gateway(self) -> str | None:
         from . import routercert
         seen = routercert.gateway_mac(config.load()["router_host"])
@@ -1323,7 +1423,22 @@ class Monitor:
     # ---- router log: blocked VPN attempts, failed admin logins, DHCP history ----
     def routerlog_loop(self):
         self.stop_event.wait(45)  # let the first scan finish first
-        self._every(lambda: config.load()["log_interval"], self.ingest_router_log)
+        self._every(lambda: OUTSIDE_SESSION_EVERY if time.time() < self._outside_until else config.load()["log_interval"],
+                    self.ingest_router_log)
+
+    def _watch_closely(self):
+        """After another device logs in to the router: re-read its rules and block list now and every couple of
+        minutes for the next half hour, and its log as often, so a change made and quickly undone is still seen."""
+        starting = time.time() >= self._outside_until
+        self._outside_until = time.time() + OUTSIDE_SESSION_WATCH
+        if not starting:
+            return
+
+        def watch():
+            while not self.stop_event.is_set() and time.time() < self._outside_until:
+                self.run_job("settingswatch", self.check_router_settings)
+                self.stop_event.wait(OUTSIDE_SESSION_EVERY)
+        threading.Thread(target=watch, name="outside-session", daemon=True).start()
 
     def ingest_router_log(self):
         self._ingest_router_log()
@@ -1372,6 +1487,7 @@ class Monitor:
             elif kind == "Admin login" and e["source"] not in mine:
                 # Someone with the router password got in (2026-11-02: James, who then narrowed the WARP rules). A session
                 # logs a login every half minute or so, so one alert per device per hour.
+                self._watch_closely()
                 if ("admin_login", e["source"]) in alerted or self._recent_alert("admin_login", e["source"], 3600):
                     continue
                 alerted.add(("admin_login", e["source"]))

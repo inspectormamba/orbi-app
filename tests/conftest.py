@@ -131,6 +131,7 @@ def monitor(tmp_config, fake_router, monkeypatch):
     monkeypatch.setattr("orbi.monitor.adapter_name", lambda ip: "")
     monkeypatch.setattr("orbi.routercert.gateway_mac", lambda host: ROUTER_MAC)
     monkeypatch.setattr("orbi.monitor.arp_mac", lambda ip: None)
+    monkeypatch.setattr("orbi.monitor.arp_table", lambda: {})
     monkeypatch.setattr("orbi.lanwatch.local_ip_for", lambda host: None)
     monkeypatch.setattr("orbi.lanwatch.adapter", lambda ip: {})
     monkeypatch.setattr("orbi.lanwatch.dhcp_servers", lambda ip, mac, timeout=4.0: {})
