@@ -2,6 +2,14 @@
 
 What changed in each version, newest first. The same notes appear in the app under More → Updates.
 
+## 1.2.5 (2026-11-06)
+
+### Device check
+- The Device check card now refreshes on its own while the More tab is open, instead of showing a frozen snapshot.
+
+### Filtering
+- Fix protection now also keeps the Tor Project site in the whole-house Block Sites list, re-adding it if the keyword list is ever cleared. This blocks the Tor website and downloads; it does not by itself stop an already-installed Tor client that uses bridges.
+
 ## 1.2.4 (2026-11-02)
 
 - New alert: "Device may be using a copied address". Fires when a device you know suddenly connects differently (always Wi-Fi, now on a cable, or the reverse) or the router identifies it as a different maker or type. Copying a device's hardware address is a way to take over its rules.
