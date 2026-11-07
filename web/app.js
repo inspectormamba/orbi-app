@@ -971,6 +971,7 @@ function pushCodeSheet(c, fresh) {
 function deviceCheckCard() {
   const card = h("section", { class: "card" }, h("h2", {}, "Device check"), h("div", { class: "muted small" }, h("span", { class: "spinner" })));
   const label = { bad: "Fix", warn: "Check", info: "Note" };
+  let expanded = false;  // keep the make/firmware list open across the card's auto-refresh
   const render = (x) => {
     const on = h("input", { type: "checkbox", checked: x.enabled, onchange: (e) => act(null, async () => {
       render(await api("/api/vulnscan", { method: "PUT", body: { enabled: e.target.checked } }));
@@ -993,7 +994,7 @@ function deviceCheckCard() {
     }) }, "Check now");
     const withFindings = x.devices.filter((d) => d.findings.length);
     const identified = x.devices.filter((d) => d.identity && (d.identity.model || d.identity.model_number));
-    const idList = h("div", { hidden: true }, ...identified.map((d) => h("div", { class: "row" }, h("div", { class: "main" },
+    const idList = h("div", { hidden: !expanded }, ...identified.map((d) => h("div", { class: "row" }, h("div", { class: "main" },
       h("div", { class: "name" }, d.name),
       h("div", { class: "meta", style: "white-space:normal" }, [d.identity.maker, d.identity.model || d.identity.model_number,
         d.identity.firmware ? `firmware ${d.identity.firmware}` : null, d.identity.lookup_error].filter(Boolean).join(" · "))))));
@@ -1005,10 +1006,13 @@ function deviceCheckCard() {
           h("span", { class: `pill ${f.severity === "info" ? "" : f.severity}` }, label[f.severity]))))
         : h("div", { class: "muted small" }, "✓ No problems found."),
       x.ts ? h("div", { class: "muted small", style: "margin-top:8px" }, `Checked ${x.devices.length} devices · ${ago(x.ts)}. `,
-        identified.length ? h("a", { href: "#", onclick: (e) => { e.preventDefault(); idList.hidden = !idList.hidden; } }, `${identified.length} identified by make and firmware`) : null) : null,
+        identified.length ? h("a", { href: "#", onclick: (e) => { e.preventDefault(); expanded = !expanded; idList.hidden = !expanded; } }, `${identified.length} identified by make and firmware`) : null) : null,
       idList, h("div", { class: "muted small", style: "margin-top:8px" }, about));
   };
-  api("/api/vulnscan").then(render).catch((e) => fill(card, h("h2", {}, "Device check"), h("div", { class: "error-text" }, e.message)));
+  const load = () => api("/api/vulnscan").then(render).catch((e) => fill(card, h("h2", {}, "Device check"), h("div", { class: "error-text" }, e.message)));
+  load();
+  // The More tab doesn't poll (it's full of forms), so refresh just this card in place while it's on screen.
+  const timer = setInterval(() => { if (!card.isConnected) { clearInterval(timer); return; } if (!document.hidden) load(); }, 30000);
   return card;
 }
 
