@@ -1172,8 +1172,10 @@ def create_app(monitor: Monitor) -> FastAPI:
             from .routerui import RouterUI
             with RouterUI(s["router_host"], config.router_password(s), s["router_user"]) as ui:
                 added = ui.ensure_protection_rules()
-            store.event("action", "Router protection rules checked", detail=f"fixed: {', '.join(added)}" if added else "all already in place")
-            return {"added": added}
+                kw_added = ui.ensure_protection_keywords()
+            fixed = (["rules: " + ", ".join(added)] if added else []) + (["keywords: " + ", ".join(kw_added)] if kw_added else [])
+            store.event("action", "Router protection rules checked", detail="fixed " + "; ".join(fixed) if fixed else "all already in place")
+            return {"added": added, "keywords_added": kw_added}
         if not monitor.run_job("protect", apply):
             raise HTTPException(409, "Already running")
         return {"ok": True}

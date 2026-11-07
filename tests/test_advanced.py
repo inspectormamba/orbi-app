@@ -482,6 +482,28 @@ def test_rule_ips_text():
     assert rule_ips_text({"type": "range", "start": "192.168.1.2", "end": "192.168.1.15"}) == "192.168.1.2 - 192.168.1.15"
 
 
+def test_ensure_protection_keywords_adds_missing(monkeypatch):
+    from orbi.routerui import RouterUI
+    ui = RouterUI.__new__(RouterUI)
+    calls = []
+    monkeypatch.setattr(ui, "read_block_sites", lambda: {"mode": "always", "keywords": ["chatgpt", "openai"]}, raising=False)
+    monkeypatch.setattr(ui, "set_block_sites", lambda mode, kws: calls.append((mode, list(kws))), raising=False)
+    added = ui.ensure_protection_keywords()
+    assert added == ["torproject"]
+    assert calls == [("always", ["chatgpt", "openai", "torproject"])]
+
+
+def test_ensure_protection_keywords_noop_when_present(monkeypatch):
+    from orbi.routerui import RouterUI
+    ui = RouterUI.__new__(RouterUI)
+    calls = []
+    monkeypatch.setattr(ui, "read_block_sites", lambda: {"mode": "always", "keywords": ["TorProject", "bereal"]}, raising=False)
+    monkeypatch.setattr(ui, "set_block_sites", lambda mode, kws: calls.append((mode, list(kws))), raising=False)
+    added = ui.ensure_protection_keywords()
+    assert added == []
+    assert calls == []
+
+
 
 def test_devices_show_their_wifi_network(client, monitor, fake_router):
     fake_router.devs[0].update(ssid="Home", connection="5GHz")

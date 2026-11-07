@@ -317,6 +317,8 @@ class RouterUI:
         ("Block-VPN-WARP-1701", "UDP", 1701),  # WARP's fallback port (also L2TP VPNs)
     ]
 
+    PROTECTION_KEYWORDS = ["torproject"]  # Block Sites keywords kept in place for every device (Tor Project site/download)
+
     def ensure_protection_rules(self) -> list[str]:
         """Makes sure each PROTECTION_RULES port is blocked for every device: adds missing rules, and widens
         one of ours that only covers some devices (an early version could save them for this PC only).
@@ -335,6 +337,20 @@ class RouterUI:
                 self.add_rule(name, protocol, port, port, {"type": "all"})
                 changed.append(name)
         return changed
+
+    def ensure_protection_keywords(self) -> list[str]:
+        """Make sure each PROTECTION_KEYWORDS entry stays in the Block Sites keyword list, keeping the
+        user's own keywords and the current mode. Returns the keywords it added.
+
+        Note: this blocks the sites' DNS lookups (e.g. the Tor Project website/download); it does not,
+        on its own, stop an already-installed client that connects by raw IP or over bridges."""
+        bs = self.read_block_sites()
+        kws = list(bs.get("keywords") or [])
+        have = {k.lower() for k in kws}
+        missing = [k for k in self.PROTECTION_KEYWORDS if k.lower() not in have]
+        if missing:
+            self.set_block_sites(bs.get("mode") or "always", kws + missing)
+        return missing
 
     # ---- DHCP address reservations (LAN Setup) ----
     def read_reservations(self) -> list[dict]:
