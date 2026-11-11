@@ -2,6 +2,12 @@
 
 What changed in each version, newest first. The same notes appear in the app under More → Updates.
 
+## 1.2.6 (2026-11-11)
+
+### Mac readiness
+- Features added since the Mac version (fake-router and copied-address checks, the address-interception alert, router certificate auto-trust after a router restart, the rogue DHCP check, the PC upload figure and the VPN message) now work on macOS too. Before, they relied on Windows-only tools and would have stopped working quietly on a Mac.
+- New move tool: python -m orbi.migrate export / import moves your history, devices, profiles, schedules, settings, PINs and saved passwords to another computer in one passphrase-protected file. The README has the step-by-step move from Windows to a Mac.
+
 ## 1.2.5 (2026-11-06)
 
 ### Device check
