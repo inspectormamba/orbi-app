@@ -109,6 +109,20 @@ Install / uninstall:
 ./uninstall-macos.sh [--purge]   # stop + remove auto-start; --purge also removes data and Keychain secrets
 ```
 
+### Moving an existing install from Windows to a Mac
+
+Your history, devices, profiles, schedules, settings, PINs and saved secrets all come along. Secrets can't just be copied (DPAPI on Windows, Keychain on the Mac), so `orbi.migrate` packs everything into one file encrypted with a passphrase you pick, and unpacks it on the Mac into the Keychain.
+
+1. **On the Mac:** install Python 3.12+ from python.org and Firefox, then put Orbi Control in a folder (the release zip from GitHub, so it can update itself, or `git clone`). Give the Mac a **reserved address** in the Orbi (Settings → Advanced → LAN Setup → Address Reservation) so phones can always find it.
+2. **On the PC** (the app can keep running): `.venv\Scripts\python -m orbi.migrate export orbi-move.zip`
+3. **On the PC: stop Orbi Control for good** before starting it on the Mac. Choose Quit from the tray, then run `uninstall.ps1`. Two copies would both sign in to the router and fight over the schedules. A Quit from the tray, unlike killing the process, doesn't raise a "shut down without Quit" alert.
+4. **Copy `orbi-move.zip` to the Mac** (AirDrop or a USB stick), then in the Orbi Control folder: `python3 -m orbi.migrate import ~/Downloads/orbi-move.zip`. Do this **before** `install-macos.sh`, which starts the app (an app that already started has made empty data; use `--force` to replace it, and the old data is backed up first).
+5. `./install-macos.sh`, then open `http://<the Mac's address>:8470` on each phone, sign in with your usual PIN, and re-add it to the home screen. **Delete `orbi-move.zip`** from both machines; it holds the router password.
+
+What doesn't move: the anti-tamper copy in Windows' event log (the Mac starts its own, so the first start on the Mac is a "first run" for that check), geckodriver (the Mac downloads its own pinned copy) and the release-signing key (releases are still signed on the PC). The Mac's own hardware addresses become the never-blocked machine automatically; the old PC becomes an ordinary device.
+
+**Keep it signed in.** The LaunchAgent, like the Windows scheduled task, only runs while you're logged in, and the Keychain only opens then. After a restart (a macOS update, a power cut) Orbi Control is off until someone logs in, and the schedules stop meanwhile. On a Mac mini that's always on: System Settings → Users & Groups → *Automatically log in as* (needs FileVault off), plus Lock Screen → *Require password immediately*. Set up the Outside check-in (More tab) so your phone hears about any gap. Don't leave the dashboard signed in in a browser on the Mac itself.
+
 Everything else — the dashboard at http://localhost:8470, the PIN, profiles, schedules, filtering, History — works the same. Firefox must be installed for the router-admin-page settings (DNS, Block Sites, schedules, VPN, firewall), exactly as on Windows.
 
 **One honest difference in the anti-tamper guarantee.** On Windows the second copy of every alert goes in the Application event log, which holds it for the full 90 days and needs an administrator to clear. macOS's unified log is the closest equivalent — erasing it needs `sudo log erase` and leaves the machine's own trace — but it is **size-bounded and rotates**, so on a busy machine older entries can age out before 90 days rather than being kept the whole time. Records are split into chunks and reassembled on read so a truncated message can't corrupt a restored alert, and the app writes a canary at startup to catch a log it can't read back. The in-app history (with its database locks) is unchanged; only the off-app backstop is weaker on macOS. Lock the Mac (Ctrl+Cmd+Q) when you step away.

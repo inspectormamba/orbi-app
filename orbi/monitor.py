@@ -13,7 +13,7 @@ import threading
 import time
 from datetime import datetime, timedelta
 
-from . import config, lanwatch, parental, vpnlog
+from . import config, lanwatch, osdep, parental, vpnlog
 from .router import RouterClient, RouterError, backhaul_kind, norm_mac
 from .store import Store
 
@@ -55,14 +55,8 @@ def internet_route(router_host: str) -> dict:
 
 
 def adapter_name(ip: str) -> str:
-    """Windows' name for the network adapter that has this address (e.g. "WireGuard Tunnel"), or ""."""
-    import subprocess
-    try:
-        out = subprocess.run(["powershell", "-NoProfile", "-Command", f"(Get-NetIPAddress -IPAddress '{ip}' -ErrorAction Stop).InterfaceAlias"],
-                             capture_output=True, text=True, timeout=15, creationflags=0x08000000).stdout  # CREATE_NO_WINDOW
-    except Exception:
-        return ""
-    return out.strip().splitlines()[0] if out.strip() else ""
+    """The OS's name for the network adapter that has this address (e.g. "WireGuard Tunnel"), or ""."""
+    return osdep.adapter_name(ip)
 
 
 def upstream_answered(response, zone: str = "example.com.") -> bool:
@@ -120,30 +114,13 @@ def arp_mac(ip: str) -> str | None:
 
 
 def arp_table() -> dict[str, str]:
-    """ip -> hardware address for every learned (dynamic) entry in this PC's ARP table."""
-    import subprocess
-    try:
-        out = subprocess.run(["arp", "-a"], capture_output=True, text=True, timeout=10,
-                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
-    except (OSError, subprocess.SubprocessError):
-        return {}
-    table = {}
-    for line in out.splitlines():
-        parts = line.split()
-        if len(parts) >= 3 and parts[2].lower() == "dynamic" and re.fullmatch(r"([0-9A-Fa-f]{2}[-:]){5}[0-9A-Fa-f]{2}", parts[1]):
-            table[parts[0]] = parts[1].replace("-", ":").upper()
-    return table
+    """ip -> hardware address for every learned (dynamic) entry in this machine's ARP table."""
+    return osdep.arp_table()
 
 
 def local_macs() -> set[str]:
-    """MACs of this PC's adapters, so the app never blocks the machine it runs on."""
-    import subprocess
-    try:
-        out = subprocess.run(["getmac", "/fo", "csv", "/nh"], capture_output=True, text=True, timeout=10,
-                             creationflags=0x08000000).stdout  # CREATE_NO_WINDOW
-    except Exception:
-        return set()
-    return {norm_mac(line.split(",")[0].strip('"')) for line in out.splitlines() if line.strip()}
+    """MACs of this machine's adapters, so the app never blocks the machine it runs on."""
+    return {norm_mac(m) for m in osdep.local_macs()}
 
 
 SIGHTING_GAP = 30 * 60  # a device seen again on the same borrowed address within this long: the same stay

@@ -268,3 +268,143 @@ def launch_update_helper(root: Path, task: str, data_dir: Path, bak: Path, port:
                       str(data_dir), version, "1" if req_changed else "0"],
                      start_new_session=True, close_fds=True, cwd=str(root),
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# ---- network: the ARP table and this Mac's own adapters ----
+# The text parsers are pure so they're unit-tested on any OS; only the subprocess wrappers need a Mac.
+_ARP_LINE = re.compile(r"^\S+ \((\d{1,3}(?:\.\d{1,3}){3})\) at ([0-9A-Fa-f]{1,2}(?::[0-9A-Fa-f]{1,2}){5})(?=\s|$)")
+
+
+def _run(args: list[str], timeout: float) -> str:
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=timeout).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def _pad_mac(mac: str) -> str:
+    """macOS drops leading zeros (0:90:4c:1a:9:0); the app always compares AA:BB:CC:DD:EE:FF."""
+    return ":".join(p.zfill(2) for p in mac.split(":")).upper()
+
+
+def parse_arp(out: str, dynamic_only: bool = True) -> dict[str, str]:
+    """`arp -an` output -> {ip: "AA:BB:CC:DD:EE:FF"}.
+    Lines look like '? (192.168.1.1) at c8:9e:43:c2:e3:33 on en0 ifscope [ethernet]'. '(incomplete)' entries have no
+    address; 'permanent' marks this Mac's own/static entries (Windows' "static"); broadcast/multicast are skipped."""
+    table = {}
+    for line in out.splitlines():
+        m = _ARP_LINE.match(line.strip())
+        if not m:
+            continue
+        mac = _pad_mac(m.group(2))
+        if int(mac[:2], 16) & 1:  # broadcast / multicast group address
+            continue
+        if dynamic_only and " permanent" in line:
+            continue
+        table[m.group(1)] = mac
+    return table
+
+
+def arp_table() -> dict[str, str]:
+    """ip -> hardware address for every learned (dynamic) entry in this Mac's ARP table."""
+    return parse_arp(_run(["arp", "-an"], 10))
+
+
+def arp_lookup(host: str) -> str | None:
+    """The hardware address the ARP table has for `host` right now, or None."""
+    return parse_arp(_run(["arp", "-n", host], 10), dynamic_only=False).get(host)
+
+
+def parse_ifconfig(out: str) -> dict[str, dict]:
+    """`ifconfig` output -> {"en0": {"mac": "AA:..", "ips": ["192.168.1.20"]}, ...}."""
+    ifaces, cur = {}, None
+    for line in out.splitlines():
+        m = re.match(r"^([A-Za-z0-9]+): flags=", line)
+        if m:
+            cur = ifaces.setdefault(m.group(1), {"mac": None, "ips": []})
+            continue
+        if cur is None:
+            continue
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == "ether":
+            cur["mac"] = _pad_mac(parts[1])
+        elif len(parts) >= 2 and parts[0] == "inet":
+            cur["ips"].append(parts[1])
+    return ifaces
+
+
+def _iface_for(ip: str, ifaces: dict | None = None) -> str | None:
+    ifaces = parse_ifconfig(_run(["ifconfig"], 10)) if ifaces is None else ifaces
+    return next((name for name, i in ifaces.items() if ip in i["ips"]), None)
+
+
+def local_macs() -> list[str]:
+    """Hardware addresses of this Mac's adapters (Wi-Fi shows the address it uses on the current network)."""
+    return [i["mac"] for i in parse_ifconfig(_run(["ifconfig"], 10)).values() if i["mac"]]
+
+
+def parse_hardware_ports(out: str) -> dict[str, str]:
+    """`networksetup -listallhardwareports` -> {"en0": "Ethernet", "en1": "Wi-Fi", ...}."""
+    ports, port = {}, None
+    for line in out.splitlines():
+        if line.startswith("Hardware Port:"):
+            port = line.split(":", 1)[1].strip()
+        elif line.startswith("Device:") and port:
+            ports[line.split(":", 1)[1].strip()] = port
+    return ports
+
+
+def adapter_name(ip: str) -> str:
+    """A friendly name for the interface that has this address ("Wi-Fi", or "utun4" for a VPN), or ""."""
+    iface = _iface_for(ip)
+    if not iface:
+        return ""
+    return parse_hardware_ports(_run(["networksetup", "-listallhardwareports"], 10)).get(iface, iface)
+
+
+def parse_netstat_obytes(out: str, iface: str) -> int | None:
+    """Bytes sent on `iface`, from `netstat -ibn`. Columns are found from the header; rows with an empty Address
+    column are skipped, since their columns shift left."""
+    lines = [line.split() for line in out.splitlines() if line.strip()]
+    if not lines or "Obytes" not in lines[0]:
+        return None
+    header = lines[0]
+    col = header.index("Obytes")
+    for parts in lines[1:]:
+        if parts[0] == iface and len(parts) == len(header):
+            try:
+                return int(parts[col])
+            except ValueError:
+                continue
+    return None
+
+
+def lan_adapter(local_ip: str) -> dict:
+    """The interface that has `local_ip`: {"mac", "dhcp_enabled", "dhcp_server", "sent_bytes"}; {} if unknown."""
+    ifaces = parse_ifconfig(_run(["ifconfig"], 10))
+    iface = _iface_for(local_ip, ifaces)
+    if not iface:
+        return {}
+    server = _run(["ipconfig", "getoption", iface, "server_identifier"], 10).strip()  # empty when the address was set by hand
+    return {"mac": ifaces[iface]["mac"], "dhcp_enabled": bool(server), "dhcp_server": server or None,
+            "sent_bytes": parse_netstat_obytes(_run(["netstat", "-ibn", "-I", iface], 10), iface)}
+
+
+IP_BOUND_IF = 25  # <netinet/in.h>: send only through this interface index (Python's socket module doesn't name it)
+
+
+def dhcp_bind(sock, local_ip: str) -> None:
+    """Binds the rogue-DHCP probe socket. BSD doesn't deliver broadcast replies to a socket bound to a unicast address,
+    so bind the wildcard address and pin the socket to the home-network interface instead. SO_REUSEPORT lets it share
+    port 68 with macOS's own DHCP client; macOS allows non-root binds below port 1024 (since 10.14)."""
+    import socket
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    iface = _iface_for(local_ip)
+    if iface:
+        sock.setsockopt(socket.IPPROTO_IP, IP_BOUND_IF, socket.if_nametoindex(iface))
+    sock.bind(("", 68))
+
+
+def venv_python(root: Path) -> Path:
+    return root / ".venv" / "bin" / "python"

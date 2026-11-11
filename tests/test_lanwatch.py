@@ -1,3 +1,4 @@
+import sys
 import json
 import socket
 import struct
@@ -270,3 +271,12 @@ def test_lanwatch_api(client, monitor, monkeypatch):
     assert client.get("/api/lanwatch").json()["gateway"]["alert"]["title"] == "kid-tablet is pretending to be the router"
     r = client.post("/api/lanwatch/trust-router")
     assert r.status_code == 200 and r.json()["gateway"]["alert"] is None
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="imports the Windows back end")
+def test_windows_arp_parser_keeps_dynamic_entries_only():
+    from orbi.osdep import windows
+    out = ("Interface: 192.168.1.58 --- 0x7\n  Internet Address      Physical Address      Type\n"
+           "  192.168.1.1           c8-9e-43-c2-e3-33     dynamic\n  192.168.1.255         ff-ff-ff-ff-ff-ff     static\n")
+    assert windows.parse_arp(out) == {"192.168.1.1": "C8:9E:43:C2:E3:33"}
+    assert windows.parse_arp(out, dynamic_only=False)["192.168.1.255"] == "FF:FF:FF:FF:FF:FF"

@@ -192,3 +192,84 @@ def launch_update_helper(root: Path, task: str, data_dir: Path, bak: Path, port:
                       "-AppPid", str(os.getpid()), "-Root", str(root), "-Backup", str(bak), "-Port", str(port),
                       "-DataDir", str(data_dir), "-Version", version, "-ReqChanged", "1" if req_changed else "0"],
                      creationflags=flags, close_fds=True, cwd=str(root))
+
+
+# ---- network: the ARP table and this PC's own adapters ----
+_MAC_RE = re.compile(r"([0-9A-Fa-f]{2}[-:]){5}[0-9A-Fa-f]{2}")
+_NO_WINDOW = 0x08000000  # CREATE_NO_WINDOW
+
+
+def _run(args: list[str], timeout: float) -> str:
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=timeout, creationflags=_NO_WINDOW).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def parse_arp(out: str, dynamic_only: bool = True) -> dict[str, str]:
+    """`arp -a` output -> {ip: "AA:BB:CC:DD:EE:FF"}. Windows lines: '  192.168.1.1   c8-9e-43-c2-e3-33   dynamic'."""
+    table = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and _MAC_RE.fullmatch(parts[1]) and (not dynamic_only or parts[2:3] == ["dynamic"]):
+            table[parts[0]] = parts[1].replace("-", ":").upper()
+    return table
+
+
+def arp_table() -> dict[str, str]:
+    """ip -> hardware address for every learned (dynamic) entry in this machine's ARP table."""
+    return parse_arp(_run(["arp", "-a"], 10))
+
+
+def arp_lookup(host: str) -> str | None:
+    """The hardware address the ARP table has for `host` right now, or None."""
+    return parse_arp(_run(["arp", "-a", host], 10), dynamic_only=False).get(host)
+
+
+def local_macs() -> list[str]:
+    """Hardware addresses of this machine's adapters (raw, as the OS prints them)."""
+    out = _run(["getmac", "/fo", "csv", "/nh"], 10)
+    return [line.split(",")[0].strip('"') for line in out.splitlines() if line.strip()]
+
+
+def adapter_name(ip: str) -> str:
+    """Windows' name for the adapter that has this address (e.g. "WireGuard Tunnel"), or ""."""
+    import ipaddress
+    try:
+        ip = str(ipaddress.IPv4Address(ip))  # validated: it's spliced into the command
+    except ValueError:
+        return ""
+    out = _run(["powershell", "-NoProfile", "-Command", f"(Get-NetIPAddress -IPAddress '{ip}' -ErrorAction Stop).InterfaceAlias"], 15)
+    return out.strip().splitlines()[0] if out.strip() else ""
+
+
+_ADAPTER_PS = r"""
+$ip = '{ip}'
+$c = Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' | Where-Object { $_.IPAddress -contains $ip } | Select-Object -First 1
+if (-not $c) { '{}'; exit }
+$sent = $null
+try { $sent = (Get-NetAdapter -InterfaceIndex $c.InterfaceIndex -ErrorAction Stop | Get-NetAdapterStatistics -ErrorAction Stop).SentBytes } catch {}
+@{ mac = $c.MACAddress; dhcp_enabled = [bool]$c.DHCPEnabled; dhcp_server = $c.DHCPServer; sent_bytes = $sent } | ConvertTo-Json -Compress
+"""
+
+
+def lan_adapter(local_ip: str) -> dict:
+    """The adapter that has `local_ip`: {"mac", "dhcp_enabled", "dhcp_server", "sent_bytes"}; {} if unknown."""
+    import ipaddress
+    import json
+    try:
+        script = _ADAPTER_PS.replace("{ip}", str(ipaddress.IPv4Address(local_ip)))  # validated: it's spliced into the script
+        return json.loads(_run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script], 30).strip() or "{}")
+    except Exception:
+        return {}
+
+
+def dhcp_bind(sock, local_ip: str) -> None:
+    """Binds the rogue-DHCP probe socket. Windows delivers broadcast replies to a socket bound to the adapter's address."""
+    import socket
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Windows' own DHCP client also uses port 68
+    sock.bind((local_ip, 68))
+
+
+def venv_python(root: Path) -> Path:
+    return root / ".venv" / "Scripts" / "python.exe"

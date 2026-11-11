@@ -19,6 +19,13 @@ Exposed:
   GECKODRIVER                   dict: the pinned geckodriver for this OS (see geckodriver.py)
   SERVICE_CREATION_FLAGS        creationflags for the Selenium driver subprocess
   launch_update_helper(...)     start the detached updater/rollback helper
+  arp_table() -> {ip: mac}      learned entries in the ARP table (MACs as AA:BB:CC:DD:EE:FF)
+  arp_lookup(host) -> mac|None  the ARP entry for one address
+  local_macs() -> [mac]         this machine's own adapter addresses (never blocked)
+  adapter_name(ip) -> str       friendly name of the adapter with that address ("" if unknown)
+  lan_adapter(ip) -> dict       {"mac", "dhcp_enabled", "dhcp_server", "sent_bytes"} for that adapter
+  dhcp_bind(sock, ip)           bind the rogue-DHCP probe socket the way this OS needs
+  venv_python(root) -> Path     the virtualenv's python inside an install folder
 """
 import sys
 
@@ -44,3 +51,10 @@ default_data_dir = _impl.default_data_dir
 GECKODRIVER = _impl.GECKODRIVER
 SERVICE_CREATION_FLAGS = _impl.SERVICE_CREATION_FLAGS
 launch_update_helper = _impl.launch_update_helper
+arp_table = _impl.arp_table
+arp_lookup = _impl.arp_lookup
+local_macs = _impl.local_macs
+adapter_name = _impl.adapter_name
+lan_adapter = _impl.lan_adapter
+dhcp_bind = _impl.dhcp_bind
+venv_python = _impl.venv_python

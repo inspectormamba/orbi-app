@@ -162,18 +162,8 @@ def pinned(host: str) -> str:
 def gateway_mac(host: str) -> str | None:
     """The hardware address this PC's ARP table has for `host` (e.g. C8:9E:43:00:00:01), or None.
     Something impersonating the router on the LAN normally shows up here with its own address."""
-    import re
-    import subprocess
-    try:
-        out = subprocess.run(["arp", "-a", host], capture_output=True, text=True, timeout=10,
-                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
-    except (OSError, subprocess.SubprocessError):
-        return None
-    for line in out.splitlines():
-        parts = line.split()
-        if len(parts) >= 2 and parts[0] == host and re.fullmatch(r"([0-9A-Fa-f]{2}[-:]){5}[0-9A-Fa-f]{2}", parts[1]):
-            return parts[1].replace("-", ":").upper()
-    return None
+    from . import osdep
+    return osdep.arp_lookup(host)
 
 
 def trust_current(host: str) -> str:

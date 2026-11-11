@@ -11,11 +11,9 @@ Upload spikes: the Orbi only reports whole-house usage (its Traffic Meter), not 
 "the house is uploading far more than it normally does at this time of day". This PC's own upload is subtracted
 out of the guesswork by reporting it separately (backups are the usual innocent cause).
 """
-import json
 import os
 import socket
 import struct
-import subprocess
 import time
 from datetime import datetime
 from statistics import quantiles
@@ -71,9 +69,9 @@ def dhcp_servers(local_ip: str, mac: str, timeout: float = 4.0) -> dict[str, dic
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     found: dict[str, dict] = {}
     try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Windows' own DHCP client also uses port 68
+        from . import osdep
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.bind((local_ip, 68))
+        osdep.dhcp_bind(sock, local_ip)  # the OS's own DHCP client also uses port 68
         sock.settimeout(0.5)
         sock.sendto(build_discover(mac_bytes, xid), ("255.255.255.255", 67))
         end = time.monotonic() + timeout
@@ -100,26 +98,10 @@ def local_ip_for(router_host: str) -> str | None:
         return None
 
 
-ADAPTER_PS = r"""
-$ip = '{ip}'
-$c = Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' | Where-Object { $_.IPAddress -contains $ip } | Select-Object -First 1
-if (-not $c) { '{}'; exit }
-$sent = $null
-try { $sent = (Get-NetAdapter -InterfaceIndex $c.InterfaceIndex -ErrorAction Stop | Get-NetAdapterStatistics -ErrorAction Stop).SentBytes } catch {}
-@{ mac = $c.MACAddress; dhcp_enabled = [bool]$c.DHCPEnabled; dhcp_server = $c.DHCPServer; sent_bytes = $sent } | ConvertTo-Json -Compress
-"""
-
-
 def adapter(local_ip: str) -> dict:
-    """This PC's adapter on the home network: {"mac", "dhcp_enabled", "dhcp_server", "sent_bytes"}; {} if unknown."""
-    import ipaddress
-    try:
-        script = ADAPTER_PS.replace("{ip}", str(ipaddress.IPv4Address(local_ip)))  # validated: it's spliced into the script
-        out = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
-                             capture_output=True, text=True, timeout=30, creationflags=0x08000000).stdout  # CREATE_NO_WINDOW
-        return json.loads(out.strip() or "{}")
-    except Exception:
-        return {}
+    """This machine's adapter on the home network: {"mac", "dhcp_enabled", "dhcp_server", "sent_bytes"}; {} if unknown."""
+    from . import osdep
+    return osdep.lan_adapter(local_ip)
 
 
 def upload_rates(rows: list[dict], interval: float) -> list[tuple[float, float]]:

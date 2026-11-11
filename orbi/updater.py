@@ -197,7 +197,7 @@ def backup(dest: Path):
 
 
 def _pip_install(root: Path):
-    py = root / ".venv" / "Scripts" / "python.exe"
+    py = osdep.venv_python(root)
     r = subprocess.run([str(py), "-m", "pip", "install", "--quiet", "--disable-pip-version-check", "-r", str(root / "requirements.txt")],
                        capture_output=True, text=True, timeout=900, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     if r.returncode:
