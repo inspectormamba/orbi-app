@@ -2,6 +2,15 @@
 
 What changed in each version, newest first. The same notes appear in the app under More → Updates.
 
+## 1.2.7 (2026-11-24)
+
+Phone connection: HTTPS is now an option.
+- The phone link is still plain HTTP by default, so nothing changes for existing setups. Turn on Encrypt the phone connection (HTTPS) on the Access page to use a certificate instead. Restart Orbi Control after changing it, then install the certificate on each phone (download it from this PC's Access page).
+- This PC's own browser and the health checks use a separate local-only port, so they keep working either way.
+- The sign-in cookie is marked Secure over HTTPS, and the certificate can only be downloaded from this PC.
+Sign-in alerts on your phone:
+- Every sign-in attempt now sends a phone alert: a successful sign-in, a wrong PIN, or an attempt refused during a lockout. The typed PIN is never included. Turn this off with push_login_alerts set to false in the settings file.
+
 ## 1.2.6 (2026-11-11)
 
 ### Mac readiness
