@@ -157,7 +157,7 @@ function Stop-App {
 }
 function Test-App {
     try {
-        $r = Invoke-WebRequest "http://127.0.0.1:$Port/api/session" -UseBasicParsing -TimeoutSec 5
+        $r = Invoke-WebRequest "http://127.0.0.1:$($Port + 1)/api/session" -UseBasicParsing -TimeoutSec 5
         return (($r.Content | ConvertFrom-Json).version -eq $Version)
     } catch { return $false }
 }

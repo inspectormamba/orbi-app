@@ -23,6 +23,7 @@ DEFAULTS = {
     "speedtest_daily_at": "04:00",  # "" disables the scheduled speed test
     "alert_new_devices": True,
     "alert_admin_login_failures": True,
+    "phone_https": False,  # the phone link: plain HTTP (default) or HTTPS with a certificate; applies at restart
     "block_pin_attackers": True,  # a program attacking the PIN page gets its device blocked at the router  # when off, failed router admin logins are neither recorded nor notified
     "mute_new_device_macs": [],  # MACs whose new-device joins are still recorded but raise no notification
     "log_interval": 600,  # seconds between router-log reads (each is a short admin login)

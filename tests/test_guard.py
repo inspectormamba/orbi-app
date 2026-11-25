@@ -142,3 +142,24 @@ def test_this_pc_is_never_shut_out(app, armed, clock):
         c.post("/api/login", json={"pin": "000000"})
     assert not app.state.guard.bans()
     assert c.post("/api/login", json={"pin": "246810"}).status_code == 200
+
+
+def test_every_sign_in_attempt_goes_to_the_phone(app, monkeypatch):
+    """Right PIN, wrong PIN and lockout refusals each send a phone alert; the typed PIN never appears in one."""
+    sent = []
+    monkeypatch.setattr("orbi.push.send", lambda title, message, priority=4: sent.append((title, message)))
+    k = kid(app)
+    assert k.post("/api/login", json={"pin": "000000"}).status_code == 401
+    assert k.post("/api/login", json={"pin": "246810"}).status_code == 200
+    titles = [t for t, _ in sent]
+    assert titles == ["Orbi Control: wrong PIN", "Signed in to Orbi Control"]
+    assert all("000000" not in m and "246810" not in m for _, m in sent)
+    assert KID_IP in sent[1][1]
+
+
+def test_phone_alerts_for_sign_in_can_be_turned_off(app, monkeypatch):
+    sent = []
+    monkeypatch.setattr("orbi.push.send", lambda title, message, priority=4: sent.append(title))
+    config.save({"push_login_alerts": False})
+    kid(app).post("/api/login", json={"pin": "246810"})
+    assert sent == []

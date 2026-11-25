@@ -228,7 +228,7 @@ stop_app() {
   pkill -f "orbi --background" 2>/dev/null
 }
 test_app() {
-  curl -fsS --max-time 5 "http://127.0.0.1:$PORT/api/session" 2>/dev/null \
+  curl -fsS --max-time 5 "http://127.0.0.1:$((PORT+1))/api/session" 2>/dev/null \
     | python3 -c "import sys,json; sys.exit(0 if json.load(sys.stdin).get('version')=='$VERSION' else 1)" 2>/dev/null
 }
 # wait for the old app to exit (up to 30s), then make sure it's gone

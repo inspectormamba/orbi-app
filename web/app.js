@@ -652,11 +652,23 @@ async function renderMore() {
     ...(alerts.length ? alerts.map((e) => h("div", { class: "row" }, h("div", { class: "main" }, h("div", { class: "name", style: "white-space:normal" }, e.title), h("div", { class: "meta" }, [fmtWhen(e.ts), e.detail].filter(Boolean).join(" · ")))))
       : [h("div", { class: "muted small" }, "No alerts.")]));
 
+  const httpsOn = access.https === true;
+  const httpsSwitch = h("input", { type: "checkbox", checked: httpsOn, onchange: (e) =>
+    act(null, () => api("/api/settings", { method: "PATCH", body: { phone_https: e.target.checked } }),
+      "Saved. Restart Orbi Control for it to take effect, then set up each phone again.").catch(() => { e.target.checked = httpsOn; }) });
   const phone = h("section", { class: "card" }, h("h2", {}, "Use it on your phone"),
     h("div", { style: "display:flex;gap:16px;align-items:center;flex-wrap:wrap" },
       access.qr_svg ? h("div", { class: "qr", html: access.qr_svg }) : null,
       h("div", { style: "flex:1;min-width:200px" }, h("div", { style: "font-weight:600;word-break:break-all" }, access.urls[0] || "—"),
-        h("p", { class: "muted small" }, "On your home Wi-Fi, scan the code or open this address. Then: iPhone → Share → Add to Home Screen; Android → ⋮ → Add to Home screen."))));
+        h("p", { class: "muted small" }, "On your home Wi-Fi, scan the code or open this address. Then add the app to the Home Screen (iPhone → Share → Add to Home Screen; Android → ⋮ → Add to Home screen)."),
+        httpsOn ? h("p", { class: "muted small" }, "The phone must trust this app's certificate first: download it below on this PC, send it to the phone (AirDrop or email), install it (iPhone: Settings → Profile Downloaded → Install, then Settings → General → About → Certificate Trust Settings → turn it on).") : null,
+        access.certificate ? h("p", { class: "muted small" },
+          h("a", { href: access.certificate.download, download: "Orbi Control.pem" }, "Download the certificate (on this PC)"),
+          access.certificate.fingerprint ? ` · fingerprint ${access.certificate.fingerprint}` : "") : null)),
+    h("label", { class: "switch" }, "Encrypt the phone connection (HTTPS)", httpsSwitch),
+    h("p", { class: "muted small" }, httpsOn
+      ? "Passwords and the session stay private on the home network. Turning this off sends the PIN in plain text on the home network, so only do that if a phone can't trust the certificate."
+      : "Plain HTTP: the PIN and sign-in cookie cross the home network unencrypted. Turn HTTPS back on when you can."));
 
   const speedAt = h("input", { type: "time", value: settings.speedtest_daily_at || "" });
   const health = h("select", {}, ...[[15, "15 s"], [30, "30 s"], [60, "1 min"], [120, "2 min"]].map(([v, l]) => h("option", { value: v, selected: settings.health_interval === v }, l)));

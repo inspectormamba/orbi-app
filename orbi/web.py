@@ -17,7 +17,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import auth, config, parental, updater
+from . import auth, config, parental, tls, updater
 from .guard import KEEP_DAYS as PIN_KEEP_DAYS, PinGuard
 from .monitor import Monitor, fmt_duration, network_of as monitor_network_of
 from .store import ACTOR
@@ -26,7 +26,7 @@ from .router import RouterClient, RouterError, norm_mac
 log = logging.getLogger("orbi.web")
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
-OPEN_PATHS = {"/api/session", "/api/login", "/api/setup"}
+OPEN_PATHS = {"/api/session", "/api/login", "/api/setup", "/api/tls/cert"}  # cert: loopback only, see tls_cert
 INSTANCE = secrets.token_hex(8)  # changes on every start, so the page can tell the app restarted
 HHMM = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 
@@ -86,6 +86,7 @@ class SettingsPatch(BaseModel):
     alert_new_devices: bool | None = None
     alert_admin_login_failures: bool | None = None
     block_pin_attackers: bool | None = None
+    phone_https: bool | None = None
     mute_new_device_macs: list[str] | None = None
     router_host: str | None = None
     check_updates: bool | None = None
@@ -254,8 +255,10 @@ def create_app(monitor: Monitor) -> FastAPI:
             raise HTTPException(409, "Router password not set yet (Settings)")
         return monitor.router
 
-    def set_cookie(resp: Response, pin_label: str = ""):
-        resp.set_cookie(auth.COOKIE, auth.make_session(pin_label), max_age=auth.SESSION_DAYS * 86400, httponly=True, samesite="strict")
+    def set_cookie(resp: Response, request: Request, pin_label: str = ""):
+        # Secure: the browser only sends the sign-in back over HTTPS (the phone link). The loopback port is plain HTTP.
+        resp.set_cookie(auth.COOKIE, auth.make_session(pin_label), max_age=auth.SESSION_DAYS * 86400, httponly=True,
+                        samesite="strict", secure=request.url.scheme == "https")
 
     def client_ip(request: Request) -> str:
         return request.client.host if request.client else "?"
@@ -297,7 +300,7 @@ def create_app(monitor: Monitor) -> FastAPI:
         return out
 
     @app.post("/api/setup")
-    def setup(body: SetupBody, response: Response):
+    def setup(body: SetupBody, request: Request, response: Response):
         if config.load()["pin_hash"]:
             raise HTTPException(409, "Already set up")
         if len(body.pin) < auth.MIN_PIN:
@@ -305,7 +308,7 @@ def create_app(monitor: Monitor) -> FastAPI:
         if body.router_password:
             _save_router_password(body.router_password)
         config.save({"pin_hash": auth.hash_pin(body.pin)})
-        set_cookie(response)
+        set_cookie(response, request)
         return {"ok": True}
 
     @app.post("/api/login")
@@ -314,7 +317,7 @@ def create_app(monitor: Monitor) -> FastAPI:
         if not s["pin_hash"]:
             raise HTTPException(401, "Wrong PIN")
         label = require_pin(body.pin, request, s)
-        set_cookie(response, label)
+        set_cookie(response, request, label)
         store.event("action", "Signed in to Orbi Control", detail=f"with the extra PIN \"{label}\"" if label else "")
         return {"ok": True}
 
@@ -744,7 +747,8 @@ def create_app(monitor: Monitor) -> FastAPI:
     def get_settings():
         s = config.load()
         return {k: s[k] for k in ("router_host", "health_interval", "scan_interval", "speedtest_daily_at", "alert_new_devices",
-                                   "alert_admin_login_failures", "block_pin_attackers", "mute_new_device_macs", "port", "check_updates")} | {
+                                   "alert_admin_login_failures", "block_pin_attackers", "mute_new_device_macs", "port", "check_updates",
+                                   "phone_https")} | {
             "router_configured": bool(s["router_password_enc"])}
 
     @app.patch("/api/settings")
@@ -769,6 +773,10 @@ def create_app(monitor: Monitor) -> FastAPI:
             # Never send the saved password to a new address: it has to be typed in again for that router.
             patch["router_password_enc"] = ""
             store.event("action", "Router address changed", detail=f"to {patch['router_host']}; router password cleared", severity="warn")
+        if "phone_https" in patch and bool(patch["phone_https"]) != bool(config.load().get("phone_https", False)):
+            store.event("action", "Phone connection " + ("set to HTTPS" if patch["phone_https"] else "set to plain HTTP"),
+                        detail="Takes effect when Orbi Control restarts. Each phone has to be set up again.",
+                        severity="warn" if not patch["phone_https"] else "info")
         if "mute_new_device_macs" in patch:
             patch["mute_new_device_macs"] = sorted({norm_mac(m) for m in patch["mute_new_device_macs"] if m.strip()})
         config.save(patch)
@@ -823,7 +831,7 @@ def create_app(monitor: Monitor) -> FastAPI:
         config.save({"pin_hash": auth.hash_pin(body.new), "extra_pins": []})  # a new PIN replaces every old one
         auth.rotate_secret()  # sign out every other device
         store.event("action", "App PIN changed", detail=f"{removed} extra PIN(s) removed" if removed else "")
-        set_cookie(response)
+        set_cookie(response, request)
         return {"ok": True}
 
     @app.get("/api/settings/pins")
@@ -857,9 +865,25 @@ def create_app(monitor: Monitor) -> FastAPI:
 
     @app.get("/api/access")
     def access():
-        port = config.load()["port"]
-        urls = [f"http://{ip}:{port}" for ip in _lan_ips()]
-        return {"urls": urls, "qr_svg": _qr_svg(urls[0]) if urls else ""}
+        s = config.load()
+        port = s["port"]
+        https = bool(s.get("phone_https", False))
+        urls = [f"{'https' if https else 'http'}://{ip}:{port}" for ip in _lan_ips()]
+        cert, _ = tls.paths()
+        certificate = ({"fingerprint": tls.fingerprint(cert) if cert.exists() else "", "download": "/api/tls/cert"}
+                       if https else None)
+        return {"https": https, "urls": urls, "qr_svg": _qr_svg(urls[0]) if urls else "", "certificate": certificate}
+
+    @app.get("/api/tls/cert")
+    def tls_cert(request: Request):
+        """The certificate file a phone needs once. Only this PC can download it (the loopback port), so the trust
+        decision starts from the PC rather than from anything on the network."""
+        if client_ip(request) not in auth.LOCAL_IPS:
+            raise HTTPException(403, "The certificate is only downloaded from this PC")
+        cert, _ = tls.paths()
+        if not cert.exists():
+            raise HTTPException(404, "No certificate yet")
+        return FileResponse(cert, media_type="application/x-pem-file", filename="Orbi Control.pem")
 
     # ---------- advanced ----------
     @app.get("/api/advanced")

@@ -9,10 +9,14 @@ from logging.handlers import RotatingFileHandler
 
 import uvicorn
 
-from . import config, osdep, tamper, updater
+from . import config, osdep, tamper, tls, updater
 from .monitor import Monitor
 from .store import Store
-from .web import create_app
+from .web import _lan_ips, create_app
+
+# The phone link is HTTPS on the settings port (all interfaces). This PC's own browser, the tray, and the
+# health checks use plain HTTP on the next port, bound to 127.0.0.1 only, so nothing on the network can reach it.
+LOOPBACK_OFFSET = 1
 
 
 def setup_logging():
@@ -44,7 +48,8 @@ def main():
 
     settings = config.load()
     port = args.port or settings["port"]
-    url = f"http://localhost:{port}"
+    local_port = port + LOOPBACK_OFFSET
+    url = f"http://localhost:{local_port}"
     if not single_instance():
         if not args.background:
             webbrowser.open(url)  # already running: just open the dashboard
@@ -60,11 +65,22 @@ def main():
     monitor.tamper = tamper.Tamper(monitor)
     monitor.start()
 
-    server = uvicorn.Server(uvicorn.Config(create_app(monitor), host="0.0.0.0", port=port, log_level="warning",
-                                           access_log=False, log_config=None, proxy_headers=False))  # never trust X-Forwarded-For
-    log.info("Orbi Control starting on port %s", port)
+    app = create_app(monitor)
+    common = dict(log_level="warning", access_log=False, log_config=None, proxy_headers=False)  # never trust X-Forwarded-For
+    if settings.get("phone_https", False):
+        cert, key = tls.ensure(_lan_ips())
+        log.info("Phone link: HTTPS, certificate %s", tls.fingerprint(cert))
+        server = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=port, ssl_certfile=str(cert), ssl_keyfile=str(key), **common))
+    else:
+        log.warning("Phone link: plain HTTP on the home network (phone_https is off in settings)")
+        server = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=port, **common))
+    local = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=local_port, **common))
+    log.info("Orbi Control starting on port %s and %s (this PC only)", port, local_port)
+    local_thread = threading.Thread(target=local.run, name="web-local", daemon=True)
+    local_thread.start()
     if args.no_tray:
         server.run()
+        local.should_exit = True
         return
 
     server_thread = threading.Thread(target=server.run, name="web", daemon=True)
@@ -76,6 +92,7 @@ def main():
         monitor.tamper.stopped("Quit from the tray")
         monitor.stop()
         server.should_exit = True
+        local.should_exit = True
 
     tray = Tray(monitor, url, quit_all)
     if update_note:

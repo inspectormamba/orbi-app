@@ -47,6 +47,7 @@ class PinGuard:
         """outcome: "wrong", "locked" (refused by the lockout without checking) or "ok"."""
         now = time.time()
         name, mac = self.monitor.identify(ip)
+        self._phone_alert(outcome, who, ip, agent)
         if outcome == "ok":
             # The device's owner got in: what it typed wrong just before was a typo of the real PIN.
             self.store.x("UPDATE pin_attempts SET guess=NULL WHERE ip=? AND ts > ?", (ip, now - TYPO_WINDOW))
@@ -73,6 +74,21 @@ class PinGuard:
         if scripted_agent(agent):
             return f"the PINs came from a program, not a web browser ({(agent or 'no User-Agent')[:60]})"
         return ""
+
+    def _phone_alert(self, outcome: str, who: str, ip: str, agent: str) -> None:
+        """Every sign-in attempt goes to the parent's phone: success, wrong PIN, or refused by the lockout.
+        The message never includes what was typed. Turn off with "push_login_alerts": false in settings."""
+        if not config.load().get("push_login_alerts", True):
+            return
+        from . import push
+        kind = "browser" if not scripted_agent(agent) else "program"
+        where = f"{who} ({ip}), {kind}"
+        if outcome == "ok":
+            push.send("Signed in to Orbi Control", f"Signed in from {where}", priority=3)
+        elif outcome == "locked":
+            push.send("Orbi Control: sign-in refused (locked out)", f"Attempt from {where}", priority=4)
+        else:
+            push.send("Orbi Control: wrong PIN", f"Wrong PIN from {where}", priority=4)
 
     def refused(self, ip: str, path: str, who: str) -> None:
         """A request for a page that needs signing in, without a valid sign-in. A browser left open makes a
