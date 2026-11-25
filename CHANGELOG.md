@@ -2,6 +2,12 @@
 
 What changed in each version, newest first. The same notes appear in the app under More → Updates.
 
+## 1.2.8 (2026-11-25)
+
+Mac install fix and Mac test fixes.
+- The macOS install was missing a package list entry: a fresh Mac install with hash checking stopped at the menu bar icon's dependencies. Those are now pinned, so a fresh install on a Mac works.
+- Nothing changes for the Windows PC or for existing installs.
+
 ## 1.2.7 (2026-11-24)
 
 Phone connection: HTTPS is now an option.
