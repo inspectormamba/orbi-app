@@ -164,6 +164,8 @@ def test_record_result(install, tmp_path):
 def test_update_api(client):
     client.post("/api/setup", json={"pin": "246810"})
     assert client.get("/api/session").json()["version"] == updater.RUNNING == updater.current_version()
+    if not updater.is_git_checkout():
+        pytest.skip("the git-checkout refusal only applies to a git checkout (a zip install is updated in place)")
     assert client.post("/api/update/apply", json={}).status_code == 409  # this repo is a git checkout
 
 

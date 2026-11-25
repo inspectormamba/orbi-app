@@ -200,4 +200,4 @@ def test_cleared_event_log_is_reported(watch, monitor, winlog, monkeypatch):
     winlog.clear()
     monkeypatch.setattr(watch, "_log_checked", 0)
     watch.check()
-    assert alerts(monitor) == ["Windows Event Log was cleared"]
+    assert alerts(monitor) == [f"{tamper.LOG_TITLE} was cleared"]

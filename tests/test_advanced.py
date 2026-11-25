@@ -367,11 +367,11 @@ def test_lost_router_connection_alerts_reminds_and_rechecks(monitor, fake_router
                                                                           {"name": "Block-VPN-WireGuard", "port": "51820", "ips": "all"}]})
     fake_router.fail = False
     monitor.scan()
-    assert monitor.notes[-1][0] == "Reconnected to the router"
-    for _ in range(100):
+    for _ in range(100):  # the firewall check runs in a background job: let it finish before looking at the notes
         if not monitor.jobs["settingswatch"]["running"]:
             break
         time.sleep(0.05)
+    assert "Reconnected to the router" in [title for title, _ in monitor.notes]
     assert monitor.store.one("SELECT end_ts FROM events WHERE kind='router_link'")["end_ts"] is not None
     assert ("Firewall rules loosened", "Removed: Block-VPN-WireGuard (port 51820)") in monitor.notes  # caught on reconnecting
 

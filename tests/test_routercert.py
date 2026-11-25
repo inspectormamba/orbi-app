@@ -90,13 +90,26 @@ def _zip(exe: bytes) -> bytes:
     return buf.getvalue()
 
 
+def _archive(exe: bytes) -> bytes:
+    """The download in this platform's format: a zip on Windows, a tar.gz on macOS."""
+    if geckodriver.SPEC["archive"] == "zip":
+        return _zip(exe)
+    import tarfile
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as t:
+        info = tarfile.TarInfo(geckodriver.SPEC["member"])
+        info.size = len(exe)
+        t.addfile(info, io.BytesIO(exe))
+    return buf.getvalue()
+
+
 @pytest.mark.parametrize("tamper", [None, "zip", "exe"])
 def test_geckodriver_is_hash_checked(tmp_config, monkeypatch, tamper):
     exe = b"MZ pretend geckodriver"
-    good_zip = _zip(exe)
+    good_zip = _archive(exe)
     monkeypatch.setitem(geckodriver.SPEC, "archive_sha256", hashlib.sha256(good_zip).hexdigest())
     monkeypatch.setitem(geckodriver.SPEC, "binary_sha256", hashlib.sha256(exe).hexdigest())
-    served = {None: good_zip, "zip": good_zip + b"x", "exe": _zip(exe + b"x")}[tamper]
+    served = {None: good_zip, "zip": good_zip + b"x", "exe": _archive(exe + b"x")}[tamper]
     if tamper == "exe":  # a zip that matches its pin but carries a different program
         monkeypatch.setitem(geckodriver.SPEC, "archive_sha256", hashlib.sha256(served).hexdigest())
 
@@ -295,10 +308,13 @@ def test_unreadable_certificate_is_never_trusted(monkeypatch):
 
 def test_gateway_mac_reads_the_arp_table(monkeypatch):
     import subprocess
+    from orbi import osdep
 
     class Done:
+        # Windows: "arp -a" lines with dashes. macOS: "arp -an" lines like "? (192.168.1.1) at c8:9e:43:00:00:01 on en0".
         stdout = ("\nInterface: 192.168.1.58 --- 0x7\n  Internet Address      Physical Address      Type\n"
-                  "  192.168.1.1           c8-9e-43-00-00-01     dynamic\n")
+                  "  192.168.1.1           c8-9e-43-00-00-01     dynamic\n") if osdep.IS_WINDOWS else (
+                  "? (192.168.1.1) at c8:9e:43:00:00:01 on en0 ifscope [ethernet]\n")
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: Done)
     assert routercert.gateway_mac("192.168.1.1") == "C8:9E:43:00:00:01"
     assert routercert.gateway_mac("192.168.1.2") is None
