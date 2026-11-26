@@ -2,6 +2,19 @@
 
 What changed in each version, newest first. The same notes appear in the app under More → Updates.
 
+## 1.2.9 (2026-11-26)
+
+### Easier to find your way around
+- More is now split into five sections: Alerts, Security, App access, Router and App. History is split into Connection, Events and Router log. The section bar stays at the top while you scroll, and More opens straight to Alerts when there are unread ones.
+- The Break-in attempts card no longer holds everything: allowed addresses and the activity log have their own cards under App access.
+### Who signed in, and what they changed
+- New Sign-ins & changes list (More -> App access): every sign-in attempt, failed or successful, and every change made in the app, with the device that made it, in plain English. PINs and passwords are never stored in it.
+- What a wrong PIN typed is now kept (encrypted, 30 days) even if that device later signs in.
+### Allowed addresses
+- Optionally let only listed addresses use the app, for example your phones and your VPN range. Single addresses, 192.168.1.0/24 or 192.168.1.100-192.168.1.150 all work. Off unless you set it; this PC is always allowed.
+### Also
+- Monitoring has the Alert me about failed router sign-ins switch the security checklist mentions.
+
 ## 1.2.8 (2026-11-25)
 
 Mac install fix and Mac test fixes.
