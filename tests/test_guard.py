@@ -48,7 +48,7 @@ def parent(app):
     return c
 
 
-def test_wrong_pins_are_recorded_and_typos_erased_on_sign_in(app, armed, clock):
+def test_wrong_pins_are_recorded_and_kept_after_the_device_signs_in(app, armed, clock):
     k = kid(app)
     for guess in ("111111", "246811"):
         assert k.post("/api/login", json={"pin": guess}).status_code == 401
@@ -60,9 +60,10 @@ def test_wrong_pins_are_recorded_and_typos_erased_on_sign_in(app, armed, clock):
     # the stored guess is encrypted, not plain text
     raw = app.state.guard.store.q("SELECT guess FROM pin_attempts")
     assert all(r["guess"] and "246811" not in r["guess"] for r in raw)
-    # the same device then gets in: those were its owner's typos of the real PIN, so they're erased
+    # the same device then gets in: the failed attempts are still on record, typed text included
     assert k.post("/api/login", json={"pin": "246810"}).status_code == 200
-    assert [r["guess"] for r in parent(app).get("/api/security").json()["attempts"]] == [None, None]
+    kept = [r["guess"] for r in parent(app).get("/api/security").json()["attempts"]]
+    assert kept and all(g is not None for g in kept)
     assert not app.state.guard.bans()
 
 

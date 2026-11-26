@@ -1249,7 +1249,7 @@ class Monitor:
         title = f"{who} is pretending to be the router" if who else "Another device is answering as the router"
         detail = (f"The router's address ({host}) now belongs to hardware address {seen}" + (f", which is {who}" if who else "")
                   + f", instead of the Orbi ({pinned}). Traffic meant for the internet may be going through that device first "
-                    "(ARP spoofing). If you replaced the router, choose \"This is my new router\" in More → Security checklist. "
+                    "(ARP spoofing). If you replaced the router, choose \"This is my new router\" in More → Security → Security checklist. "
                     "Otherwise find and unplug the device" + (f" ({who})" if who else "") + ", then restart the router.")
         self.store.put("gateway_alert_id", self.store.event("fake_router", title, detail=detail, severity="error",
                                                             mac=seen if who else ""))
@@ -2030,8 +2030,8 @@ class Monitor:
         self.state["update"] = st
         if st["available"] and not st["git_checkout"] and self.store.get("update_notified") != st["latest"]:
             self.store.put("update_notified", st["latest"])
-            self.store.event("update", f"Orbi Control {st['latest']} is available", detail="More → Updates")
-            self.notify("Update available", f"Orbi Control {st['latest']} is ready to install (More → Updates).")
+            self.store.event("update", f"Orbi Control {st['latest']} is available", detail="More → App → Updates")
+            self.notify("Update available", f"Orbi Control {st['latest']} is ready to install (More → App → Updates).")
         return st
 
     def maintenance_loop(self):

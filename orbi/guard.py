@@ -3,8 +3,7 @@
 The lockout in auth.Throttle already makes guessing hopeless; this is about *noticing* and *reacting*.
 Every PIN attempt is recorded with the device (by its hardware address at that moment), the program that
 sent it (User-Agent), and what was typed. What was typed is encrypted on disk with Windows DPAPI, never
-written to the app log, and erased as soon as that device signs in successfully: a parent's typos are
-near-misses of the real PIN and mustn't be left lying around as hints.
+written to the app log. They're kept for 30 days even after that device signs in: the record is the point.
 
 An attack by a program rather than a person (too fast to type, carrying on through the lockout, a
 non-browser client, or probing the app's pages without signing in) gets an immediate alert, bans the
@@ -21,7 +20,6 @@ from . import auth, config
 log = logging.getLogger(__name__)
 
 KEEP_DAYS = 30
-TYPO_WINDOW = 15 * 60  # guesses from a device that signs in within this long were its owner's typos
 BAN_SECONDS = 24 * 3600
 FAST = (3, 2.0)  # this many attempts within this many seconds: nobody types a PIN that fast
 THROUGH_LOCKOUT = (6, 10.0)  # attempts while locked out, within seconds: a program ignoring "try again later"
@@ -49,9 +47,7 @@ class PinGuard:
         name, mac = self.monitor.identify(ip)
         self._phone_alert(outcome, who, ip, agent)
         if outcome == "ok":
-            # The device's owner got in: what it typed wrong just before was a typo of the real PIN.
-            self.store.x("UPDATE pin_attempts SET guess=NULL WHERE ip=? AND ts > ?", (ip, now - TYPO_WINDOW))
-            return
+            return  # a successful sign-in isn't recorded here; the activity log has it
         with self._lock:
             hits = [h for h in self._recent.get(ip, []) if now - h[0] < 60] + [(now, outcome)]
             self._recent[ip] = hits

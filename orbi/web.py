@@ -26,6 +26,8 @@ from .router import RouterClient, RouterError, norm_mac
 log = logging.getLogger("orbi.web")
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
+AUDIT_KEEP_DAYS = 365
+AUDIT_SKIP = {"/api/events/seen", "/api/advanced/refresh"}  # bookkeeping, not changes: marking alerts read, re-reading router settings
 OPEN_PATHS = {"/api/session", "/api/login", "/api/setup", "/api/tls/cert"}  # cert: loopback only, see tls_cert
 INSTANCE = secrets.token_hex(8)  # changes on every start, so the page can tell the app restarted
 HHMM = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
@@ -87,6 +89,7 @@ class SettingsPatch(BaseModel):
     alert_admin_login_failures: bool | None = None
     block_pin_attackers: bool | None = None
     phone_https: bool | None = None
+    allowed_login_ips: list[str] | None = None
     mute_new_device_macs: list[str] | None = None
     router_host: str | None = None
     check_updates: bool | None = None
@@ -226,12 +229,34 @@ def create_app(monitor: Monitor) -> FastAPI:
     app = FastAPI(title="Orbi Control", docs_url=None, redoc_url=None)
     app.state.guard = guard
 
+    refused_addresses: dict[str, float] = {}
+
+    def address_allowed(ip: str, allowed: list[str] | None = None) -> bool:
+        """True if `ip` may use the app. An empty allowed list means anyone on the network may."""
+        allowed = config.load().get("allowed_login_ips") or [] if allowed is None else allowed
+        if not allowed or ip in auth.LOCAL_IPS:
+            return True
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            return False
+        return any(addr in ipaddress.ip_network(n, strict=False) for n in allowed)
+
     @app.middleware("http")
     async def require_login(request: Request, call_next):
         path = request.url.path
         if guard.banned(client_ip(request)):
             log.info("%s %s by %s -> 403 (banned for attacking the PIN)", request.method, path, who(request))
             return JSONResponse({"detail": "This device tried to break into Orbi Control and is shut out for a day."}, status_code=403)
+        if not address_allowed(client_ip(request)):
+            ip = client_ip(request)
+            now = time.time()
+            if now - refused_addresses.get(ip, 0) > 3600:  # one history entry per address per hour
+                refused_addresses[ip] = now
+                store.event("access_refused", "Refused a device that isn't on the allowed list",
+                            detail=f"{who(request)} tried to open {path[:60]}. Only the addresses in settings may use Orbi Control.",
+                            severity="warn")
+            return JSONResponse({"detail": "This address isn't allowed to use Orbi Control"}, status_code=403)
         if path.startswith("/api/") and path not in OPEN_PATHS:
             if not auth.valid_session(request.cookies.get(auth.COOKIE), touch=True):
                 guard.refused(client_ip(request), path, who(request))
@@ -244,6 +269,12 @@ def create_app(monitor: Monitor) -> FastAPI:
                 ACTOR.reset(token)
         if token:
             log.info("%s %s by %s -> %s", request.method, path, who(request), response.status_code)
+            # Activity record: every sign-in attempt (any outcome) and every change, with the device and the outcome.
+            # Only the method, path and status are kept; request bodies (PINs, passwords) are never stored.
+            if path not in AUDIT_SKIP:
+                store.x("INSERT INTO audit(ts,device,ip,method,path,status) VALUES(?,?,?,?,?,?)",
+                        (time.time(), who(request), client_ip(request), request.method, path[:200], response.status_code))
+                store.x("DELETE FROM audit WHERE ts < ?", (time.time() - AUDIT_KEEP_DAYS * 86400,))
         if path.startswith("/api/"):
             response.headers["Cache-Control"] = "no-store"
         elif path.startswith("/static/"):
@@ -322,6 +353,12 @@ def create_app(monitor: Monitor) -> FastAPI:
         return {"ok": True}
 
     # ---------- break-in attempts ----------
+    @app.get("/api/audit")
+    def audit(limit: int = 200):
+        """Sign-ins (successful and failed) and changes made in the app, newest first, with the device that made them."""
+        rows = store.q("SELECT ts,device,ip,method,path,status FROM audit ORDER BY ts DESC LIMIT ?", (max(1, min(limit, 1000)),))
+        return rows
+
     @app.get("/api/security")
     def security():
         bans = [{"ip": ip, **b} for ip, b in guard.bans().items()]
@@ -332,6 +369,7 @@ def create_app(monitor: Monitor) -> FastAPI:
                         for r in store.q("SELECT ts, source FROM router_log WHERE kind='Admin login failure' AND ts > ? ORDER BY ts DESC LIMIT 40",
                                          (time.time() - PIN_KEEP_DAYS * 86400,)) if r["source"] not in mine]
         return {"attempts": guard.recent(), "router_failures": router_fails, "bans": sorted(bans, key=lambda b: -b["since"]),
+                "allowed_login_ips": config.load().get("allowed_login_ips") or [],
                 "block_pin_attackers": config.load().get("block_pin_attackers", True)}
 
     @app.delete("/api/security/attempts")
@@ -748,12 +786,32 @@ def create_app(monitor: Monitor) -> FastAPI:
         s = config.load()
         return {k: s[k] for k in ("router_host", "health_interval", "scan_interval", "speedtest_daily_at", "alert_new_devices",
                                    "alert_admin_login_failures", "block_pin_attackers", "mute_new_device_macs", "port", "check_updates",
-                                   "phone_https")} | {
+                                   "phone_https", "allowed_login_ips")} | {
             "router_configured": bool(s["router_password_enc"])}
 
     @app.patch("/api/settings")
-    def patch_settings(body: SettingsPatch):
+    def patch_settings(body: SettingsPatch, request: Request):
         patch = {k: v for k, v in body.model_dump().items() if v is not None}
+        if "allowed_login_ips" in patch:
+            nets = []
+            for raw in patch["allowed_login_ips"]:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    if "-" in raw:  # a start-end range, stored as the CIDR blocks that cover exactly that span
+                        first, last = (ipaddress.ip_address(x.strip()) for x in raw.split("-", 1))
+                        if last < first:
+                            raise ValueError
+                        nets += [str(n) for n in ipaddress.summarize_address_range(first, last)]
+                    else:
+                        nets.append(str(ipaddress.ip_network(raw, strict=False)))
+                except ValueError:
+                    raise HTTPException(400, f"{raw} isn't an address or range "
+                                             "(like 192.168.1.32, 192.168.1.0/24 or 192.168.1.100-192.168.1.150)")
+            if nets and not address_allowed(client_ip(request), nets):
+                raise HTTPException(400, "Include this device's own address in the list, or you would lock yourself out")
+            patch["allowed_login_ips"] = nets
         if "health_interval" in patch:
             patch["health_interval"] = max(10, min(patch["health_interval"], 600))
         if "scan_interval" in patch:
@@ -1043,7 +1101,7 @@ def create_app(monitor: Monitor) -> FastAPI:
             raise HTTPException(404, "Phone alerts aren't set up")
         store.event("action", "Phone-alert code shown", severity="warn")
         push.send("Phone-alert code was shown", f"On {ACTOR.get() or 'Orbi Control'}. If that wasn't you, choose New code in "
-                  "More → Phone alerts and subscribe again.")
+                  "More → Alerts → Phone alerts and subscribe again.")
         return _push_code()
 
     @app.post("/api/push/test")
@@ -1586,7 +1644,7 @@ def create_app(monitor: Monitor) -> FastAPI:
     def apply_update(request: Request):
         s = config.load()
         if not s["check_updates"]:
-            raise HTTPException(409, "Updates are turned off (More → Updates)")
+            raise HTTPException(409, "Updates are turned off (More → App → Updates)")
 
         def work():
             info = monitor.check_updates(force=True)

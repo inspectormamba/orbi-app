@@ -88,3 +88,52 @@ def test_phone_link_is_plain_http_by_default_and_https_is_an_option(app, data_di
     assert all(u.startswith("https://") for u in acc["urls"])
     events = [e["title"] for e in parent.get("/api/events?limit=50").json()]
     assert "Phone connection set to HTTPS" in events
+
+
+def test_activity_records_failed_and_successful_sign_ins_and_changes(app, data_dir):
+    phone = TestClient(app, base_url="http://localhost:8471", client=("192.168.1.32", 50000))
+    phone.post("/api/setup", json={"pin": "246810"})
+    assert phone.post("/api/login", json={"pin": "000000"}).status_code == 401
+    assert phone.post("/api/login", json={"pin": "246810"}).status_code == 200
+    assert phone.patch("/api/settings", json={"check_updates": True}).status_code == 200
+    rows = phone.get("/api/audit").json()
+    got = [(r["method"], r["path"], r["status"]) for r in rows]
+    assert ("POST", "/api/login", 401) in got and ("POST", "/api/login", 200) in got
+    assert ("PATCH", "/api/settings", 200) in got
+    assert all(r["device"] for r in rows)
+    assert all("000000" not in str(r) and "246810" not in str(r) for r in rows), "PINs are never stored in the activity"
+
+
+def test_login_allowlist_refuses_other_addresses_and_cannot_lock_out_the_saver(app, data_dir):
+    parent = TestClient(app, base_url="http://localhost:8471", client=("127.0.0.1", 50000))
+    parent.post("/api/setup", json={"pin": "246810"})
+    other = TestClient(app, base_url="http://192.168.1.99:8470", client=("192.168.1.99", 50000))
+    phone = TestClient(app, base_url="http://192.168.1.32:8470", client=("192.168.1.32", 50000))
+
+    # empty list: anyone on the network may use the app
+    assert other.get("/api/session").status_code == 200
+
+    assert parent.patch("/api/settings", json={"allowed_login_ips": ["192.168.1.32", "192.168.1.123"]}).status_code == 200
+    assert config.load()["allowed_login_ips"] == ["192.168.1.32/32", "192.168.1.123/32"]
+    assert other.get("/api/session").status_code == 403
+    assert other.post("/api/login", json={"pin": "246810"}).status_code == 403
+    assert phone.get("/api/session").status_code == 200
+    assert parent.get("/api/session").status_code == 200, "this PC is always allowed"
+
+    # a range works too
+    assert parent.patch("/api/settings", json={"allowed_login_ips": ["192.168.1.0/24"]}).status_code == 200
+    assert other.get("/api/session").status_code == 200
+
+    # a start-end range is stored as the CIDR blocks covering exactly that span
+    assert parent.patch("/api/settings", json={"allowed_login_ips": ["192.168.1.96-192.168.1.103"]}).status_code == 200
+    assert config.load()["allowed_login_ips"] == ["192.168.1.96/29"]
+    assert other.get("/api/session").status_code == 200  # .99 is inside
+    assert phone.get("/api/session").status_code == 403  # .32 is not
+    assert parent.patch("/api/settings", json={"allowed_login_ips": ["192.168.1.20-192.168.1.10"]}).status_code == 400
+    assert parent.patch("/api/settings", json={"allowed_login_ips": ["192.168.1.0/24"]}).status_code == 200
+
+    # saving a list that leaves out the device saving it is refused
+    assert phone.post("/api/login", json={"pin": "246810"}).status_code == 200
+    assert phone.patch("/api/settings", json={"allowed_login_ips": ["192.168.1.123"]}).status_code == 400
+    assert parent.patch("/api/settings", json={"allowed_login_ips": ["not an address"]}).status_code == 400
+    assert config.load()["allowed_login_ips"] == ["192.168.1.0/24"]

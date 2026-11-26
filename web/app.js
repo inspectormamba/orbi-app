@@ -183,10 +183,17 @@ const VIEWS = { home: renderHome, devices: renderDevices, family: renderFamily, 
 const ADV_KEY = "orbi-advanced-mode";
 const advancedOn = () => { try { return localStorage.getItem(ADV_KEY) === "1"; } catch { return false; } };
 function syncAdvancedTab() { $("#tab-advanced").hidden = !advancedOn(); }
-function route(tab) {
-  if (!VIEWS[tab] || (tab === "advanced" && !advancedOn())) tab = "home";
+function route(raw) {
+  let [tab, sub] = String(raw || "").split(":");
+  if (!VIEWS[tab] || (tab === "advanced" && !advancedOn())) { tab = "home"; sub = ""; }
+  if (tab === "more") {
+    if (sub && MORE_SECTIONS.some(([k]) => k === sub)) moreSection = sub;
+    else if (!sub && !$("#alert-badge").hidden) moreSection = "alerts";  // unread alerts: open straight to them
+  }
+  if (tab === "history" && sub && HIST_SECTIONS.some(([k]) => k === sub)) histSection = sub;
   currentTab = tab;
-  if (location.hash.slice(1) !== tab) history.replaceState(null, "", `#${tab}`);
+  const want = tab === "more" ? `more:${moreSection}` : tab === "history" ? `history:${histSection}` : tab;
+  if (location.hash.slice(1) !== want) history.replaceState(null, "", `#${want}`);
   document.querySelectorAll(".tabs button").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
   closeSheet(); stopRefresh();
   setView(h("div", { class: "empty" }, h("span", { class: "spinner" })));
@@ -544,7 +551,31 @@ function ruleSheet(p, r) {
 
 // ---------- History ----------
 let histHours = 24;
+const HIST_SECTIONS = [["connection", "Connection"], ["events", "Events"], ["log", "Router log"]];
+let histSection = "connection";
+
+function goHistory(section) {
+  histSection = section;
+  if (currentTab !== "history") return route(`history:${section}`);
+  if (location.hash.slice(1) !== `history:${section}`) history.replaceState(null, "", `#history:${section}`);
+  window.scrollTo(0, 0);
+  renderHistory().catch((e) => setView(h("div", { class: "empty" }, e.message)));
+}
+
 async function renderHistory() {
+  if (!HIST_SECTIONS.some(([k]) => k === histSection)) histSection = "connection";
+  const nav = sectionNav(HIST_SECTIONS, histSection, goHistory);
+  if (histSection === "log") return setView(nav, routerLogCard());
+  if (histSection === "events") {
+    const events = (await api("/api/events?limit=200")).filter((e) => e.kind !== "outage");
+    const log = h("section", { class: "card" }, h("h2", {}, "Alerts & events"),
+      ...(events.length ? events.slice(0, 100).map((e) => h("div", { class: "row" },
+        h("div", { class: "main" }, h("div", { class: "name", style: "white-space:normal" }, e.title), h("div", { class: "meta", style: "white-space:normal" }, [fmtWhen(e.ts), e.detail].filter(Boolean).join(" · "))),
+        e.severity !== "info" ? h("span", { class: `pill ${e.severity === "error" ? "bad" : "warn"}` }, e.severity === "error" ? "Alert" : "Notice") : null))
+        : [h("div", { class: "empty" }, "Nothing recorded yet.")]));
+    return setView(nav, log, vpnAttemptsCard());
+  }
+
   const [hist, events, speeds, traffic] = await Promise.all([api(`/api/history?hours=${histHours}`), api("/api/events?limit=200"), api("/api/speedtests?days=30"), api("/api/traffic?days=30")]);
   const chips = h("div", { class: "chips" }, ...[[24, "24 hours"], [168, "7 days"], [720, "30 days"]].map(([hrs, l]) =>
     h("button", { class: `chip${histHours === hrs ? " on" : ""}`, onclick: () => { histHours = hrs; renderHistory(); } }, l)));
@@ -553,7 +584,7 @@ async function renderHistory() {
   const inRange = outages.filter((e) => (e.end_ts || Date.now() / 1000) > since);
   const totalDown = inRange.reduce((s, e) => s + ((e.end_ts || Date.now() / 1000) - Math.max(e.ts, since)), 0);
 
-  const uptimeCard = h("section", { class: "card" }, h("h2", {}, "Internet connection"),
+  const uptimeCard = h("section", { class: "card" }, h("h2", {}, "Internet connection"), chips,
     hist.points.length ? uptimeChart(hist) : h("div", { class: "empty" }, "Collecting data… check back in a few minutes."),
     h("div", { class: "legend" }, h("span", {}, h("i", { style: "background:var(--ok)" }), "online"), h("span", {}, h("i", { style: "background:var(--bad)" }), "offline"), h("span", {}, h("i", { style: "background:var(--accent)" }), "latency")),
     h("div", { class: "muted small", style: "margin-top:6px" }, `${inRange.length} outage${inRange.length === 1 ? "" : "s"}, ${dur(totalDown)} offline in this period.`));
@@ -571,12 +602,7 @@ async function renderHistory() {
       : [h("div", { class: "empty" }, "No speed tests yet.")]));
 
   const trafficCard = traffic.length ? h("section", { class: "card" }, h("h2", {}, "Daily usage"), barChart(traffic)) : null;
-
-  const log = h("section", { class: "card" }, h("h2", {}, "Activity"),
-    ...events.filter((e) => e.kind !== "outage").slice(0, 60).map((e) => h("div", { class: "row" },
-      h("div", { class: "main" }, h("div", { class: "name", style: "white-space:normal" }, e.title), h("div", { class: "meta" }, [fmtWhen(e.ts), e.detail].filter(Boolean).join(" · "))),
-      e.severity !== "info" ? h("span", { class: `pill ${e.severity === "error" ? "bad" : "warn"}` }, e.severity === "error" ? "Alert" : "Notice") : null)));
-  setView(chips, uptimeCard, outageCard, speedCard, trafficCard, log, vpnAttemptsCard(), routerLogCard());
+  setView(nav, uptimeCard, outageCard, speedCard, trafficCard);
 }
 
 function routerLogCard() {
@@ -644,19 +670,72 @@ function barChart(days) {
 }
 
 // ---------- More ----------
+// ---------- More: five short sections instead of one long page ----------
+// Alerts (what happened, where alerts go) · Security (checks, break-in attempts) · App access (who can open the app,
+// what they did) · Router (the Orbi itself) · App (how Orbi Control runs). The section is in the address (#more:router).
+const MORE_SECTIONS = [["alerts", "Alerts"], ["security", "Security"], ["access", "App access"], ["router", "Router"], ["app", "App"]];
+const MORE_KEY = "orbi-more-section";
+let moreSection = (() => { try { return localStorage.getItem(MORE_KEY) || "alerts"; } catch { return "alerts"; } })();
+
+function sectionNav(sections, current, go) {
+  return h("nav", { class: "chips section-nav", "aria-label": "Sections" }, ...sections.map(([k, l]) =>
+    h("button", { class: `chip${current === k ? " on" : ""}`, "aria-current": current === k ? "page" : null, onclick: () => go(k) }, l)));
+}
+
+function goMore(section) {
+  moreSection = section;
+  try { localStorage.setItem(MORE_KEY, section); } catch {}
+  if (currentTab !== "more") return route(`more:${section}`);
+  if (location.hash.slice(1) !== `more:${section}`) history.replaceState(null, "", `#more:${section}`);
+  window.scrollTo(0, 0);
+  renderMore().catch((e) => setView(h("div", { class: "empty" }, e.message)));
+}
+
 async function renderMore() {
-  const [settings, access, events, st] = await Promise.all([api("/api/settings"), api("/api/access"), api("/api/events?limit=50"), api("/api/status")]);
+  if (!MORE_SECTIONS.some(([k]) => k === moreSection)) moreSection = "alerts";
+  const build = { alerts: moreAlerts, security: moreSecurity, access: moreAccess, router: moreRouter, app: moreApp }[moreSection];
+  const cards = await build();
+  setView(sectionNav(MORE_SECTIONS, moreSection, goMore), ...cards);
+}
+
+async function moreAlerts() {
+  const events = await api("/api/events?limit=50");
   api("/api/events/seen", { body: {} }).then(() => ($("#alert-badge").hidden = true)).catch(() => {});
-  const alerts = events.filter((e) => e.severity !== "info").slice(0, 8);
-  const alertCard = h("section", { class: "card" }, h("h2", {}, "Recent alerts"),
+  const alerts = events.filter((e) => e.severity !== "info").slice(0, 10);
+  const alertCard = h("section", { class: "card" }, h("h2", {}, "Recent alerts",
+    h("button", { class: "btn small act", onclick: () => goHistory("events") }, "All events")),
     ...(alerts.length ? alerts.map((e) => h("div", { class: "row" }, h("div", { class: "main" }, h("div", { class: "name", style: "white-space:normal" }, e.title), h("div", { class: "meta" }, [fmtWhen(e.ts), e.detail].filter(Boolean).join(" · ")))))
       : [h("div", { class: "muted small" }, "No alerts.")]));
+  return [alertCard, pushCard(), heartbeatCard()];
+}
 
+async function moreSecurity() {
+  return [securityChecklistCard(), breakinCard(), exposureCard(), deviceCheckCard()];
+}
+
+async function moreAccess() {
+  const [settings, access] = await Promise.all([api("/api/settings"), api("/api/access")]);
+  return [phoneCard(access), allowedCard(settings), pinCard(), activityCard()];
+}
+
+async function moreRouter() {
+  const [settings, st] = await Promise.all([api("/api/settings"), api("/api/status")]);
+  return [routerCard(settings, st), remoteCard(), advancedModeCard()];
+}
+
+async function moreApp() {
+  const settings = await api("/api/settings");
+  return [monitoringCard(settings), updatesCard(settings),
+    h("div", { class: "muted small center" }, "Orbi Control runs on your PC and talks to the Orbi directly — no cloud. Outside connections: the optional update check to GitHub, internet checks to 1.1.1.1, 8.8.8.8 and 9.9.9.9, and, when the device check is on, CISA's and NIST's vulnerability lists (only product names and firmware versions are sent).")];
+}
+
+// ---------- App access ----------
+function phoneCard(access) {
   const httpsOn = access.https === true;
   const httpsSwitch = h("input", { type: "checkbox", checked: httpsOn, onchange: (e) =>
     act(null, () => api("/api/settings", { method: "PATCH", body: { phone_https: e.target.checked } }),
       "Saved. Restart Orbi Control for it to take effect, then set up each phone again.").catch(() => { e.target.checked = httpsOn; }) });
-  const phone = h("section", { class: "card" }, h("h2", {}, "Use it on your phone"),
+  return h("section", { class: "card" }, h("h2", {}, "Use it on your phone"),
     h("div", { style: "display:flex;gap:16px;align-items:center;flex-wrap:wrap" },
       access.qr_svg ? h("div", { class: "qr", html: access.qr_svg }) : null,
       h("div", { style: "flex:1;min-width:200px" }, h("div", { style: "font-weight:600;word-break:break-all" }, access.urls[0] || "—"),
@@ -668,20 +747,170 @@ async function renderMore() {
     h("label", { class: "switch" }, "Encrypt the phone connection (HTTPS)", httpsSwitch),
     h("p", { class: "muted small" }, httpsOn
       ? "Passwords and the session stay private on the home network. Turning this off sends the PIN in plain text on the home network, so only do that if a phone can't trust the certificate."
-      : "Plain HTTP: the PIN and sign-in cookie cross the home network unencrypted. Turn HTTPS back on when you can."));
+      : "Plain HTTP: the PIN and sign-in cookie cross the home network unencrypted. Turn HTTPS on when every phone can trust the certificate."));
+}
 
-  const speedAt = h("input", { type: "time", value: settings.speedtest_daily_at || "" });
-  const health = h("select", {}, ...[[15, "15 s"], [30, "30 s"], [60, "1 min"], [120, "2 min"]].map(([v, l]) => h("option", { value: v, selected: settings.health_interval === v }, l)));
-  const scan = h("select", {}, ...[[60, "1 min"], [120, "2 min"], [300, "5 min"], [600, "10 min"]].map(([v, l]) => h("option", { value: v, selected: settings.scan_interval === v }, l)));
-  const newDev = h("input", { type: "checkbox", checked: settings.alert_new_devices });
-  const monitoring = h("section", { class: "card form" }, h("h2", {}, "Monitoring"),
-    h("label", { class: "field" }, "Check internet every", health),
-    h("label", { class: "field" }, "Scan devices & satellites every", scan),
-    h("label", { class: "field" }, "Daily speed test at (clear to turn off)", speedAt),
-    h("label", { class: "switch" }, "Alert me about new devices", newDev),
-    h("button", { class: "btn primary", onclick: (e) => act(e.currentTarget, () => api("/api/settings", { method: "PATCH", body: {
-      health_interval: Number(health.value), scan_interval: Number(scan.value), speedtest_daily_at: speedAt.value, alert_new_devices: newDev.checked } }), "Settings saved") }, "Save"));
+function allowedCard(settings) {
+  const list = settings.allowed_login_ips || [];
+  const box = h("input", { type: "text", value: list.join(", "), placeholder: "e.g. 192.168.1.32, 192.168.1.123, 192.168.254.0/24" });
+  return h("section", { class: "card form" }, h("h2", {}, "Allowed addresses"),
+    h("div", { class: "muted small" }, list.length
+      ? `Only these can open the app from the network: ${list.join(", ")}. This PC is always allowed.`
+      : "Anyone on the home network can try to sign in. List addresses to allow only those. This PC is always allowed."),
+    h("label", { class: "field" }, "Addresses or ranges, separated by commas", box),
+    h("div", { class: "muted small" }, "Ranges work: 192.168.1.0/24 or 192.168.1.100-192.168.1.150. Include the device you're using now, or the app won't save the list."),
+    h("button", { class: "btn", onclick: (e) => act(e.currentTarget,
+      () => api("/api/settings", { method: "PATCH", body: { allowed_login_ips: box.value.split(",").map((x) => x.trim()).filter(Boolean) } }), "Allowed addresses saved")
+      .then(() => goMore("access")).catch(() => {}) }, "Save"));
+}
 
+function pinCard() {
+  const cur = h("input", { type: "password", inputmode: "numeric", autocomplete: "current-password" });
+  const nw = h("input", { type: "password", inputmode: "numeric", autocomplete: "new-password" });
+  const extraPins = h("div", {});
+  function renderExtraPins() {
+    api("/api/settings/pins").then((r) => fill(extraPins, r.extra.length ? r.extra.map((p) => h("div", { class: "row" },
+      h("div", { class: "main" }, h("div", { class: "name" }, p.label)),
+      h("button", { class: "btn small danger", onclick: (e) => act(e.currentTarget, () => api(`/api/settings/pins/${encodeURIComponent(p.label)}`, { method: "DELETE" }), "PIN removed").then(renderExtraPins) }, "Remove")))
+      : h("div", { class: "muted small" }, "None"))).catch((e) => fill(extraPins, h("div", { class: "error-text" }, e.message)));
+  }
+  renderExtraPins();
+  return h("section", { class: "card form" }, h("h2", {}, "App PIN"),
+    h("div", { class: "inline" }, h("label", { class: "field" }, "Current", cur), h("label", { class: "field" }, "New (6+)", nw)),
+    h("button", { class: "btn", onclick: (e) => act(e.currentTarget, () => api("/api/settings/pin", { body: { current: cur.value, new: nw.value } }), "PIN changed; other PINs removed and other devices signed out").then(() => { cur.value = nw.value = ""; renderExtraPins(); }) }, "Change PIN"),
+    h("button", { class: "btn", onclick: (e) => act(e.currentTarget, () => api("/api/logout", { body: {} })).then(showLogin) }, "Sign out of this device"),
+    h("div", { class: "muted small", style: "margin-top:10px" }, "Other PINs that also unlock the app (removed when you change the PIN):"),
+    extraPins);
+}
+
+// Plain-English names for what each change did. Anything not listed shows its raw request, so nothing is hidden.
+const ACTIVITY_NAMES = [
+  [/^POST \/api\/logout$/, "Signed out"],
+  [/^POST \/api\/setup$/, "Set up the app PIN"],
+  [/^POST \/api\/profiles\/\d+\/pause$/, (p) => `Paused internet for ${p}`],
+  [/^POST \/api\/profiles\/\d+\/resume$/, (p) => `Resumed internet for ${p}`],
+  [/^POST \/api\/profiles\/\d+\/bonus\/cancel$/, (p) => `Ended extra time for ${p}`],
+  [/^POST \/api\/profiles\/\d+\/bonus$/, (p) => `Gave extra time to ${p}`],
+  [/^POST \/api\/profiles\/\d+\/rules$/, (p) => `Added a schedule for ${p}`],
+  [/^POST \/api\/profiles$/, "Created a profile"],
+  [/^PATCH \/api\/profiles\/\d+$/, (p) => `Edited ${p}`],
+  [/^DELETE \/api\/profiles\/\d+$/, "Deleted a profile"],
+  [/^PUT \/api\/rules\/\d+$/, "Changed a schedule"],
+  [/^DELETE \/api\/rules\/\d+$/, "Deleted a schedule"],
+  [/^POST \/api\/family\/late-bedtime$/, "Set a later bedtime tonight"],
+  [/^DELETE \/api\/family\/late-bedtime$/, "Cancelled the later bedtime"],
+  [/^PUT \/api\/family\/settings$/, "Changed family settings"],
+  [/^POST \/api\/family\/assign-unassigned$/, "Put unassigned devices in a profile"],
+  [/^PATCH \/api\/devices\/[^/]+$/, "Changed a device"],
+  [/^POST \/api\/devices\/[^/]+\/block$/, "Blocked or unblocked a device"],
+  [/^PATCH \/api\/settings$/, "Changed settings"],
+  [/^POST \/api\/settings\/pin$/, "Changed the app PIN"],
+  [/^(POST|DELETE) \/api\/settings\/pins/, "Changed the extra PINs"],
+  [/^POST \/api\/settings\/router-password$/, "Changed the saved router password"],
+  [/^POST \/api\/settings\/router-cert\/trust$/, "Trusted a new router certificate"],
+  [/^(POST|PUT|DELETE) \/api\/reservations/, "Changed an address reservation"],
+  [/^PUT \/api\/siteblock$/, "Changed blocked apps & sites"],
+  [/^(POST|PUT) \/api\/filtering/, "Changed content filtering"],
+  [/^(POST|PUT|DELETE) \/api\/firewall/, "Changed firewall rules"],
+  [/^PUT \/api\/guest$/, "Changed guest Wi-Fi"],
+  [/^PUT \/api\/iot$/, "Changed IoT Wi-Fi"],
+  [/^PUT \/api\/upnp$/, "Changed UPnP"],
+  [/^PUT \/api\/ddns$/, "Changed Dynamic DNS"],
+  [/^POST \/api\/push\/show$/, "Viewed the phone-alert code"],
+  [/^POST \/api\/push\/test$/, "Sent a test phone alert"],
+  [/^(POST|PUT) \/api\/push/, "Changed phone alerts"],
+  [/^(PUT|DELETE) \/api\/heartbeat$/, "Changed the outside check-in"],
+  [/^POST \/api\/router\/reboot$/, "Restarted or scheduled a router restart"],
+  [/^DELETE \/api\/router\/reboot$/, "Cancelled a scheduled router restart"],
+  [/^POST \/api\/router-backup$/, "Backed up the router's settings"],
+  [/^POST \/api\/speedtest$/, "Ran a speed test"],
+  [/^DELETE \/api\/security\/attempts$/, "Cleared the break-in list"],
+  [/^DELETE \/api\/security\/bans/, "Let a shut-out device back in"],
+  [/^PUT \/api\/(exposure|vulnscan)$/, "Changed a security check"],
+  [/^POST \/api\/(exposure|vulnscan)\/scan$/, "Ran a security check"],
+  [/^POST \/api\/lanwatch\//, "Ran a network check"],
+  [/^POST \/api\/update\/apply$/, "Installed an app update"],
+  [/^POST \/api\/update\/check$/, "Checked for app updates"],
+  [/^POST \/api\/advanced\/refresh$/, "Refreshed the router settings view"],
+];
+const isSignIn = (a) => a.method === "POST" && ["/api/login", "/api/logout", "/api/setup"].includes(a.path);
+
+function describeActivity(a, profileName) {
+  if (a.method === "POST" && a.path === "/api/login") {
+    return { 200: "Signed in", 401: "Wrong PIN", 429: "Sign-in refused: locked out", 403: "Sign-in refused: address not allowed" }[a.status] || `Sign-in (${a.status})`;
+  }
+  const key = `${a.method} ${a.path}`;
+  const pid = (a.path.match(/^\/api\/profiles\/(\d+)/) || [])[1];
+  const hit = ACTIVITY_NAMES.find(([re]) => re.test(key));
+  const text = !hit ? key : typeof hit[1] === "function" ? hit[1](profileName(pid) || "a profile") : hit[1];
+  return a.status >= 400 ? `${text} (didn't go through: ${a.status})` : text;
+}
+
+function activityCard() {
+  const card = h("section", { class: "card" }, h("h2", {}, "Sign-ins & changes"), h("div", { class: "muted small" }, h("span", { class: "spinner" })));
+  let shown = "all", limit = 50;
+  Promise.all([api("/api/audit?limit=500"), api("/api/profiles").catch(() => [])]).then(([rows, profiles]) => {
+    const profileName = (id) => (profiles.find((p) => String(p.id) === String(id)) || {}).name;
+    const draw = () => {
+      const pick = rows.filter((a) => shown === "all" || (shown === "signins" ? isSignIn(a) : !isSignIn(a)));
+      const failedSignIns = rows.filter((a) => a.method === "POST" && a.path === "/api/login" && a.status !== 200).length;
+      fill(card, h("h2", {}, "Sign-ins & changes"),
+        h("div", { class: "muted small" }, `Every sign-in attempt (kept even when that device later signs in) and every change made in the app, with the device that made it. ${failedSignIns} failed sign-in${failedSignIns === 1 ? "" : "s"} on record.`),
+        h("div", { class: "chips", style: "margin:8px 0" }, ...[["all", "Everything"], ["signins", "Sign-ins"], ["changes", "Changes"]].map(([k, l]) =>
+          h("button", { class: `chip${shown === k ? " on" : ""}`, onclick: () => { shown = k; limit = 50; draw(); } }, l))),
+        ...(pick.length ? pick.slice(0, limit).map((a) => h("div", { class: "row" }, h("div", { class: "main" },
+          h("div", { class: "name", style: "white-space:normal" }, describeActivity(a, profileName)),
+          h("div", { class: "meta", style: "white-space:normal;overflow-wrap:anywhere" }, [fmtWhen(a.ts), a.device, a.ip].filter(Boolean).join(" · "))),
+          a.status >= 400 ? h("span", { class: "pill warn" }, a.method === "POST" && a.path === "/api/login" ? "Failed" : "Refused") : null))
+          : [h("div", { class: "muted small" }, "Nothing recorded yet.")]),
+        pick.length > limit ? h("button", { class: "btn small", style: "margin-top:8px", onclick: () => { limit += 50; draw(); } }, `Show more (${pick.length - limit} older)`) : null);
+    };
+    draw();
+  }).catch((e) => fill(card, h("h2", {}, "Sign-ins & changes"), h("div", { class: "error-text" }, e.message)));
+  return card;
+}
+
+// ---------- Security: wrong PINs and attacks on the app ----------
+function breakinCard() {
+  const card = h("section", { class: "card form" }, h("h2", {}, "Break-in attempts"), h("div", { class: "muted small" }, h("span", { class: "spinner" })));
+  const render = async () => {
+    let s;
+    try { s = await api("/api/security"); } catch (e) { return fill(card, h("h2", {}, "Break-in attempts"), h("div", { class: "error-text" }, e.message)); }
+    const label = { wrong: "Wrong PIN", locked: "Sent while locked out", ok: "Signed in" };
+    const wrap = "white-space:normal;overflow-wrap:anywhere";
+    const reveal = h("input", { type: "checkbox", onchange: () => list.replaceChildren(...rows()) });
+    const rows = () => s.attempts.length ? s.attempts.slice(0, 40).map((a) => h("div", { class: "row" }, h("div", { class: "main" },
+      h("div", { class: "name", style: "white-space:normal" }, `${a.device || a.ip}${a.automated ? " · program" : ""}`),
+      h("div", { class: "meta", style: wrap }, [fmtWhen(a.ts), label[a.outcome] || a.outcome, a.ip, a.mac].filter(Boolean).join(" · ")),
+      reveal.checked ? h("div", { class: "meta", style: wrap + ";color:var(--text)" }, a.guess != null ? `Typed: “${a.guess}”` : "Typed: not kept") : null,
+      a.automated || !/Mozilla/.test(a.agent || "") ? h("div", { class: "meta", style: wrap }, `Sent by: ${a.agent || "no program name"}`) : null)))
+      : [h("div", { class: "muted small" }, "No wrong PINs in the last 30 days.")];
+    const list = h("div", {}, ...rows());
+    const routerFails = s.router_failures || [];
+    const block = h("input", { type: "checkbox", checked: s.block_pin_attackers, onchange: (e) =>
+      act(null, () => api("/api/settings", { method: "PATCH", body: { block_pin_attackers: e.target.checked } }), "Saved").catch(() => {}) });
+    fill(card, h("h2", {}, "Break-in attempts"),
+      h("div", { class: "muted small" }, "Every wrong PIN, with the device it came from. A program guessing (too fast for a person, carrying on through the lockout, or not a web browser) is shut out of the app for a day and you get an alert. What was typed is kept encrypted for 30 days, even if that device later signs in. Successful sign-ins are under App access → Sign-ins & changes."),
+      ...s.bans.map((b) => h("div", { class: "note" }, `Shut out until ${fmtAt(b.until)}: ${b.who}. ${b.why}. `,
+        h("button", { class: "btn small", onclick: (e) => act(e.currentTarget, () => api(`/api/security/bans/${encodeURIComponent(b.ip)}`, { method: "DELETE" }), "It can use the app again").then(render) }, "Let it back in"))),
+      h("label", { class: "switch" }, "Also block the device at the router", block),
+      h("label", { class: "switch" }, "Show what was typed", reveal),
+      h("div", { class: "group-label" }, "Orbi Control PIN"),
+      list,
+      s.attempts.length ? h("button", { class: "btn small", onclick: (e) => act(e.currentTarget, () => api("/api/security/attempts", { method: "DELETE" }), "Cleared").then(render) }, "Clear the list") : null,
+      h("div", { class: "group-label", style: "margin-top:12px" }, "Router admin page (routerlogin.net)"),
+      h("div", { class: "muted small" }, "Failed logins to the Orbi's own settings page, which has its own password. The router only records who tried, not what they typed."),
+      ...(routerFails.length ? routerFails.map((a) => h("div", { class: "row" }, h("div", { class: "main" },
+        h("div", { class: "name", style: "white-space:normal" }, a.device || a.ip),
+        h("div", { class: "meta", style: wrap }, [fmtWhen(a.ts), "Wrong router password", a.ip].join(" · ")))))
+        : [h("div", { class: "muted small" }, "None in the last 30 days.")]));
+  };
+  render();
+  return card;
+}
+
+// ---------- Router ----------
+function routerCard(settings, st) {
   const rpw = h("input", { type: "password", autocomplete: "off", placeholder: settings.router_configured ? "••••••••" : "Orbi admin password" });
   const certInfo = h("div", {});
   const backupInfo = h("div", {});
@@ -696,7 +925,7 @@ async function renderMore() {
     ["Memory used", st.system?.memory != null ? `${st.system.memory}%` : null],
     ["In use since", st.info?.first_use ? fmtWhen(st.info.first_use) : null],
     ["Access Control", st.access_control == null ? null : st.access_control ? "On (needed for device blocking)" : "Off"]].filter(([, v]) => v != null && v !== "");
-  const routerCard = h("section", { class: "card form" }, h("h2", {}, "Router"),
+  const card = h("section", { class: "card form" }, h("h2", {}, "Router"),
     routerFacts.length ? h("dl", { class: "kv" }, ...routerFacts.flatMap(([k, v]) => [h("dt", {}, k), h("dd", {}, v)])) : null,
     fwStale ? h("div", { class: "note" }, "The router only looks for firmware updates when asked, and hasn't looked in over two weeks. Use Check for firmware update below; security fixes come that way.") : null,
     h("label", { class: "field" }, `Admin password for ${settings.router_host}`, rpw),
@@ -714,70 +943,34 @@ async function renderMore() {
     h("div", { class: "muted small" }, c.pinned ? `Security certificate: pinned (${c.pinned})` : "Security certificate: trusted on first connection"),
     c.changed ? h("div", { class: "muted small" }, "A firmware update or factory reset can change it. If you didn't do either, a device on your network may be pretending to be the router.") : null,
     c.changed ? h("button", { class: "btn", onclick: (e) => act(e.currentTarget, () => api("/api/settings/router-cert/trust", { body: {} }), "Now trusting the router's new certificate").then(renderMore) }, "Trust the router's new certificate") : null)).catch(() => {});
+  return card;
+}
 
-  const cur = h("input", { type: "password", inputmode: "numeric", autocomplete: "current-password" });
-  const nw = h("input", { type: "password", inputmode: "numeric", autocomplete: "new-password" });
-  const extraPins = h("div", {});
-  const pinCard = h("section", { class: "card form" }, h("h2", {}, "App PIN"),
-    h("div", { class: "inline" }, h("label", { class: "field" }, "Current", cur), h("label", { class: "field" }, "New (6+)", nw)),
-    h("button", { class: "btn", onclick: (e) => act(e.currentTarget, () => api("/api/settings/pin", { body: { current: cur.value, new: nw.value } }), "PIN changed; other PINs removed and other devices signed out").then(() => { cur.value = nw.value = ""; renderExtraPins(); }) }, "Change PIN"),
-    h("button", { class: "btn", onclick: (e) => act(e.currentTarget, () => api("/api/logout", { body: {} })).then(showLogin) }, "Sign out of this device"),
-    h("div", { class: "muted small", style: "margin-top:10px" }, "Other PINs that also unlock the app (removed when you change the PIN):"),
-    extraPins);
-  function renderExtraPins() {
-    api("/api/settings/pins").then((r) => fill(extraPins, r.extra.length ? r.extra.map((p) => h("div", { class: "row" },
-      h("div", { class: "main" }, h("div", { class: "name" }, p.label)),
-      h("button", { class: "btn small danger", onclick: (e) => act(e.currentTarget, () => api(`/api/settings/pins/${encodeURIComponent(p.label)}`, { method: "DELETE" }), "PIN removed").then(renderExtraPins) }, "Remove")))
-      : h("div", { class: "muted small" }, "None"))).catch((e) => fill(extraPins, h("div", { class: "error-text" }, e.message)));
-  }
-  renderExtraPins();
-  const securityCard = h("section", { class: "card form" }, h("h2", {}, "Break-in attempts"), h("div", { class: "muted small" }, h("span", { class: "spinner" })));
-  renderSecurity(securityCard);
-
+function advancedModeCard() {
   const advToggle = h("input", { type: "checkbox", checked: advancedOn(), onchange: (e) => {
     try { localStorage.setItem(ADV_KEY, e.target.checked ? "1" : "0"); } catch {}
     syncAdvancedTab(); toast(e.target.checked ? "Advanced tab added" : "Advanced tab hidden");
   } });
-  const advCard = h("section", { class: "card" }, h("h2", {}, "Advanced mode"),
-    h("label", { class: "switch" }, "Show the Advanced tab (Wi-Fi networks, DHCP, logs, VPN, firewall rules…)", advToggle));
-  setView(securityChecklistCard(), alertCard, pushCard(), heartbeatCard(), exposureCard(), deviceCheckCard(), phone, remoteCard(), advCard, monitoring, routerCard, pinCard, securityCard, updatesCard(settings),
-    h("div", { class: "muted small center" }, "Orbi Control runs on your PC and talks to the Orbi directly — no cloud. Outside connections: the optional update check to GitHub, internet checks to 1.1.1.1, 8.8.8.8 and 9.9.9.9, and, when the device check is on, CISA's and NIST's vulnerability lists (only product names and firmware versions are sent)."));
+  return h("section", { class: "card" }, h("h2", {}, "Advanced tab"),
+    h("label", { class: "switch" }, "Show the Advanced tab: Wi-Fi networks, address reservations, firewall rules, port forwarding", advToggle));
 }
 
-// ---------- break-in attempts ----------
-async function renderSecurity(card) {
-  let s;
-  try { s = await api("/api/security"); } catch (e) { return fill(card, h("h2", {}, "Break-in attempts"), h("div", { class: "error-text" }, e.message)); }
-  const label = { wrong: "Wrong PIN", locked: "Sent while locked out", ok: "Signed in" };
-  const wrap = "white-space:normal;overflow-wrap:anywhere";
-  const reveal = h("input", { type: "checkbox", onchange: () => list.replaceChildren(...rows()) });
-  const rows = () => s.attempts.length ? s.attempts.slice(0, 40).map((a) => h("div", { class: "row" }, h("div", { class: "main" },
-    h("div", { class: "name", style: "white-space:normal" }, `${a.device || a.ip}${a.automated ? " · program" : ""}`),
-    h("div", { class: "meta", style: wrap }, [fmtWhen(a.ts), label[a.outcome] || a.outcome, a.ip, a.mac].filter(Boolean).join(" · ")),
-    reveal.checked ? h("div", { class: "meta", style: wrap + ";color:var(--text)" },
-      a.guess != null ? `Typed: “${a.guess}”` : "Typed: erased (that device then signed in)") : null,
-    a.automated || !/Mozilla/.test(a.agent || "") ? h("div", { class: "meta", style: wrap }, `Sent by: ${a.agent || "no program name"}`) : null)))
-    : [h("div", { class: "muted small" }, "No wrong PINs in the last 30 days.")];
-  const list = h("div", {}, ...rows());
-  const routerFails = s.router_failures || [];
-  const routerList = [h("div", { class: "group-label", style: "margin-top:12px" }, "Router admin page (routerlogin.net)"),
-    h("div", { class: "muted small" }, "Failed logins to the Orbi's own settings page, which has its own password. The router only records who tried, not what they typed."),
-    ...(routerFails.length ? routerFails.map((a) => h("div", { class: "row" }, h("div", { class: "main" },
-      h("div", { class: "name", style: "white-space:normal" }, a.device || a.ip),
-      h("div", { class: "meta", style: wrap }, [fmtWhen(a.ts), "Wrong router password", a.ip].join(" · ")))))
-      : [h("div", { class: "muted small" }, "None in the last 30 days.")])];
-  const block = h("input", { type: "checkbox", checked: s.block_pin_attackers, onchange: (e) =>
-    act(null, () => api("/api/settings", { method: "PATCH", body: { block_pin_attackers: e.target.checked } }), "Saved").catch(() => {}) });
-  fill(card, h("h2", {}, "Break-in attempts"),
-    h("div", { class: "muted small" }, "Every wrong PIN, with the device it came from. A program guessing (too fast for a person, carrying on through the lockout, or not a web browser) is shut out of the app for a day and you get an alert. What was typed is kept encrypted for 30 days and erased if that device then signs in, since it was probably a typo."),
-    ...s.bans.map((b) => h("div", { class: "note" }, `Shut out until ${fmtAt(b.until)}: ${b.who}. ${b.why}. `,
-      h("button", { class: "btn small", onclick: (e) => act(e.currentTarget, () => api(`/api/security/bans/${encodeURIComponent(b.ip)}`, { method: "DELETE" }), "It can use the app again").then(() => renderSecurity(card)) }, "Let it back in"))),
-    h("label", { class: "switch" }, "Also block the device at the router", block),
-    h("label", { class: "switch" }, "Show what was typed", reveal),
-    h("div", { class: "group-label" }, "Orbi Control PIN"),
-    list,
-    s.attempts.length ? h("button", { class: "btn small", onclick: (e) => act(e.currentTarget, () => api("/api/security/attempts", { method: "DELETE" }), "Cleared").then(() => renderSecurity(card)) }, "Clear the list") : null,
-    ...routerList);
+// ---------- App ----------
+function monitoringCard(settings) {
+  const speedAt = h("input", { type: "time", value: settings.speedtest_daily_at || "" });
+  const health = h("select", {}, ...[[15, "15 s"], [30, "30 s"], [60, "1 min"], [120, "2 min"]].map(([v, l]) => h("option", { value: v, selected: settings.health_interval === v }, l)));
+  const scan = h("select", {}, ...[[60, "1 min"], [120, "2 min"], [300, "5 min"], [600, "10 min"]].map(([v, l]) => h("option", { value: v, selected: settings.scan_interval === v }, l)));
+  const newDev = h("input", { type: "checkbox", checked: settings.alert_new_devices });
+  const adminFail = h("input", { type: "checkbox", checked: settings.alert_admin_login_failures });
+  return h("section", { class: "card form" }, h("h2", {}, "Monitoring"),
+    h("label", { class: "field" }, "Check internet every", health),
+    h("label", { class: "field" }, "Scan devices & satellites every", scan),
+    h("label", { class: "field" }, "Daily speed test at (clear to turn off)", speedAt),
+    h("label", { class: "switch" }, "Alert me about new devices", newDev),
+    h("label", { class: "switch" }, "Alert me about failed router sign-ins", adminFail),
+    h("button", { class: "btn primary", onclick: (e) => act(e.currentTarget, () => api("/api/settings", { method: "PATCH", body: {
+      health_interval: Number(health.value), scan_interval: Number(scan.value), speedtest_daily_at: speedAt.value,
+      alert_new_devices: newDev.checked, alert_admin_login_failures: adminFail.checked } }), "Settings saved") }, "Save"));
 }
 
 // ---------- app updates ----------
@@ -937,7 +1130,7 @@ function heartbeatSheet(render) {
     h("ol", { class: "small", style: "padding-left:18px;margin:0 0 8px" },
       h("li", {}, "Make a free account at healthchecks.io."),
       h("li", {}, "Add a check. Set its Period to 5 minutes and Grace Time to 10 minutes."),
-      h("li", {}, "Under Integrations, add ntfy with the same server and code as your phone alerts (More → Phone alerts → Show code), so its alarm lands in the same app."),
+      h("li", {}, "Under Integrations, add ntfy with the same server and code as your phone alerts (More → Alerts → Phone alerts → Show code), so its alarm lands in the same app."),
       h("li", {}, "Copy the check's ping address and paste it here.")),
     h("label", { class: "field" }, "Ping address", url),
     h("div", { class: "btns" }, h("button", { class: "btn", onclick: closeSheet }, "Cancel"),
@@ -1139,7 +1332,7 @@ function securityChecklistCard() {
 
       const exposed = (exp.devices || []).filter((dv) => dv.services?.length);
       add(!exp.enabled ? "warn" : exposed.length ? "bad" : exp.ts ? true : "warn", "Remote-access exposure",
-        !exp.enabled ? "The watch is off. Turn it on in More → Remote access."
+        !exp.enabled ? "The watch is off. Turn it on in More → Security → Remote access."
           : exposed.length ? `${exposed.length} device${exposed.length > 1 ? "s" : ""} on your network accept remote-control connections (SSH, Remote Desktop, VNC…).`
           : exp.ts ? "Nothing in the house accepts remote control." : "Not checked yet - runs once a day once turned on.");
 
@@ -1150,7 +1343,7 @@ function securityChecklistCard() {
           : st.info?.firmware_auto ? "Automatic." : fwChecked ? `Checked ${ago(fwChecked)}. Orbi Control checks twice a day.` : "Automatic, or checked recently.");
 
       add(settings.alert_admin_login_failures ? true : "warn", "Failed admin-login alerts",
-        settings.alert_admin_login_failures ? "On." : "Off. A guessed router password would go unnoticed. Turn on in More → Settings.");
+        settings.alert_admin_login_failures ? "On." : "Off. A guessed router password would go unnoticed. Turn on in More → App → Monitoring.");
 
       const okCount = items.filter((i) => i.status === "ok").length;
       const headerClass = items.some((i) => i.status === "bad") ? "bad" : okCount === items.length ? "ok" : "warn";
